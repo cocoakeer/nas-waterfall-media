@@ -29,7 +29,7 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi"}
 COVER_NAMES = {"cover.jpg", "cover.png", "cover.webp"}
 
-# 数据模型
+# 数据模型 新增 is_admin 布尔标记，不再依靠用户名admin
 class LoginForm(BaseModel):
     username: str
     password: str
@@ -38,6 +38,7 @@ class UserItem(BaseModel):
     username: str
     password_hash: str
     allow_dirs: List[str]
+    is_admin: bool
 
 class ChangePwdForm(BaseModel):
     old_password: str
@@ -47,6 +48,7 @@ class AdminUserForm(BaseModel):
     username: str
     password: Optional[str] = Field(None, description="新增必填；编辑留空则不修改密码")
     allow_dirs: List[str]
+    is_admin: bool
 
 class UserRenameForm(BaseModel):
     old_username: str
@@ -62,12 +64,19 @@ def load_users() -> List[UserItem]:
             {
                 "username": "admin",
                 "password_hash": default_hash,
-                "allow_dirs": ["/"]
+                "allow_dirs": ["/"],
+                "is_admin": True
             }
         ]
         USER_CONFIG_PATH.write_text(json.dumps(init_data, ensure_ascii=False, indent=2), encoding="utf-8")
-    raw = json.loads(USER_CONFIG_PATH.read_text(encoding="utf-8"))
-    return [UserItem(**x) for x in raw]
+    raw_list = json.loads(USER_CONFIG_PATH.read_text(encoding="utf-8"))
+    out = []
+    # 兼容旧配置文件，旧数据缺少is_admin字段自动补为False，原admin用户名自动升级为管理员
+    for item in raw_list:
+        if "is_admin" not in item:
+            item["is_admin"] = (item.get("username") == "admin")
+        out.append(UserItem(**item))
+    return out
 
 def save_users(user_list: List[UserItem]):
     data = [u.model_dump() for u in user_list]
@@ -91,7 +100,8 @@ async def get_current_user(request: Request) -> UserItem:
     return user
 
 async def require_admin(user: UserItem = Depends(get_current_user)):
-    if user.username != "admin":
+    # 不再判断用户名admin，判断is_admin标记
+    if not user.is_admin:
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return user
 
@@ -130,6 +140,12 @@ def scan_media_root_dirs() -> List[str]:
         pass
     return dir_list
 
+# 校验：至少保留一个管理员账号，禁止把全部管理员取消
+def check_at_least_one_admin(user_list: List[UserItem]):
+    admin_count = sum(1 for u in user_list if u.is_admin)
+    if admin_count <= 0:
+        raise HTTPException(status_code=400, detail="系统至少保留一名管理员账号，不允许全部取消管理员")
+
 # ========== APP初始化 ==========
 app = FastAPI()
 app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="assets")
@@ -161,7 +177,7 @@ async def whoami(user: UserItem = Depends(get_current_user)):
     return {
         "code":0,
         "username": user.username,
-        "is_admin": user.username == "admin",
+        "is_admin": user.is_admin,
         "allow_dirs": user.allow_dirs
     }
 
@@ -188,7 +204,8 @@ async def admin_get_all_users(_admin: UserItem = Depends(require_admin)):
     for u in users:
         out.append({
             "username": u.username,
-            "allow_dirs": u.allow_dirs
+            "allow_dirs": u.allow_dirs,
+            "is_admin": u.is_admin
         })
     return {"code":0, "list": out}
 
@@ -221,7 +238,7 @@ async def admin_rename_user(form: UserRenameForm, _admin: UserItem = Depends(req
     save_users(users)
     return {"code":0, "msg":"用户名修改成功"}
 
-## 管理员新增/编辑用户（不含重命名，重命名单独接口）
+## 管理员新增/编辑用户（支持设置is_admin管理员标记）
 @app.post("/api/admin/user-save")
 async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(require_admin)):
     reload_users()
@@ -231,6 +248,7 @@ async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(requir
         if form.password is not None and form.password.strip()!="":
             exist.password_hash = bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode()
         exist.allow_dirs = form.allow_dirs
+        exist.is_admin = form.is_admin
     else:
         # 新增用户
         if not form.password or form.password.strip()=="":
@@ -238,20 +256,26 @@ async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(requir
         new_u = UserItem(
             username=form.username,
             password_hash=bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode(),
-            allow_dirs=form.allow_dirs
+            allow_dirs=form.allow_dirs,
+            is_admin=form.is_admin
         )
         users.append(new_u)
+    # 校验：至少保留一个管理员账号
+    check_at_least_one_admin(users)
     save_users(users)
     return {"code":0,"msg":"保存成功"}
 
 ## 管理员删除用户
 @app.delete("/api/admin/user/{username}")
 async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin)):
-    if username == "admin":
-        raise HTTPException(400, "禁止删除admin账号")
     reload_users()
+    target_user = next((u for u in users if u.username == username), None)
+    if not target_user:
+        raise HTTPException(404, "用户不存在")
     global users
     users = [u for u in users if u.username != username]
+    # 删除之后校验至少还有一个管理员
+    check_at_least_one_admin(users)
     # 清理该用户全部session
     to_del = [k for k, v in sessions.items() if v == username]
     for k in to_del:

@@ -183,10 +183,13 @@
         <div class="user-list">
           <div class="user-row" v-for="u in adminUserList" :key="u.username">
             <div class="u-name">{{u.username}}</div>
+            <div class="u-tag">
+              <span v-if="u.is_admin" class="admin-tag">管理员</span>
+            </div>
             <div class="u-dir">{{u.allow_dirs.join("; ")}}</div>
             <div class="u-op">
               <button @click="editUser(u)" class="btn">编辑</button>
-              <button v-if="u.username!=='admin'" @click="delUser(u.username)" class="btn btn-danger">删除</button>
+              <button @click="delUser(u.username)" class="btn btn-danger">删除</button>
             </div>
           </div>
         </div>
@@ -203,6 +206,11 @@
         <div class="form-row">
           <label>密码(编辑留空不修改)</label>
           <input v-model="editUserForm.password" type="password" placeholder="新增必填"/>
+        </div>
+
+        <div class="form-row">
+          <label>是否管理员</label>
+          <input type="checkbox" v-model="editUserForm.is_admin"/>
         </div>
 
         <div class="form-row">
@@ -262,7 +270,7 @@ const pwdMsg = ref("")
 const userManageModal = ref(false)
 const adminUserList = ref([])
 const adminMsg = ref("")
-const editUserForm = ref({username:"",password:""})
+const editUserForm = ref({username:"",password:"",is_admin:false})
 // 目录多选下拉
 const dirOptions = ref([])
 const selectedDirList = ref([])
@@ -680,9 +688,10 @@ async function checkLoginStatus() {
       const ret = await res.json()
       isLogin.value = true
       userInfo.value = ret
+      // --------------------------改动点：登录后默认打开根目录，不再读取localStorage上次目录
       const urlDir = getDirFromUrl()
-      const lastDir = localStorage.getItem(STORAGE_KEY) ?? ''
-      const initDir = urlDir || lastDir || ''
+      // 只有URL地址栏带?dir=xxx参数才使用该目录，登录默认打开根目录
+      const initDir = urlDir ?? ''
       loadMedia(initDir, !!urlDir)
       initCheckCacheTask()
     } else {
@@ -763,13 +772,14 @@ async function reloadAdminUserList(){
   }
 }
 function clearEditForm(){
-  editUserForm.value = {username:"",password:""}
+  editUserForm.value = {username:"",password:"",is_admin:false}
   selectedDirList.value = []
   adminMsg.value = ""
 }
 function editUser(u){
   editUserForm.value.username = u.username
   editUserForm.value.password = ""
+  editUserForm.value.is_admin = u.is_admin
   selectedDirList.value = [...u.allow_dirs]
   adminMsg.value = ""
 }
@@ -822,7 +832,8 @@ async function submitSaveUser(){
   const body = {
     username:username,
     password: editUserForm.value.password.trim() || null,
-    allow_dirs: selectedDirList.value
+    allow_dirs: selectedDirList.value,
+    is_admin: editUserForm.value.is_admin
   }
   try{
     const res = await fetch("/api/admin/user-save",{
@@ -1245,7 +1256,7 @@ onUnmounted(() => {
   background:#181818;
   border-radius:12px;
   padding:24px;
-  width:660px;
+  width:680px;
   max-height:85vh;
   overflow-y:auto;
 }
@@ -1261,6 +1272,13 @@ onUnmounted(() => {
 }
 .u-name {
   width:140px;
+}
+.u-tag {
+  width:80px;
+}
+.admin-tag {
+  color:#ffd044;
+  font-size:12px;
 }
 .u-dir {
   flex:1;
