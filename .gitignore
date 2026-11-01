@@ -6,3 +6,6 @@ frontend/package-lock.json
 .DS_Store
 *.log
 
+cache/
+config/
+frontend/dist/

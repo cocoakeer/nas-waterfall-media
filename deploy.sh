@@ -7,6 +7,9 @@ IGNORE_RULES=(
 "frontend/package-lock.json"
 ".DS_Store"
 "*.log"
+"cache/"
+"config/"
+"frontend/dist/"
 )
 
 echo "===== 检查 .gitignore ====="
@@ -28,9 +31,20 @@ if git ls-files | grep -q "frontend/node_modules";then
   git rm --cached -r frontend/node_modules
 fi
 
+echo "===== 检查npm环境 ====="
+if ! command -v npm &> /dev/null; then
+  echo "❌ npm 未安装，请先安装 Node.js"
+  exit 1
+fi
+
 echo "===== 开始打包前端 ====="
 cd frontend
 npm run build
+# 校验dist目录是否生成
+if [ ! -d "dist" ];then
+  echo "❌ 前端打包失败，dist目录不存在！"
+  exit 1
+fi
 cd ..
 
 echo "===== 打包完成，准备提交git ====="
@@ -43,7 +57,8 @@ if [ -z "$msg" ];then
 fi
 git commit -m "$msg"
 
+echo "⚠️  注意：本脚本将执行强制推送（适合本项目，不要用于多人协作仓库）"
 echo "===== 推送到GitHub ====="
-git push origin main
+git push -f origin main
 
 echo "✅ 打包+上传全部完成！前往Github Actions查看镜像构建"
