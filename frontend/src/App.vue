@@ -56,12 +56,14 @@
         <span @click="changeDir(item.path)" class="breadcrumb-item">{{ item.name }}</span>
       </span>
     </div>
-    <!-- column多列瀑布流 -->
-    <div class="waterfall-wrap">
+
+    <!-- JS横向优先瀑布流容器 -->
+    <div ref="waterfallBoxRef" class="waterfall-wrap">
       <div
         v-for="item in mediaList"
         :key="item.id"
         class="media-card"
+        :style="{left: item._left + 'px', top: item._top + 'px'}"
         @click="handleCardClick(item)"
       >
         <div class="card-thumb">
@@ -71,6 +73,7 @@
               :src="getThumbUrl(item.cover_path)"
               alt=""
               loading="lazy"
+              @load="onImageLoaded"
             />
             <svg v-else width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
               <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" />
@@ -81,12 +84,14 @@
             :src="getThumbUrl(item.path)"
             alt=""
             loading="lazy"
+            @load="onImageLoaded"
           />
           <div v-else-if="item.type === 'video'" class="video-wrap">
             <img
               :src="getThumbUrl(item.path)"
               alt=""
               loading="lazy"
+              @load="onImageLoaded"
             />
             <div class="play-icon">▶</div>
           </div>
@@ -94,6 +99,7 @@
         <div class="card-name">{{ item.name }}</div>
       </div>
     </div>
+
     <!-- 预览弹窗 -->
     <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
       <div class="preview-box">
@@ -259,7 +265,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
 
 const baseUrl = ''
 // 初始化加载标记：修复刷新闪现登录页
@@ -297,6 +303,7 @@ const umDelConfirm = ref({
 
 const mediaList = ref([])
 const breadcrumbList = ref([])
+const waterfallBoxRef = ref(null)
 
 const previewShow = ref(false)
 const previewItem = ref(null)
@@ -318,6 +325,61 @@ const cachePercent = ref(0)
 let statusPollTimer = null
 
 const STORAGE_KEY = "waterfall_last_dir"
+
+// ========= JS瀑布流配置【横向优先：先排满一行再下一行】 =========
+const waterfallConfig = {
+  cardWidth: 260,
+  gap: 14
+}
+let resizeTimer = null
+
+/**
+ * 横向优先（行优先）布局：索引 % 列数 → 当前放在第几列
+ */
+function layoutWaterfall(){
+  if(!waterfallBoxRef.value || !mediaList.value.length) return
+  const boxW = waterfallBoxRef.value.clientWidth
+  const colCount = Math.max(1, Math.floor((boxW + waterfallConfig.gap) / (waterfallConfig.cardWidth + waterfallConfig.gap)))
+
+  const colHeights = new Array(colCount).fill(0)
+
+  mediaList.value.forEach((item, idx)=>{
+    // 行优先逻辑：0%4=0，1%4=1，2%4=2，3%4=3；4%4=0，实现一行一行横向排布
+    const colIdx = idx % colCount
+    const left = colIdx * (waterfallConfig.cardWidth + waterfallConfig.gap)
+
+    const dom = waterfallBoxRef.value.children[idx]
+    let h = 280
+    if(dom) h = dom.offsetHeight || 280
+
+    const top = colHeights[colIdx]
+    colHeights[colIdx] = top + h + waterfallConfig.gap
+
+    item._left = left
+    item._top = top
+  })
+
+  const maxH = Math.max(...colHeights)
+  waterfallBoxRef.value.style.height = maxH + 'px'
+}
+
+// 图片加载完成防抖重布局
+function onImageLoaded(){
+  clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(layoutWaterfall,120)
+}
+
+// 监听数据变更，重新布局
+watch(mediaList, async ()=>{
+  await nextTick()
+  layoutWaterfall()
+},{deep:true})
+
+// 窗口缩放
+function onWindowResize(){
+  clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(layoutWaterfall,150)
+}
 
 const getThumbUrl = (path) => {
   return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
@@ -618,9 +680,6 @@ function closePreview() {
   previewCurrentIndex = 0
 }
 
-function onWindowResize() {
-}
-
 function onPopState(e) {
   const dir = e.state?.dir ?? getDirFromUrl()
   loadMedia(dir, false)
@@ -880,6 +939,7 @@ onUnmounted(() => {
   document.removeEventListener("click", onClickOutsideDrop)
   if (statusPollTimer) clearInterval(statusPollTimer)
   clearTimeout(slideTimer.value)
+  clearTimeout(resizeTimer)
 })
 </script>
 
@@ -1054,41 +1114,26 @@ onUnmounted(() => {
   margin: 0 6px;
 }
 
-/* ========= column多列瀑布流（Pinterest标准实现，全浏览器兼容） ========= */
+/* JS横向优先瀑布流容器 */
 .waterfall-wrap {
   width: 100%;
-  column-count: 4;
-  column-gap: 14px;
-}
-@media (max-width:1200px){
-  .waterfall-wrap{
-    column-count:3;
-  }
-}
-@media (max-width:768px){
-  .waterfall-wrap{
-    column-count:2;
-  }
-}
-@media (max-width:480px){
-  .waterfall-wrap{
-    column-count:1;
-  }
+  position: relative;
 }
 
 .media-card {
+  width: 260px;
+  position: absolute;
   background: #1e1e1e;
   border-radius: 10px;
   overflow: hidden;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
-  break-inside: avoid;
-  margin-bottom:14px;
 }
 .media-card:hover {
   transform: translateY(-3px);
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
 }
+
 .card-thumb {
   width: 100%;
   overflow: hidden;
