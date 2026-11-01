@@ -1,6 +1,11 @@
 <template>
+  <!-- 初始化加载中，完全屏蔽登录/主页面闪烁 -->
+  <div v-if="initLoading" class="init-loading-mask">
+    <div class="loading-text">正在加载...</div>
+  </div>
+
   <!-- 登录弹窗 -->
-  <div v-if="!isLogin" class="login-mask">
+  <div v-else-if="!isLogin" class="login-mask">
     <div class="login-box">
       <h2>NAS媒体瀑布流 - 登录</h2>
       <div class="form-item">
@@ -262,6 +267,8 @@
 import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 
 const baseUrl = ''
+// 初始化加载标记：修复刷新闪现登录页
+const initLoading = ref(true)
 const isLogin = ref(false)
 const userInfo = ref({})
 const loginForm = ref({username:'', password:''})
@@ -296,7 +303,6 @@ const umDelConfirm = ref({
 const mediaList = ref([])
 const breadcrumbList = ref([])
 const waterfallRef = ref(null)
-// 加载状态：修复刷新/切换目录点击无响应
 const isLoading = ref(false)
 
 const previewShow = ref(false)
@@ -369,7 +375,7 @@ function layoutWaterfall() {
   container.style.position = 'relative'
   cards.forEach(card => {
     card.style.position = 'absolute'
-    // 关键修复：图片未加载完成，强制最小占位高度，保证点击区域可用
+    // 卡片最小占位高度，保证图片未加载点击可用
     if (!card.offsetHeight || card.offsetHeight < 120) {
       card.style.height = '220px'
     }
@@ -495,7 +501,6 @@ function checkAuthResp(r) {
 async function loadMedia(dir = '', pushHistory = false) {
   if(isLoading.value) return
   isLoading.value = true
-  // 切换目录立刻清空旧DOM，避免旧元素干扰
   mediaList.value = []
   breadcrumbList.value = []
   try {
@@ -509,8 +514,9 @@ async function loadMedia(dir = '', pushHistory = false) {
     if (pushHistory) {
       syncDirToUrl(dir)
     }
-    // DOM渲染完成，立刻执行布局，不等图片加载
     await nextTick()
+    // 再加一帧，保证DOM完全渲染，修复首次进来不是瀑布流
+    await new Promise(resolve => requestAnimationFrame(resolve))
     layoutWaterfall()
   } catch (err) {
     console.error(err)
@@ -722,13 +728,16 @@ async function checkLoginStatus() {
       userInfo.value = ret
       const urlDir = getDirFromUrl()
       const initDir = urlDir ?? ''
-      loadMedia(initDir, !!urlDir)
+      await loadMedia(initDir, !!urlDir)
       initCheckCacheTask()
     } else {
       isLogin.value = false
     }
   } catch(e) {
     isLogin.value = false
+  } finally {
+    // 鉴权请求完成，关闭初始化遮罩，消除刷新闪现登录页
+    initLoading.value = false
   }
 }
 
@@ -953,6 +962,20 @@ onUnmounted(() => {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+}
+/* 初始化加载遮罩，修复刷新闪现登录页 */
+.init-loading-mask{
+  position:fixed;
+  inset:0;
+  background:#000;
+  z-index:999999;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+.loading-text{
+  color:#fff;
+  font-size:16px;
 }
 
 .login-mask {
@@ -1398,7 +1421,6 @@ onUnmounted(() => {
   font-size:13px;
   min-height:20px;
 }
-
 .inner-confirm-mask{
   position:absolute;
   inset:0;
@@ -1419,7 +1441,6 @@ onUnmounted(() => {
   justify-content:flex-end;
   margin-top:18px;
 }
-
 .btn-group {
   display: flex;
   gap: 10px;
