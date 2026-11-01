@@ -16,7 +16,8 @@
       </span>
     </div>
 
-    <div class="waterfall">
+    <!-- 瀑布流容器 -->
+    <div ref="waterfallRef" class="waterfall-wrap">
       <div
         v-for="item in mediaList"
         :key="item.id"
@@ -25,7 +26,6 @@
       >
         <div class="card-thumb">
           <template v-if="item.type === 'folder'">
-            <!-- 文件夹：优先cover_path封面图，无封面显示黄色文件夹svg -->
             <img v-if="item.cover_path" :src="getThumbUrl(item.cover_path)" alt="" />
             <svg v-else width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
               <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
@@ -86,11 +86,12 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
 
 const baseUrl = ''
 const mediaList = ref([])
 const breadcrumbList = ref([])
+const waterfallRef = ref(null)
 
 const previewShow = ref(false)
 const previewItem = ref(null)
@@ -106,11 +107,56 @@ const slideTimer = ref(null)
 const slideList = ref([])
 const currentSlide = ref({})
 
+let resizeObserver = null
+
 const getThumbUrl = (path) => {
   return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
 }
 const getSrcUrl = (path) => {
   return `${baseUrl}/api/src?path=${encodeURIComponent(path)}`
+}
+
+// 获取当前屏幕列数
+function getColumnCount() {
+  const w = window.innerWidth
+  if(w <= 480) return 1
+  if(w <=768) return 2
+  if(w <=1200) return 3
+  return 4
+}
+
+// JS瀑布流重排：按顺序放入高度最小的列，实现横向顺序+参差高度
+function layoutWaterfall(){
+  if(!waterfallRef.value) return
+  const container = waterfallRef.value
+  const cards = Array.from(container.querySelectorAll('.media-card'))
+  const colCount = getColumnCount()
+  const gap = 14
+
+  // 重置样式
+  container.style.position = 'relative'
+  cards.forEach(card=>{
+    card.style.position = 'absolute'
+  })
+
+  // 记录每列高度
+  const colHeights = new Array(colCount).fill(0)
+  const cardWidth = (container.clientWidth - gap*(colCount-1)) / colCount
+
+  for(const card of cards){
+    // 找到当前高度最小的列
+    let minCol = 0
+    for(let i=0;i<colCount;i++){
+      if(colHeights[i] < colHeights[minCol]) minCol = i
+    }
+    card.style.width = cardWidth + 'px'
+    card.style.left = minCol * (cardWidth + gap) + 'px'
+    card.style.top = colHeights[minCol] + 'px'
+    // 更新列高度
+    colHeights[minCol] += card.offsetHeight + gap
+  }
+  // 设置容器总高度
+  container.style.height = Math.max(...colHeights) + 'px'
 }
 
 async function loadMedia(dir = '') {
@@ -120,6 +166,8 @@ async function loadMedia(dir = '') {
     const data = await res.json()
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
+    await nextTick()
+    layoutWaterfall()
   } catch (err) {
     console.error(err)
     mediaList.value = []
@@ -205,11 +253,24 @@ function closePreview() {
   previewCurrentIndex = 0
 }
 
+function onWindowResize(){
+  layoutWaterfall()
+}
+
 onMounted(()=>{
   document.addEventListener('keydown', handleKeydown)
+  window.addEventListener('resize', onWindowResize)
+  // 图片加载完成后重新布局，防止高度计算错误
+  resizeObserver = new ResizeObserver(()=>{
+    layoutWaterfall()
+  })
+  if(waterfallRef.value) resizeObserver.observe(waterfallRef.value)
 })
+
 onUnmounted(()=>{
   document.removeEventListener('keydown', handleKeydown)
+  window.removeEventListener('resize', onWindowResize)
+  if(resizeObserver) resizeObserver.disconnect()
 })
 
 loadMedia()
@@ -266,13 +327,11 @@ loadMedia()
   margin: 0 6px;
 }
 
-.waterfall {
-  display: flex;
-  flex-wrap: wrap;
-  gap:14px;
+.waterfall-wrap {
+  width: 100%;
+  min-height: 200px;
 }
 .media-card {
-  width: calc(25% - 11px);
   background: #1e1e1e;
   border-radius: 10px;
   overflow: hidden;
@@ -285,7 +344,6 @@ loadMedia()
 }
 .card-thumb {
   width:100%;
-  height:180px;
   overflow: hidden;
   background:#222;
   position:relative;
@@ -295,8 +353,7 @@ loadMedia()
 }
 .card-thumb img {
   width:100%;
-  height:100%;
-  object-fit:cover;
+  height:auto;
   display:block;
 }
 .play-icon {
@@ -320,22 +377,6 @@ loadMedia()
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-@media (max-width:1200px) {
-  .media-card {
-    width: calc(33.333% - 10px);
-  }
-}
-@media (max-width:768px) {
-  .media-card {
-    width: calc(50% - 7px);
-  }
-}
-@media (max-width:480px) {
-  .media-card {
-    width:100%;
-  }
 }
 
 .preview-mask {
