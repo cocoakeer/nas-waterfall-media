@@ -70,19 +70,23 @@
     <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
       <div class="preview-box">
         <button class="close-btn" @click="closePreview">×</button>
+
         <div v-if="previewItem.type === 'image'" class="preview-media">
           <img :src="getSrcUrl(previewItem.path)" alt="" :style="imgRotateStyle" />
-          <!-- 图片操作按钮组 -->
-          <div class="img-action-bar">
-            <button @click="openOriginal">查看原图</button>
-            <button @click="rotateLeft">↺ 左旋90°</button>
-            <button @click="rotateRight">↻ 右旋90°</button>
-          </div>
         </div>
         <div v-else class="preview-media">
           <video controls :src="getSrcUrl(previewItem.path)"></video>
         </div>
+
         <div class="preview-name">{{ previewItem.name }}</div>
+
+        <!-- 图片操作栏：移到图片外下方 -->
+        <div v-if="previewItem.type === 'image'" class="img-action-bar">
+          <button @click="openOriginal">查看原图</button>
+          <button @click="rotateLeft">↺ 左旋90°</button>
+          <button @click="rotateRight">↻ 右旋90°</button>
+          <button @click="resetRotate">重置旋转</button>
+        </div>
       </div>
     </div>
 
@@ -128,7 +132,6 @@ const previewShow = ref(false)
 const previewItem = ref(null)
 let previewMediaList = []
 let previewCurrentIndex = 0
-// 图片旋转角度
 const imgRotateDeg = ref(0)
 
 const settingShow = ref(false)
@@ -143,10 +146,11 @@ const currentSlide = ref({})
 let resizeObserver = null
 let layoutDebounceTimer = null
 
-// ==========缓存任务状态==========
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
 let statusPollTimer = null
+
+const STORAGE_KEY = "waterfall_last_dir"
 
 const getThumbUrl = (path) => {
   return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
@@ -155,7 +159,6 @@ const getSrcUrl = (path) => {
   return `${baseUrl}/api/src?path=${encodeURIComponent(path)}`
 }
 
-// 旋转样式
 const imgRotateStyle = ref({
   transform: 'rotate(0deg)',
   transition: 'transform 0.25s ease'
@@ -169,44 +172,45 @@ function rotateRight() {
   imgRotateDeg.value += 90
   imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
 }
+function resetRotate() {
+  imgRotateDeg.value = 0
+  imgRotateStyle.value.transform = 'rotate(0deg)'
+}
 function openOriginal() {
   window.open(getSrcUrl(previewItem.value.path), '_blank')
 }
 
 function getColumnCount() {
   const w = window.innerWidth
-  if(w <= 480) return 1
-  if(w <=768) return 2
-  if(w <=1200) return 3
+  if (w <= 480) return 1
+  if (w <= 768) return 2
+  if (w <= 1200) return 3
   return 4
 }
 
-// ✅ 修复：标准横向多列瀑布流
-function layoutWaterfall(){
-  if(!waterfallRef.value) return
+function layoutWaterfall() {
+  if (!waterfallRef.value) return
   const container = waterfallRef.value
   const cards = Array.from(container.querySelectorAll('.media-card'))
   const colCount = getColumnCount()
   const gap = 14
 
   container.style.position = 'relative'
-  cards.forEach(card=>{
+  cards.forEach(card => {
     card.style.position = 'absolute'
   })
 
   const colHeights = new Array(colCount).fill(0)
-  const cardWidth = (container.clientWidth - gap*(colCount-1)) / colCount
+  const cardWidth = (container.clientWidth - gap * (colCount - 1)) / colCount
 
-  for(const card of cards){
-    // 找到当前高度最小的列
+  for (const card of cards) {
     let minCol = 0
-    for(let i=0;i<colCount;i++){
-      if(colHeights[i] < colHeights[minCol]) minCol = i
+    for (let i = 0; i < colCount; i++) {
+      if (colHeights[i] < colHeights[minCol]) minCol = i
     }
     card.style.width = cardWidth + 'px'
     card.style.left = minCol * (cardWidth + gap) + 'px'
     card.style.top = colHeights[minCol] + 'px'
-    // 更新这一列高度
     colHeights[minCol] += card.offsetHeight + gap
   }
   container.style.height = Math.max(...colHeights) + 'px'
@@ -214,7 +218,7 @@ function layoutWaterfall(){
 
 function debounceLayout() {
   clearTimeout(layoutDebounceTimer)
-  layoutDebounceTimer = setTimeout(()=>{
+  layoutDebounceTimer = setTimeout(() => {
     layoutWaterfall()
   }, 120)
 }
@@ -223,24 +227,22 @@ function onMediaImgFinish() {
   debounceLayout()
 }
 
-// 轮询任务状态
-async function pollCacheStatus(){
-  try{
+async function pollCacheStatus() {
+  try {
     const res = await fetch(`${baseUrl}/api/cache-status`)
     const st = await res.json()
     cachePercent.value = st.percent
-    if(!st.running){
+    if (!st.running) {
       clearInterval(statusPollTimer)
       statusPollTimer = null
       cacheRunning.value = false
       alert(`✅缓存任务结束！\n${st.message}\n处理文件:${st.processed}/${st.total}`)
     }
-  }catch(err){
-    console.error("查询任务状态失败",err)
+  } catch (err) {
+    console.error("查询任务状态失败", err)
   }
 }
 
-// 页面载入自动检查任务状态
 async function initCheckCacheTask() {
   try {
     const res = await fetch(`${baseUrl}/api/cache-status`)
@@ -255,55 +257,70 @@ async function initCheckCacheTask() {
   }
 }
 
-// 启动缓存任务
-async function runCacheTask(){
-  if(cacheRunning.value) return
+async function runCacheTask() {
+  if (cacheRunning.value) return
   cacheRunning.value = true
   cachePercent.value = 0
   try {
     const res = await fetch(`${baseUrl}/api/cache-run`)
     const ret = await res.json()
-    if(ret.code !== 0){
-      alert("❌"+ret.msg)
+    if (ret.code !== 0) {
+      alert("❌" + ret.msg)
       cacheRunning.value = false
       return
     }
     statusPollTimer = setInterval(pollCacheStatus, 800)
-  }catch(err){
+  } catch (err) {
     console.error(err)
     alert("❌请求失败，提交任务出错！")
     cacheRunning.value = false
   }
 }
 
-// 取消任务
 async function stopCacheTask() {
   if (!confirm("确认要终止缓存任务吗？")) return
   try {
     const res = await fetch(`${baseUrl}/api/cache-stop`)
     const ret = await res.json()
-    if(ret.code !==0){
-      alert("❌"+ret.msg)
+    if (ret.code !== 0) {
+      alert("❌" + ret.msg)
     }
-  } catch(err) {
+  } catch (err) {
     console.error(err)
     alert("❌发送停止指令失败")
   }
 }
 
-// ========== 目录记忆相关 ==========
-const STORAGE_KEY = "waterfall_last_dir"
+// 从地址栏读取目录
+function getDirFromUrl() {
+  const params = new URLSearchParams(window.location.search)
+  return params.get('dir') ?? ''
+}
 
-// 加载目录，并且保存路径到localStorage
-async function loadMedia(dir = '') {
+// 同步目录到地址栏
+function syncDirToUrl(dir) {
+  const url = new URL(window.location.href)
+  if (dir) {
+    url.searchParams.set('dir', dir)
+  } else {
+    url.searchParams.delete('dir')
+  }
+  window.history.pushState({ dir }, '', url.toString())
+}
+
+async function loadMedia(dir = '', pushHistory = false) {
   try {
     const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
     if (!res.ok) throw new Error()
     const data = await res.json()
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
-    // 保存当前路径到本地存储
     localStorage.setItem(STORAGE_KEY, dir)
+
+    if (pushHistory) {
+      syncDirToUrl(dir)
+    }
+
     await nextTick()
     debounceLayout()
   } catch (err) {
@@ -313,7 +330,7 @@ async function loadMedia(dir = '') {
 }
 
 function changeDir(path) {
-  loadMedia(path)
+  loadMedia(path, true)
 }
 
 function handleCardClick(item) {
@@ -323,7 +340,6 @@ function handleCardClick(item) {
     previewMediaList = mediaList.value.filter(x => x.type !== 'folder')
     previewCurrentIndex = previewMediaList.findIndex(x => x.id === item.id)
     previewItem.value = item
-    // 打开新图片时重置旋转角度
     imgRotateDeg.value = 0
     imgRotateStyle.value.transform = 'rotate(0deg)'
     previewShow.value = true
@@ -338,6 +354,7 @@ function prevMedia() {
     imgRotateStyle.value.transform = 'rotate(0deg)'
   }
 }
+
 function nextMedia() {
   if (previewCurrentIndex < previewMediaList.length - 1) {
     previewCurrentIndex += 1
@@ -349,7 +366,7 @@ function nextMedia() {
 
 function handleKeydown(e) {
   if (!previewShow.value) return
-  switch(e.key) {
+  switch (e.key) {
     case 'ArrowLeft':
       e.preventDefault()
       prevMedia()
@@ -368,9 +385,11 @@ function handleKeydown(e) {
 function openSlideSetting() {
   settingShow.value = true
 }
+
 function saveSetting() {
   settingShow.value = false
 }
+
 function startSlide() {
   slideList.value = mediaList.value.filter(i => i.type === 'image')
   if (slideList.value.length === 0) return alert('当前目录没有图片，无法幻灯片')
@@ -378,6 +397,7 @@ function startSlide() {
   slideShow.value = true
   runSlide()
 }
+
 function runSlide() {
   clearTimeout(slideTimer.value)
   currentSlide.value = slideList.value[slideIndex.value]
@@ -385,7 +405,10 @@ function runSlide() {
     slideIndex.value++
     if (slideIndex.value >= slideList.value.length) {
       if (slideLoop.value) slideIndex.value = 0
-      else { slideShow.value = false; return }
+      else {
+        slideShow.value = false
+        return
+      }
     }
     runSlide()
   }, slideDelay.value * 1000)
@@ -398,33 +421,43 @@ function closePreview() {
   previewCurrentIndex = 0
 }
 
-function onWindowResize(){
+function onWindowResize() {
   debounceLayout()
 }
 
-onMounted(()=>{
+// 浏览器前进后退
+function onPopState(e) {
+  const dir = e.state?.dir ?? getDirFromUrl()
+  loadMedia(dir, false)
+}
+
+onMounted(() => {
   document.addEventListener('keydown', handleKeydown)
   window.addEventListener('resize', onWindowResize)
-  resizeObserver = new ResizeObserver(()=>{
+  window.addEventListener('popstate', onPopState)
+
+  resizeObserver = new ResizeObserver(() => {
     debounceLayout()
   })
-  if(waterfallRef.value) resizeObserver.observe(waterfallRef.value)
+  if (waterfallRef.value) resizeObserver.observe(waterfallRef.value)
 
-  // 读取上次保存的目录，没有就默认根目录
-  const lastDir = localStorage.getItem(STORAGE_KEY) ?? ""
-  loadMedia(lastDir)
+  // 优先地址栏目录，其次本地记忆，最后根目录
+  const urlDir = getDirFromUrl()
+  const lastDir = localStorage.getItem(STORAGE_KEY) ?? ''
+  const initDir = urlDir || lastDir || ''
 
+  loadMedia(initDir, !!urlDir)
   initCheckCacheTask()
 })
 
-onUnmounted(()=>{
+onUnmounted(() => {
   document.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', onWindowResize)
-  if(resizeObserver) resizeObserver.disconnect()
+  window.removeEventListener('popstate', onPopState)
+  if (resizeObserver) resizeObserver.disconnect()
   clearTimeout(layoutDebounceTimer)
-  if(statusPollTimer) clearInterval(statusPollTimer)
+  if (statusPollTimer) clearInterval(statusPollTimer)
 })
-
 </script>
 
 <style scoped>
@@ -433,12 +466,14 @@ onUnmounted(()=>{
   padding: 0;
   box-sizing: border-box;
 }
+
 .app-container {
   min-height: 100vh;
   background: #121212;
   color: #eee;
   padding: 16px;
 }
+
 .header {
   display: flex;
   justify-content: space-between;
@@ -447,14 +482,17 @@ onUnmounted(()=>{
   flex-wrap: wrap;
   gap: 12px;
 }
+
 .header h1 {
   font-size: 22px;
   color: #fff;
 }
+
 .header-actions {
   display: flex;
   gap: 10px;
 }
+
 .btn {
   padding: 6px 12px;
   border: none;
@@ -463,24 +501,30 @@ onUnmounted(()=>{
   color: #fff;
   cursor: pointer;
 }
+
 .btn:disabled {
-  opacity:0.65;
-  cursor:not-allowed;
+  opacity: 0.65;
+  cursor: not-allowed;
 }
+
 .btn.primary {
   background: #2563eb;
 }
+
 .btn-danger {
   background: #dc2626;
 }
+
 .breadcrumb {
   margin-bottom: 16px;
   color: #aaa;
 }
+
 .breadcrumb-item {
   color: #60a5fa;
   cursor: pointer;
 }
+
 .separator {
   margin: 0 6px;
 }
@@ -490,6 +534,7 @@ onUnmounted(()=>{
   min-height: 200px;
   position: relative;
 }
+
 .media-card {
   background: #1e1e1e;
   border-radius: 10px;
@@ -497,148 +542,186 @@ onUnmounted(()=>{
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
+
 .media-card:hover {
   transform: translateY(-3px);
-  box-shadow: 0 8px 20px rgba(0,0,0,0.32);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.32);
 }
+
 .card-thumb {
-  width:100%;
+  width: 100%;
   overflow: hidden;
-  background:#222;
-  position:relative;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+  background: #222;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
+
 .card-thumb img {
-  width:100%;
-  height:auto;
-  display:block;
+  width: 100%;
+  height: auto;
+  display: block;
 }
+
 .play-icon {
-  position:absolute;
-  top:50%;
-  left:50%;
-  transform:translate(-50%,-50%);
-  width:44px;
-  height:44px;
-  background:rgba(0,0,0,0.6);
-  border-radius:50%;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  font-size:18px;
-  color:#fff;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 44px;
+  height: 44px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: #fff;
 }
+
 .card-name {
-  padding:10px 12px;
-  font-size:13px;
+  padding: 10px 12px;
+  font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .preview-mask {
-  position:fixed;
-  inset:0;
-  background:rgba(0,0,0,0.85);
-  z-index:99;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  z-index: 99;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
+
 .preview-box {
-  background:#181818;
-  border-radius:12px;
-  padding:12px;
-  max-width:90vw;
-  max-height:90vh;
-  position:relative;
+  background: #181818;
+  border-radius: 12px;
+  padding: 12px;
+  max-width: 92vw;
+  max-height: 92vh;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
+
 .close-btn {
-  position:absolute;
+  position: absolute;
   top: 4px;
   right: 4px;
-  width:28px;
-  height:28px;
-  border-radius:50%;
-  background:#333;
-  color:#fff;
-  border:none;
-  font-size:20px;
-  cursor:pointer;
-  z-index:2;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #333;
+  color: #fff;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  z-index: 2;
 }
+
 .preview-media {
-  max-width:85vw;
-  max-height:80vh;
-  display:flex;
-  flex-direction:column;
-  align-items:center;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 10px;
 }
-.preview-media img, .preview-media video {
-  max-width:100%;
-  max-height:70vh;
-  display:block;
+
+.preview-media img {
+  max-width: 85vw;
+  max-height: 62vh;
+  object-fit: contain;
 }
-.img-action-bar {
-  margin-top:12px;
-  display:flex;
-  gap:10px;
+
+.preview-media video {
+  max-width: 85vw;
+  max-height: 70vh;
 }
-.img-action-bar button {
-  padding:5px 10px;
-  background:#2a2a2a;
-  color:#fff;
-  border:0;
-  border-radius:6px;
-  cursor:pointer;
-}
-.img-action-bar button:hover {
-  background:#3a3a3a;
-}
+
 .preview-name {
-  text-align:center;
-  margin-top:8px;
-  font-size:14px;
+  margin-top: 10px;
+  font-size: 14px;
+  color: #eee;
+  text-align: center;
+}
+
+/* 操作栏放到图片外下方 */
+.img-action-bar {
+  margin-top: 14px;
+  margin-bottom: 6px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.img-action-bar button {
+  padding: 6px 12px;
+  background: #2a2a2a;
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.img-action-bar button:hover {
+  background: #3a3a3a;
 }
 
 .setting-box {
-  background:#181818;
-  border-radius:12px;
-  padding:24px;
-  width:360px;
+  background: #181818;
+  border-radius: 12px;
+  padding: 24px;
+  width: 360px;
 }
+
 .form-row {
-  margin:14px 0;
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
+  margin: 14px 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
+
 .btn-group {
-  display:flex;
-  gap:10px;
-  justify-content:flex-end;
-  margin-top:20px;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 20px;
 }
 
 .slide-mask {
-  position:fixed;
-  inset:0;
-  background:#000;
-  z-index:100;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+  position: fixed;
+  inset: 0;
+  background: #000;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
-.slide-content img, .slide-content video {
-  max-width:98vw;
-  max-height:98vh;
+
+.slide-content {
+  position: relative;
 }
+
+.slide-content img,
+.slide-content video {
+  max-width: 98vw;
+  max-height: 98vh;
+}
+
 .slide-name {
-  position:absolute;
-  bottom:16px;
-  color:#fff;
-  font-size:14px;
+  position: absolute;
+  bottom: 16px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  color: #fff;
+  font-size: 14px;
 }
 </style>
