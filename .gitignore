@@ -1,0 +1,10 @@
+# Mac系统文件
+.DS_Store
+# 脚本自身
+deploy.sh
+# 前端打包产物
+frontend/dist/
+# 依赖缓存
+node_modules/
+__pycache__/
+*.pyc
