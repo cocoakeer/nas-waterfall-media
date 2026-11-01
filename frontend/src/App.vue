@@ -80,7 +80,7 @@
 
         <div class="preview-name">{{ previewItem.name }}</div>
 
-        <!-- 图片操作栏：移到图片外下方 -->
+        <!-- 图片操作栏：图片外下方 -->
         <div v-if="previewItem.type === 'image'" class="img-action-bar">
           <button @click="openOriginal">查看原图</button>
           <button @click="rotateLeft">↺ 左旋90°</button>
@@ -602,8 +602,8 @@ onUnmounted(() => {
   background: #181818;
   border-radius: 12px;
   padding: 12px;
-  max-width: 92vw;
-  max-height: 92vh;
+  max-width: 96vw;
+  max-height: 96vh;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -631,17 +631,19 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   margin-top: 10px;
+  flex: 1;
 }
 
+/* 核心修改：图片最大化，不超出屏幕 */
 .preview-media img {
-  max-width: 85vw;
-  max-height: 62vh;
+  max-width: 94vw;
+  max-height: 88vh;
   object-fit: contain;
 }
 
 .preview-media video {
-  max-width: 85vw;
-  max-height: 70vh;
+  max-width: 90vw;
+  max-height: 80vh;
 }
 
 .preview-name {
