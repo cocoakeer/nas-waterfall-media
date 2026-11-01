@@ -264,7 +264,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 
 const baseUrl = ''
 // 初始化加载标记：修复刷新闪现登录页
@@ -375,7 +375,7 @@ function layoutWaterfall() {
   container.style.position = 'relative'
   cards.forEach(card => {
     card.style.position = 'absolute'
-    // 卡片最小占位高度，保证图片未加载点击可用
+    // 关键修复：图片未加载完成，强制最小占位高度，保证点击区域可用
     if (!card.offsetHeight || card.offsetHeight < 120) {
       card.style.height = '220px'
     }
@@ -407,6 +407,17 @@ function debounceLayout() {
 function onMediaImgFinish() {
   debounceLayout()
 }
+
+// =========【重点修复】侦听mediaList数据变化，自动执行布局 =========
+watch(mediaList, () => {
+  if (mediaList.value.length === 0) return
+  nextTick(()=>{
+    layoutWaterfall()
+    setTimeout(()=>{
+      layoutWaterfall()
+    },0)
+  })
+},{deep:true})
 
 async function pollCacheStatus() {
   try {
@@ -501,6 +512,7 @@ function checkAuthResp(r) {
 async function loadMedia(dir = '', pushHistory = false) {
   if(isLoading.value) return
   isLoading.value = true
+  // 切换目录立刻清空旧DOM，避免旧元素干扰
   mediaList.value = []
   breadcrumbList.value = []
   try {
@@ -514,10 +526,6 @@ async function loadMedia(dir = '', pushHistory = false) {
     if (pushHistory) {
       syncDirToUrl(dir)
     }
-    await nextTick()
-    // 再加一帧，保证DOM完全渲染，修复首次进来不是瀑布流
-    await new Promise(resolve => requestAnimationFrame(resolve))
-    layoutWaterfall()
   } catch (err) {
     console.error(err)
     mediaList.value = []
@@ -1421,6 +1429,7 @@ onUnmounted(() => {
   font-size:13px;
   min-height:20px;
 }
+
 .inner-confirm-mask{
   position:absolute;
   inset:0;
@@ -1441,6 +1450,7 @@ onUnmounted(() => {
   justify-content:flex-end;
   margin-top:18px;
 }
+
 .btn-group {
   display: flex;
   gap: 10px;
