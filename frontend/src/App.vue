@@ -1,248 +1,381 @@
 <template>
-  <div class="app-wrap">
-    <header class="header-bar">
-      <div class="breadcrumb">
-        <span @click="goRoot">根目录</span>
-        <span v-for="(item, idx) in breadList" :key="idx" class="sep">/</span>
-        <span v-for="(item, idx) in breadList" :key="idx" @click="navBread(idx)">{{ item }}</span>
-      </div>
-      <div class="ctrl-group">
-        <span>幻灯片间隔(秒)</span>
-        <input v-model.number="slideDelay" type="number" min="1" class="inp">
-        <label class="check">
-          <input v-model="loopPlay" type="checkbox">循环播放
-        </label>
-        <button @click="startSlide" class="btn">幻灯片播放</button>
+  <div class="app-container">
+    <header class="header">
+      <h1>NAS 媒体瀑布流</h1>
+      <div class="header-actions">
+        <button @click="toggleLayout" class="btn">
+          {{ layoutMode === 'waterfall' ? '平铺模式' : '瀑布流模式' }}
+        </button>
+        <button @click="openSlideSetting" class="btn">幻灯片设置</button>
+        <button @click="startSlide" class="btn primary">开始幻灯片</button>
       </div>
     </header>
 
-    <div class="waterfall">
-      <div v-for="item in mediaList" :key="item.path" class="card">
-        <div v-if="item.type === 'folder'" class="folder-card" @click="openFolder(item.path)">
-          <div class="folder-preview">
-            <img v-if="item.cover" :src="item.cover" class="cover-img" alt="">
-            <div v-else class="folder-icon">
-              <svg width="64" height="64" viewBox="0 0 24 24" fill="#999">
-                <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
-              </svg>
-            </div>
-          </div>
-          <div class="folder-name">{{ item.name }}</div>
-        </div>
+    <div class="breadcrumb">
+      <span @click="changeDir('')" class="breadcrumb-item">根目录</span>
+      <span v-for="(item, idx) in breadcrumbList" :key="idx">
+        <span class="separator">/</span>
+        <span @click="changeDir(item.path)" class="breadcrumb-item">{{ item.name }}</span>
+      </span>
+    </div>
 
-        <div v-else class="media-card" @click="openMedia(item)">
-          <div class="media-preview">
-            <img :src="item.thumb" class="cover-img" alt="">
-            <div v-if="item.type==='video'" class="play-mark">▶</div>
+    <div v-if="layoutMode === 'waterfall'" class="waterfall">
+      <div
+        v-for="item in mediaList"
+        :key="item.id"
+        class="media-card"
+        @click="openPreview(item)"
+      >
+        <div class="card-thumb">
+          <img v-if="item.type === 'image'" :src="item.thumb" alt="" />
+          <div v-if="item.type === 'video'" class="video-wrap">
+            <img :src="item.thumb" alt="" />
+            <div class="play-icon">▶</div>
           </div>
-          <div class="media-name">{{ item.name }}</div>
+        </div>
+        <div class="card-name">{{ item.name }}</div>
+      </div>
+    </div>
+
+    <div v-else class="grid-layout">
+      <div
+        v-for="item in mediaList"
+        :key="item.id"
+        class="grid-card"
+        @click="openPreview(item)"
+      >
+        <div class="card-thumb">
+          <img v-if="item.type === 'image'" :src="item.thumb" alt="" />
+          <div v-if="item.type === 'video'" class="video-wrap">
+            <img :src="item.thumb" alt="" />
+            <div class="play-icon">▶</div>
+          </div>
+        </div>
+        <div class="card-name">{{ item.name }}</div>
+      </div>
+    </div>
+
+    <!-- 预览弹窗 -->
+    <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
+      <div class="preview-box">
+        <button class="close-btn" @click="closePreview">×</button>
+        <div v-if="previewItem.type === 'image'" class="preview-media">
+          <img :src="previewItem.src" alt="" />
+        </div>
+        <div v-else class="preview-media">
+          <video controls :src="previewItem.src"></video>
+        </div>
+        <div class="preview-name">{{ previewItem.name }}</div>
+      </div>
+    </div>
+
+    <!-- 幻灯片设置弹窗 -->
+    <div v-if="settingShow" class="preview-mask" @click.self="settingShow=false">
+      <div class="setting-box">
+        <h3>幻灯片设置</h3>
+        <div class="form-row">
+          <label>切换间隔（秒）</label>
+          <input v-model.number="slideDelay" type="number" min="1" />
+        </div>
+        <div class="form-row">
+          <label>循环播放</label>
+          <input v-model="slideLoop" type="checkbox" />
+        </div>
+        <div class="btn-group">
+          <button @click="saveSetting" class="btn primary">保存</button>
+          <button @click="settingShow=false" class="btn">取消</button>
         </div>
       </div>
     </div>
 
-    <!-- 幻灯片弹窗 -->
-    <div v-if="slideOpen" class="slide-modal" @click.self="closeSlide">
-      <div class="slide-inner">
-        <img v-if="curItem.type==='image'" :src="`/api/src?path=${curItem.path}`" class="slide-media">
-        <video v-else-if="curItem.type==='video'" :src="`/api/src?path=${curItem.path}`" controls autoplay class="slide-media"></video>
+    <!-- 幻灯片全屏预览 -->
+    <div v-if="slideShow" class="slide-mask" @click="slideShow=false">
+      <div class="slide-content">
+        <img v-if="currentSlide.type==='image'" :src="currentSlide.src" alt="" />
+        <video v-else controls :src="currentSlide.src"></video>
+        <div class="slide-name">{{ currentSlide.name }}</div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from "vue"
-const curDir = ref("")
-const breadList = ref([])
+import { ref, reactive, computed, watch } from 'vue'
+
+const baseUrl = ''
 const mediaList = ref([])
+const currentDir = ref('')
+const breadcrumbList = ref([])
+const layoutMode = ref('waterfall')
+
+// 预览
+const previewShow = ref(false)
+const previewItem = ref(null)
+
+// 幻灯片
+const settingShow = ref(false)
 const slideDelay = ref(3)
-const loopPlay = ref(false)
-const slideOpen = ref(false)
-const curIdx = ref(0)
-const curItem = ref(null)
+const slideLoop = ref(true)
+const slideShow = ref(false)
+const slideIndex = ref(0)
 const slideTimer = ref(null)
-const imgOnlyList = ref([])
+const slideList = ref([])
+const currentSlide = ref({})
 
-async function loadSetting() {
-  const res = await fetch("/api/get-setting")
-  const d = await res.json()
-  slideDelay.value = d.slide_delay ?? 3
-  loopPlay.value = !!d.loop
-}
-async function saveSetting() {
-  await fetch("/api/save-setting", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({slide_delay: slideDelay.value, loop: loopPlay.value})
-  })
+// 加载目录媒体列表
+async function loadMedia(dir = '') {
+  const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
+  const data = await res.json()
+  mediaList.value = data.list || []
+  currentDir.value = dir
+  breadcrumbList.value = data.breadcrumb || []
 }
 
-async function loadList() {
-  const q = new URLSearchParams({dir:curDir.value, page:1, size:999})
-  const res = await fetch(`/api/list?${q}`)
-  const dat = await res.json()
-  mediaList.value = dat.list
-  imgOnlyList.value = dat.list.filter(x=>x.type==="image")
-  breadList.value = curDir.value.split("/").filter(Boolean)
+// 切换目录
+function changeDir(path) {
+  loadMedia(path)
 }
-function goRoot() {
-  curDir.value = ""
+
+// 切换布局
+function toggleLayout() {
+  layoutMode.value = layoutMode.value === 'waterfall' ? 'grid' : 'waterfall'
 }
-function openFolder(p) {
-  curDir.value = p
+
+// 【重点修复】打开预览，path 和缩略图保持一致，带 /media/ 前缀
+function openPreview(item) {
+  previewItem.value = {
+    ...item,
+    // 这里和 thumb 的 path 完全对齐，后端 /api/thumb 是 /media/xxx，src 也用一样的
+    src: `${baseUrl}/api/src?path=${encodeURIComponent(item.path)}`
+  }
+  previewShow.value = true
 }
-function navBread(idx) {
-  curDir.value = breadList.value.slice(0, idx+1).join("/")
+
+// 幻灯片
+function openSlideSetting() {
+  settingShow.value = true
 }
-function openMedia(it) {
-  curItem.value = it
-  slideOpen.value = true
-  stopTimer()
+function saveSetting() {
+  settingShow.value = false
 }
 function startSlide() {
-  if(!imgOnlyList.value.length) return alert("当前目录无图片")
-  curIdx.value = 0
-  curItem.value = imgOnlyList.value[0]
-  slideOpen.value = true
+  slideList.value = mediaList.value.filter(i => i.type === 'image')
+  if (slideList.value.length === 0) return alert('当前目录没有图片，无法幻灯片')
+  slideIndex.value = 0
+  slideShow.value = true
   runSlide()
 }
 function runSlide() {
-  stopTimer()
-  slideTimer.value = setInterval(()=>{
-    curIdx.value++
-    if(curIdx.value >= imgOnlyList.value.length) {
-      if(loopPlay.value) curIdx.value = 0
-      else {closeSlide();return}
+  clearTimeout(slideTimer.value)
+  currentSlide.value = slideList.value[slideIndex.value]
+  currentSlide.value.src = `${baseUrl}/api/src?path=${encodeURIComponent(currentSlide.value.path)}`
+  slideTimer.value = setTimeout(() => {
+    slideIndex.value++
+    if (slideIndex.value >= slideList.value.length) {
+      if (slideLoop.value) slideIndex.value = 0
+      else { slideShow.value = false; return }
     }
-    curItem.value = imgOnlyList.value[curIdx.value]
+    runSlide()
   }, slideDelay.value * 1000)
 }
-function stopTimer() {
-  if(slideTimer.value) clearInterval(slideTimer.value)
+
+function closePreview() {
+  previewShow.value = false
+  previewItem.value = null
 }
-function closeSlide() {
-  slideOpen.value = false
-  stopTimer()
-}
-watch([slideDelay, loopPlay], ()=>saveSetting())
-watch(curDir, loadList, {immediate:true})
-onMounted(loadSetting)
+
+loadMedia()
 </script>
 
 <style scoped>
-.app-wrap {
-  min-height:100vh;
-  background:#121212;
-  color:#eee;
-  padding:16px;
-  box-sizing:border-box;
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
-.header-bar {
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
-  margin-bottom:16px;
-  flex-wrap:wrap;
-  gap:12px;
+.app-container {
+  min-height: 100vh;
+  background: #121212;
+  color: #eee;
+  padding: 16px;
 }
-.breadcrumb {
-  font-size:15px;
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 12px;
 }
-.breadcrumb span {
-  cursor:pointer;
-  color:#8cf;
+.header h1 {
+  font-size: 22px;
+  color: #fff;
 }
-.sep {
-  margin:0 6px;
-  color:#666;
-  cursor:default !important;
-}
-.ctrl-group {
-  display:flex;
-  align-items:center;
-  gap:8px;
-}
-.inp {
-  width:60px;
-  background:#222;
-  border:1px solid #444;
-  color:#fff;
-  padding:4px;
-  border-radius:4px;
-}
-.check {
-  display:flex;
-  align-items:center;
-  gap:4px;
+.header-actions {
+  display: flex;
+  gap: 10px;
 }
 .btn {
-  background:#2563eb;
-  color:white;
-  border:none;
-  padding:6px 12px;
-  border-radius:6px;
-  cursor:pointer;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 6px;
+  background: #2a2a2a;
+  color: #fff;
+  cursor: pointer;
 }
+.btn.primary {
+  background: #2563eb;
+}
+.breadcrumb {
+  margin-bottom: 16px;
+  color: #aaa;
+}
+.breadcrumb-item {
+  color: #60a5fa;
+  cursor: pointer;
+}
+.separator {
+  margin: 0 6px;
+}
+
 .waterfall {
-  display:grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  column-count: 4;
+  column-gap: 14px;
+}
+.grid-layout {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap:14px;
 }
-.card {
-  background:#1e1e1e;
-  border-radius:10px;
-  overflow:hidden;
-  cursor:pointer;
-  transition:0.2s;
+.media-card, .grid-card {
+  break-inside: avoid;
+  background: #1e1e1e;
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom:14px;
+  cursor: pointer;
+  transition: 0.2s ease;
 }
-.card:hover {
-  transform:translateY(-3px);
-  box-shadow:0 6px 14px #0006;
+.media-card:hover, .grid-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 8px 20px #0005;
 }
-.folder-preview, .media-preview {
+.card-thumb {
   width:100%;
-  aspect-ratio:16/12;
-  background:#292929;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  overflow:hidden;
+  height: 180px;
+  overflow: hidden;
+  background:#222;
   position:relative;
 }
-.cover-img {
+.card-thumb img {
   width:100%;
   height:100%;
   object-fit:cover;
 }
-.play-mark {
+.play-icon {
   position:absolute;
-  width:40px;height:40px;
-  background:#0008;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  width:44px;
+  height:44px;
+  background:rgba(0,0,0,0.6);
   border-radius:50%;
-  color:white;
   display:flex;
   align-items:center;
   justify-content:center;
   font-size:18px;
 }
-.folder-name, .media-name {
+.card-name {
   padding:8px 10px;
-  font-size:14px;
-  white-space:nowrap;
-  overflow:hidden;
-  text-overflow:ellipsis;
+  font-size:13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.slide-modal {
+
+.preview-mask {
   position:fixed;
   inset:0;
-  background:#000c;
+  background:rgba(0,0,0,0.85);
+  z-index:99;
   display:flex;
   align-items:center;
   justify-content:center;
-  z-index:999;
 }
-.slide-media {
+.preview-box {
+  background:#181818;
+  border-radius:12px;
+  padding:12px;
   max-width:90vw;
   max-height:90vh;
+  position:relative;
+}
+.close-btn {
+  position:absolute;
+  top: 4px;
+  right: 4px;
+  width:28px;
+  height:28px;
+  border-radius:50%;
+  background:#333;
+  color:#fff;
+  border:none;
+  font-size:20px;
+  cursor:pointer;
+  z-index:2;
+}
+.preview-media {
+  max-width:85vw;
+  max-height:80vh;
+}
+.preview-media img, .preview-media video {
+  max-width:100%;
+  max-height:80vh;
+  display:block;
+}
+.preview-name {
+  text-align:center;
+  margin-top:8px;
+  font-size:14px;
+}
+
+.setting-box {
+  background:#181818;
+  border-radius:12px;
+  padding:24px;
+  width:360px;
+}
+.form-row {
+  margin:14px 0;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.btn-group {
+  display:flex;
+  gap:10px;
+  justify-content:flex-end;
+  margin-top:20px;
+}
+
+.slide-mask {
+  position:fixed;
+  inset:0;
+  background:#000;
+  z-index:100;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+.slide-content img, .slide-content video {
+  max-width:98vw;
+  max-height:98vh;
+}
+.slide-name {
+  position:absolute;
+  bottom:16px;
+  color:#fff;
+  font-size:14px;
 }
 </style>
