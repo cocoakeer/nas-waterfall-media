@@ -57,7 +57,7 @@
       </span>
     </div>
 
-    <!-- JS横向优先瀑布流容器 -->
+    <!-- JS横向优先瀑布流容器 方案A 290px卡片 -->
     <div ref="waterfallBoxRef" class="waterfall-wrap">
       <div
         v-for="item in mediaList"
@@ -326,39 +326,42 @@ let statusPollTimer = null
 
 const STORAGE_KEY = "waterfall_last_dir"
 
-// ========= JS瀑布流配置【横向优先：先排满一行再下一行】 =========
+// ========= JS瀑布流配置【方案A：卡片290px｜横向优先行优先排序】 =========
 const waterfallConfig = {
-  cardWidth: 260,
+  cardWidth: 290,
   gap: 14
 }
 let resizeTimer = null
 
 /**
- * 横向优先（行优先）布局：索引 % 列数 → 当前放在第几列
+ * 横向优先（行优先）瀑布流计算
+ * 逻辑：一行排满列数，再下一行
  */
 function layoutWaterfall(){
   if(!waterfallBoxRef.value || !mediaList.value.length) return
-  const boxW = waterfallBoxRef.value.clientWidth
-  const colCount = Math.max(1, Math.floor((boxW + waterfallConfig.gap) / (waterfallConfig.cardWidth + waterfallConfig.gap)))
+  const boxWidth = waterfallBoxRef.value.clientWidth
+  const colCount = Math.max(1, Math.floor((boxWidth + waterfallConfig.gap) / (waterfallConfig.cardWidth + waterfallConfig.gap)))
 
+  // 每列高度记录
   const colHeights = new Array(colCount).fill(0)
 
   mediaList.value.forEach((item, idx)=>{
-    // 行优先逻辑：0%4=0，1%4=1，2%4=2，3%4=3；4%4=0，实现一行一行横向排布
-    const colIdx = idx % colCount
-    const left = colIdx * (waterfallConfig.cardWidth + waterfallConfig.gap)
+    // 行优先逻辑：索引 % 列数，实现一行一行横向排布
+    const colIndex = idx % colCount
+    const left = colIndex * (waterfallConfig.cardWidth + waterfallConfig.gap)
 
     const dom = waterfallBoxRef.value.children[idx]
-    let h = 280
-    if(dom) h = dom.offsetHeight || 280
+    let cardH = 280
+    if(dom) cardH = dom.offsetHeight || 280
 
-    const top = colHeights[colIdx]
-    colHeights[colIdx] = top + h + waterfallConfig.gap
+    const top = colHeights[colIndex]
+    colHeights[colIndex] = top + cardH + waterfallConfig.gap
 
     item._left = left
     item._top = top
   })
 
+  // 设置容器总高度
   const maxH = Math.max(...colHeights)
   waterfallBoxRef.value.style.height = maxH + 'px'
 }
@@ -366,19 +369,21 @@ function layoutWaterfall(){
 // 图片加载完成防抖重布局
 function onImageLoaded(){
   clearTimeout(resizeTimer)
-  resizeTimer = setTimeout(layoutWaterfall,120)
+  resizeTimer = setTimeout(()=>{
+    layoutWaterfall()
+  },120)
 }
 
-// 监听数据变更，重新布局
 watch(mediaList, async ()=>{
   await nextTick()
   layoutWaterfall()
 },{deep:true})
 
-// 窗口缩放
 function onWindowResize(){
   clearTimeout(resizeTimer)
-  resizeTimer = setTimeout(layoutWaterfall,150)
+  resizeTimer = setTimeout(()=>{
+    layoutWaterfall()
+  },150)
 }
 
 const getThumbUrl = (path) => {
@@ -1114,14 +1119,14 @@ onUnmounted(() => {
   margin: 0 6px;
 }
 
-/* JS横向优先瀑布流容器 */
+/* ========= JS横向优先瀑布流容器｜方案A卡片290px ========= */
 .waterfall-wrap {
   width: 100%;
   position: relative;
 }
 
 .media-card {
-  width: 260px;
+  width: 290px;
   position: absolute;
   background: #1e1e1e;
   border-radius: 10px;
@@ -1138,7 +1143,7 @@ onUnmounted(() => {
   width: 100%;
   overflow: hidden;
   background: #222;
-  display:block;
+  display: block;
   position:relative;
 }
 .card-thumb img {
@@ -1146,6 +1151,7 @@ onUnmounted(() => {
   height: auto;
   display: block;
 }
+
 .play-icon {
   position: absolute;
   top: 50%;
