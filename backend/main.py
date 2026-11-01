@@ -11,14 +11,18 @@ from pydantic import BaseModel, Field
 import uvicorn
 from PIL import Image
 
-# ========== 配置读取 ==========
+# ========== 配置读取 适配compose CONFIG_PATH / CACHE_PATH ==========
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
-CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
-CACHE_DIR = Path(os.getenv("CACHE_DIR", "/cache"))
-CONFIG_DIR.mkdir(exist_ok=True)
-CACHE_DIR.mkdir(exist_ok=True)
+CONFIG_DIR = Path(os.getenv("CONFIG_PATH", "/app/config"))
+CACHE_DIR = Path(os.getenv("CACHE_PATH", "/app/cache"))
+
+# 创建目录并设置权限，打印路径用于排错
+CONFIG_DIR.mkdir(exist_ok=True, mode=0o775)
+CACHE_DIR.mkdir(exist_ok=True, mode=0o775)
 
 USER_CONFIG_PATH = CONFIG_DIR / "users.json"
+print(f"[CONFIG] 用户配置文件路径: {USER_CONFIG_PATH}")
+
 SESSION_EXPIRE_SEC = 86400
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -44,6 +48,10 @@ class AdminUserForm(BaseModel):
     password: Optional[str] = Field(None, description="新增必填；编辑留空则不修改密码")
     allow_dirs: List[str]
 
+class UserRenameForm(BaseModel):
+    old_username: str
+    new_username: str
+
 # 内存会话存储
 sessions: Dict[str, str] = {}
 
@@ -57,7 +65,7 @@ def load_users() -> List[UserItem]:
                 "allow_dirs": ["/"]
             }
         ]
-        USER_CONFIG_PATH.write_text(json.dumps(init_data, ensure_ascii=False, indent=2))
+        USER_CONFIG_PATH.write_text(json.dumps(init_data, ensure_ascii=False, indent=2), encoding="utf-8")
     raw = json.loads(USER_CONFIG_PATH.read_text(encoding="utf-8"))
     return [UserItem(**x) for x in raw]
 
@@ -108,6 +116,19 @@ def check_path_allowed(user: UserItem, target_dir: str) -> Path:
     if not ok:
         raise HTTPException(status_code=403, detail="无权访问该目录")
     return req_path
+
+# 获取media根下全部一级子目录（给前端下拉选择）
+def scan_media_root_dirs() -> List[str]:
+    base = Path(MEDIA_ROOT).resolve()
+    dir_list = ["/"]
+    try:
+        for entry in base.iterdir():
+            if entry.is_dir():
+                rel = "/" + str(entry.relative_to(base)).replace(os.sep, "/")
+                dir_list.append(rel)
+    except Exception:
+        pass
+    return dir_list
 
 # ========== APP初始化 ==========
 app = FastAPI()
@@ -171,20 +192,40 @@ async def admin_get_all_users(_admin: UserItem = Depends(require_admin)):
         })
     return {"code":0, "list": out}
 
-## 管理员新增/编辑用户
+## 获取媒体库目录下拉选项
+@app.get("/api/admin/dirs")
+async def admin_get_dir_options(_admin: UserItem = Depends(require_admin)):
+    dir_options = scan_media_root_dirs()
+    return {"code":0, "options": dir_options}
+
+## 管理员重命名用户名
+@app.post("/api/admin/user-rename")
+async def admin_rename_user(form: UserRenameForm, _admin: UserItem = Depends(require_admin)):
+    reload_users()
+    old = form.old_username.strip()
+    new = form.new_username.strip()
+    if not old or not new:
+        raise HTTPException(400, "用户名不能为空")
+    if old == new:
+        return {"code":0, "msg":"未变更"}
+    if next((u for u in users if u.username == new), None) is not None:
+        raise HTTPException(400, "新用户名已存在")
+    u_target = next((u for u in users if u.username == old), None)
+    if u_target is None:
+        raise HTTPException(404, "原用户不存在")
+    # 更新内存会话中该用户的session映射
+    for sid, uname in list(sessions.items()):
+        if uname == old:
+            sessions[sid] = new
+    u_target.username = new
+    save_users(users)
+    return {"code":0, "msg":"用户名修改成功"}
+
+## 管理员新增/编辑用户（不含重命名，重命名单独接口）
 @app.post("/api/admin/user-save")
 async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(require_admin)):
     reload_users()
     exist = next((u for u in users if u.username == form.username), None)
-    # admin用户名禁止修改删除
-    if form.username.lower() == "admin":
-        if form.password is not None:
-            u_admin = next(x for x in users if x.username == "admin")
-            u_admin.password_hash = bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode()
-        u_admin.allow_dirs = form.allow_dirs
-        save_users(users)
-        return {"code":0,"msg":"管理员账号已更新"}
-
     if exist is not None:
         # 编辑已有用户
         if form.password is not None and form.password.strip()!="":
@@ -207,10 +248,14 @@ async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(requir
 @app.delete("/api/admin/user/{username}")
 async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin)):
     if username == "admin":
-        raise HTTPException(400, "禁止删除admin管理员账号")
+        raise HTTPException(400, "禁止删除admin账号")
     reload_users()
     global users
     users = [u for u in users if u.username != username]
+    # 清理该用户全部session
+    to_del = [k for k, v in sessions.items() if v == username]
+    for k in to_del:
+        del sessions[k]
     save_users(users)
     return {"code":0,"msg":"已删除"}
 
@@ -286,7 +331,7 @@ async def api_src(path: str, user: UserItem = Depends(get_current_user)):
         raise HTTPException(404)
     return FileResponse(fp)
 
-# ========== 缩略图占位，你原有缩略逻辑放回这里 ==========
+# ========== 缩略图占位 ==========
 @app.get("/api/thumb")
 async def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
     fp = check_path_allowed(user, path)

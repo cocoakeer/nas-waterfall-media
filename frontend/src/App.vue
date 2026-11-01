@@ -191,18 +191,35 @@
           </div>
         </div>
         <div class="divider"></div>
+
         <div class="form-row">
           <label>用户名</label>
-          <input v-model="editUserForm.username" :disabled="editUserForm.username==='admin'" />
+          <div style="display:flex;gap:8px;">
+            <input v-model="editUserForm.username" style="flex:1"/>
+            <button @click="submitRenameUser" class="btn">修改用户名</button>
+          </div>
         </div>
+
         <div class="form-row">
           <label>密码(编辑留空不修改)</label>
           <input v-model="editUserForm.password" type="password" placeholder="新增必填"/>
         </div>
+
         <div class="form-row">
-          <label>允许访问目录，分号分隔 例：/photos;/video</label>
-          <input v-model="editDirText" placeholder="/photos;/movie"/>
+          <label>允许访问目录（多选）</label>
+          <div class="multi-select-wrap">
+            <div v-for="opt in dirOptions" class="check-item">
+              <input
+                type="checkbox"
+                :value="opt"
+                v-model="selectedDirList"
+                :id="'dir_'+opt"
+              />
+              <label :for="'dir_'+opt">{{opt}}</label>
+            </div>
+          </div>
         </div>
+
         <div class="msg-tip">{{adminMsg}}</div>
         <div class="btn-group">
           <button @click="clearEditForm" class="btn">清空新增</button>
@@ -246,7 +263,9 @@ const userManageModal = ref(false)
 const adminUserList = ref([])
 const adminMsg = ref("")
 const editUserForm = ref({username:"",password:""})
-const editDirText = ref("")
+// 目录多选下拉
+const dirOptions = ref([])
+const selectedDirList = ref([])
 
 const mediaList = ref([])
 const breadcrumbList = ref([])
@@ -714,13 +733,23 @@ async function submitChangePwd(){
   }
 }
 
-// 管理员用户管理
+// 管理员：用户管理
 async function openUserManageModal(){
   showUserDrop.value = false
   userManageModal.value = true
   adminMsg.value = ""
   clearEditForm()
+  await reloadDirOptions()
   await reloadAdminUserList()
+}
+async function reloadDirOptions(){
+  try{
+    const res = await fetch("/api/admin/dirs")
+    const json = await res.json()
+    if(json.code===0){
+      dirOptions.value = json.options
+    }
+  }catch(e){}
 }
 async function reloadAdminUserList(){
   try{
@@ -735,15 +764,50 @@ async function reloadAdminUserList(){
 }
 function clearEditForm(){
   editUserForm.value = {username:"",password:""}
-  editDirText.value = ""
+  selectedDirList.value = []
   adminMsg.value = ""
 }
 function editUser(u){
   editUserForm.value.username = u.username
   editUserForm.value.password = ""
-  editDirText.value = u.allow_dirs.join(";")
+  selectedDirList.value = [...u.allow_dirs]
   adminMsg.value = ""
 }
+
+// 修改用户名
+async function submitRenameUser(){
+  adminMsg.value = ""
+  const oldU = editUserForm.value.username.trim()
+  if(!oldU){
+    adminMsg.value = "请先编辑选中一个用户"
+    return
+  }
+  const newName = prompt("输入新用户名", oldU)
+  if(!newName || !newName.trim()) return
+  const newTrim = newName.trim()
+  if(newTrim === oldU){
+    adminMsg.value = "用户名未变化"
+    return
+  }
+  try{
+    const res = await fetch("/api/admin/user-rename",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({old_username:oldU, new_username:newTrim})
+    })
+    const json = await res.json()
+    if(json.code===0){
+      adminMsg.value = "用户名修改成功"
+      editUserForm.value.username = newTrim
+      await reloadAdminUserList()
+    }else{
+      adminMsg.value = json.detail || "修改失败"
+    }
+  }catch(e){
+    adminMsg.value = "网络异常"
+  }
+}
+
 async function submitSaveUser(){
   adminMsg.value = ""
   const username = editUserForm.value.username.trim()
@@ -751,15 +815,14 @@ async function submitSaveUser(){
     adminMsg.value = "用户名不能为空"
     return
   }
-  const dirArr = editDirText.value.split(";").map(s=>s.trim()).filter(s=>!!s)
-  if(dirArr.length===0){
-    adminMsg.value = "至少填写一个允许访问目录"
+  if(selectedDirList.value.length===0){
+    adminMsg.value = "至少勾选一个允许访问目录"
     return
   }
   const body = {
     username:username,
     password: editUserForm.value.password.trim() || null,
-    allow_dirs: dirArr
+    allow_dirs: selectedDirList.value
   }
   try{
     const res = await fetch("/api/admin/user-save",{
@@ -1182,7 +1245,7 @@ onUnmounted(() => {
   background:#181818;
   border-radius:12px;
   padding:24px;
-  width:620px;
+  width:660px;
   max-height:85vh;
   overflow-y:auto;
 }
@@ -1197,7 +1260,7 @@ onUnmounted(() => {
   border-bottom:1px solid #333;
 }
 .u-name {
-  width:120px;
+  width:140px;
 }
 .u-dir {
   flex:1;
@@ -1237,6 +1300,25 @@ onUnmounted(() => {
   border:none;
   border-radius:6px;
   color:#fff;
+}
+
+.multi-select-wrap {
+  width:100%;
+  max-height:220px;
+  overflow-y:auto;
+  background:#2a2a2a;
+  border-radius:6px;
+  padding:10px;
+}
+.check-item {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:4px 0;
+}
+.check-item label {
+  color:#eee;
+  font-size:14px;
 }
 
 .btn-group {
