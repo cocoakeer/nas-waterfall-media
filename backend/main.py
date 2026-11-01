@@ -11,7 +11,6 @@ Image.MAX_IMAGE_PIXELS = None
 
 app = FastAPI(title="NAS Waterfall Media")
 
-# 跨域中间件，本地调试用，容器部署无副作用
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,12 +28,36 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi"}
+COVER_NAMES = {"cover.jpg", "cover.png", "cover.webp", "Cover.jpg", "Cover.png", "Cover.webp"}
 
 app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="assets")
 
 @app.get("/")
 async def index():
     return FileResponse("/frontend/dist/index.html")
+
+
+def get_folder_cover(folder_abs: str, base_abs: str):
+    """获取文件夹封面：优先cover.*，否则取目录第一个图片；返回相对路径，无则返回None"""
+    cover_candidate = None
+    media_first = None
+    try:
+        for name in os.listdir(folder_abs):
+            full = os.path.join(folder_abs, name)
+            if os.path.isfile(full):
+                if name in COVER_NAMES:
+                    rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
+                    cover_candidate = "/" + rel
+                ext = os.path.splitext(name)[1].lower()
+                if ext in IMAGE_EXT and media_first is None and name.lower() not in {"cover.jpg", "cover.png", "cover.webp"}:
+                    rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
+                    media_first = "/" + rel
+    except Exception:
+        pass
+    if cover_candidate:
+        return cover_candidate
+    return media_first
+
 
 @app.get("/api/list")
 async def list_dir(dir: str = ""):
@@ -58,15 +81,20 @@ async def list_dir(dir: str = ""):
 
         items = []
         for name in os.listdir(target):
+            # 过滤cover封面文件，不展示列表
+            if name in COVER_NAMES:
+                continue
             full = os.path.join(target, name)
             rel_path = os.path.relpath(full, base).replace(os.sep, "/")
             ext = os.path.splitext(name)[1].lower()
             if os.path.isdir(full):
+                cover_path = get_folder_cover(full, base)
                 items.append({
                     "id": rel_path,
                     "name": name,
                     "path": "/" + rel_path,
-                    "type": "folder"
+                    "type": "folder",
+                    "cover_path": cover_path
                 })
             elif ext in IMAGE_EXT:
                 items.append({
