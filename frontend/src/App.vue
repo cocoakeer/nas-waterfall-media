@@ -56,7 +56,8 @@
         <span @click="changeDir(item.path)" class="breadcrumb-item">{{ item.name }}</span>
       </span>
     </div>
-    <div ref="waterfallRef" class="waterfall-wrap">
+    <!-- 【CSS原生瀑布流，移除JS绝对定位】 -->
+    <div class="waterfall-wrap">
       <div
         v-for="item in mediaList"
         :key="item.id"
@@ -70,8 +71,6 @@
               :src="getThumbUrl(item.cover_path)"
               alt=""
               loading="lazy"
-              @load="onMediaImgFinish"
-              @error="onMediaImgFinish"
             />
             <svg v-else width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
               <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" />
@@ -82,16 +81,12 @@
             :src="getThumbUrl(item.path)"
             alt=""
             loading="lazy"
-            @load="onMediaImgFinish"
-            @error="onMediaImgFinish"
           />
           <div v-else-if="item.type === 'video'" class="video-wrap">
             <img
               :src="getThumbUrl(item.path)"
               alt=""
               loading="lazy"
-              @load="onMediaImgFinish"
-              @error="onMediaImgFinish"
             />
             <div class="play-icon">▶</div>
           </div>
@@ -264,7 +259,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 
 const baseUrl = ''
 // 初始化加载标记：修复刷新闪现登录页
@@ -302,8 +297,6 @@ const umDelConfirm = ref({
 
 const mediaList = ref([])
 const breadcrumbList = ref([])
-const waterfallRef = ref(null)
-const isLoading = ref(false)
 
 const previewShow = ref(false)
 const previewItem = ref(null)
@@ -319,9 +312,6 @@ const slideIndex = ref(0)
 const slideTimer = ref(null)
 const slideList = ref([])
 const currentSlide = ref({})
-
-let resizeObserver = null
-let layoutDebounceTimer = null
 
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
@@ -356,68 +346,6 @@ function resetRotate() {
 function openOriginal() {
   window.open(getSrcUrl(previewItem.value.path), '_blank')
 }
-
-function getColumnCount() {
-  const w = window.innerWidth
-  if (w <= 480) return 1
-  if (w <= 768) return 2
-  if (w <= 1200) return 3
-  return 4
-}
-
-function layoutWaterfall() {
-  if (!waterfallRef.value) return
-  const container = waterfallRef.value
-  const cards = Array.from(container.querySelectorAll('.media-card'))
-  const colCount = getColumnCount()
-  const gap = 14
-
-  container.style.position = 'relative'
-  cards.forEach(card => {
-    card.style.position = 'absolute'
-    // 关键修复：图片未加载完成，强制最小占位高度，保证点击区域可用
-    if (!card.offsetHeight || card.offsetHeight < 120) {
-      card.style.height = '220px'
-    }
-  })
-
-  const colHeights = new Array(colCount).fill(0)
-  const cardWidth = (container.clientWidth - gap * (colCount - 1)) / colCount
-
-  for (const card of cards) {
-    let minCol = 0
-    for (let i = 0; i < colCount; i++) {
-      if (colHeights[i] < colHeights[minCol]) minCol = i
-    }
-    card.style.width = cardWidth + 'px'
-    card.style.left = minCol * (cardWidth + gap) + 'px'
-    card.style.top = colHeights[minCol] + 'px'
-    colHeights[minCol] += card.offsetHeight + gap
-  }
-  container.style.height = Math.max(...colHeights) + 'px'
-}
-
-function debounceLayout() {
-  clearTimeout(layoutDebounceTimer)
-  layoutDebounceTimer = setTimeout(() => {
-    layoutWaterfall()
-  }, 80)
-}
-
-function onMediaImgFinish() {
-  debounceLayout()
-}
-
-// =========【重点修复】侦听mediaList数据变化，自动执行布局 =========
-watch(mediaList, () => {
-  if (mediaList.value.length === 0) return
-  nextTick(()=>{
-    layoutWaterfall()
-    setTimeout(()=>{
-      layoutWaterfall()
-    },0)
-  })
-},{deep:true})
 
 async function pollCacheStatus() {
   try {
@@ -509,10 +437,10 @@ function checkAuthResp(r) {
   }
 }
 
+let isLoading = ref(false)
 async function loadMedia(dir = '', pushHistory = false) {
   if(isLoading.value) return
   isLoading.value = true
-  // 切换目录立刻清空旧DOM，避免旧元素干扰
   mediaList.value = []
   breadcrumbList.value = []
   try {
@@ -522,7 +450,6 @@ async function loadMedia(dir = '', pushHistory = false) {
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
     localStorage.setItem(STORAGE_KEY, dir)
-
     if (pushHistory) {
       syncDirToUrl(dir)
     }
@@ -692,7 +619,7 @@ function closePreview() {
 }
 
 function onWindowResize() {
-  debounceLayout()
+  // CSS原生瀑布流不需要JS重布局
 }
 
 function onPopState(e) {
@@ -744,7 +671,6 @@ async function checkLoginStatus() {
   } catch(e) {
     isLogin.value = false
   } finally {
-    // 鉴权请求完成，关闭初始化遮罩，消除刷新闪现登录页
     initLoading.value = false
   }
 }
@@ -946,11 +872,6 @@ onMounted(() => {
       exitSlide()
     }
   })
-
-  resizeObserver = new ResizeObserver(() => {
-    debounceLayout()
-  })
-  if (waterfallRef.value) resizeObserver.observe(waterfallRef.value)
 })
 
 onUnmounted(() => {
@@ -958,8 +879,6 @@ onUnmounted(() => {
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('popstate', onPopState)
   document.removeEventListener("click", onClickOutsideDrop)
-  if (resizeObserver) resizeObserver.disconnect()
-  clearTimeout(layoutDebounceTimer)
   if (statusPollTimer) clearInterval(statusPollTimer)
   clearTimeout(slideTimer.value)
 })
@@ -1136,10 +1055,28 @@ onUnmounted(() => {
   margin: 0 6px;
 }
 
+/* ========= CSS原生瀑布流【彻底移除JS绝对定位】 ========= */
 .waterfall-wrap {
   width: 100%;
-  min-height: 200px;
-  position: relative;
+  /* 核心：CSS多列瀑布流 masonry */
+  column-count: 4;
+  column-gap: 14px;
+}
+/* 响应式列数 */
+@media (max-width:1200px){
+  .waterfall-wrap{
+    column-count:3;
+  }
+}
+@media (max-width:768px){
+  .waterfall-wrap{
+    column-count:2;
+  }
+}
+@media (max-width:480px){
+  .waterfall-wrap{
+    column-count:1;
+  }
 }
 
 .media-card {
@@ -1148,6 +1085,9 @@ onUnmounted(() => {
   overflow: hidden;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
+  /* 重要：防止卡片被列分割切断 */
+  break-inside: avoid;
+  margin-bottom:14px;
 }
 .media-card:hover {
   transform: translateY(-3px);
@@ -1429,7 +1369,6 @@ onUnmounted(() => {
   font-size:13px;
   min-height:20px;
 }
-
 .inner-confirm-mask{
   position:absolute;
   inset:0;
@@ -1450,7 +1389,6 @@ onUnmounted(() => {
   justify-content:flex-end;
   margin-top:18px;
 }
-
 .btn-group {
   display: flex;
   gap: 10px;
