@@ -1,10 +1,18 @@
-# Mac系统文件
+# Mac系统垃圾文件
 .DS_Store
-# 脚本自身
+# 本地部署脚本
 deploy.sh
-# 前端打包产物
+# docker忽略配置
+.dockerignore
+# 前端本地打包产物
 frontend/dist/
-# 依赖缓存
+# node依赖
 node_modules/
+frontend/node_modules/
+# python缓存
 __pycache__/
 *.pyc
+*.pyo
+*.log
+cache/
+config/
