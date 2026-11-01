@@ -56,7 +56,7 @@
         <span @click="changeDir(item.path)" class="breadcrumb-item">{{ item.name }}</span>
       </span>
     </div>
-    <!-- 【CSS原生瀑布流，移除JS绝对定位】 -->
+    <!-- CSS Grid masonry 横向优先瀑布流 -->
     <div class="waterfall-wrap">
       <div
         v-for="item in mediaList"
@@ -619,7 +619,7 @@ function closePreview() {
 }
 
 function onWindowResize() {
-  // CSS原生瀑布流不需要JS重布局
+  // grid masonry 浏览器原生处理，不需要JS
 }
 
 function onPopState(e) {
@@ -1055,28 +1055,15 @@ onUnmounted(() => {
   margin: 0 6px;
 }
 
-/* ========= CSS原生瀑布流【彻底移除JS绝对定位】 ========= */
+/* ========= CSS Grid masonry【横向优先瀑布流】 ========= */
 .waterfall-wrap {
   width: 100%;
-  /* 核心：CSS多列瀑布流 masonry */
-  column-count: 4;
-  column-gap: 14px;
-}
-/* 响应式列数 */
-@media (max-width:1200px){
-  .waterfall-wrap{
-    column-count:3;
-  }
-}
-@media (max-width:768px){
-  .waterfall-wrap{
-    column-count:2;
-  }
-}
-@media (max-width:480px){
-  .waterfall-wrap{
-    column-count:1;
-  }
+  display: grid;
+  /* 自适应列宽，最小220px */
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+  /* 开启masonry，横向顺序排列，高度自适应 */
+  grid-template-rows: masonry;
 }
 
 .media-card {
@@ -1085,9 +1072,6 @@ onUnmounted(() => {
   overflow: hidden;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
-  /* 重要：防止卡片被列分割切断 */
-  break-inside: avoid;
-  margin-bottom:14px;
 }
 .media-card:hover {
   transform: translateY(-3px);
@@ -1369,6 +1353,7 @@ onUnmounted(() => {
   font-size:13px;
   min-height:20px;
 }
+
 .inner-confirm-mask{
   position:absolute;
   inset:0;
@@ -1389,6 +1374,7 @@ onUnmounted(() => {
   justify-content:flex-end;
   margin-top:18px;
 }
+
 .btn-group {
   display: flex;
   gap: 10px;
