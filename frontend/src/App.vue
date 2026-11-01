@@ -1055,60 +1055,64 @@ onUnmounted(() => {
   margin: 0 6px;
 }
 
-/* ========= CSS Grid masonry【横向优先瀑布流】 ========= */
+/* ========= Grid masonry 【图片自适应原始宽高比】 ========= */
 .waterfall-wrap {
   width: 100%;
   display: grid;
-  /* 自适应列宽，最小220px */
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 14px;
-  /* 开启masonry，横向顺序排列，高度自适应 */
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 6px;
   grid-template-rows: masonry;
 }
 
 .media-card {
   background: #1e1e1e;
-  border-radius: 10px;
+  border-radius: 6px;
   overflow: hidden;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
+  /* 图片未加载完成预留占位高度，减少布局跳动 */
+  contain-intrinsic-size: 240px;
 }
 .media-card:hover {
-  transform: translateY(-3px);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.32);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
 }
+
 .card-thumb {
   width: 100%;
   overflow: hidden;
   background: #222;
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: block;
 }
 .card-thumb img {
   width: 100%;
+  /* ✅关键：height:auto，图片高度跟随原图宽高比，完整展示不裁切 */
   height: auto;
   display: block;
 }
+
 .play-icon {
   position: absolute;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  width: 44px;
-  height: 44px;
+  width: 40px;
+  height: 40px;
   background: rgba(0, 0, 0, 0.6);
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
+  font-size: 16px;
   color: #fff;
 }
+.video-wrap{
+  position:relative;
+}
+
 .card-name {
-  padding: 10px 12px;
-  font-size: 13px;
+  padding: 8px 10px;
+  font-size: 12px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1374,7 +1378,6 @@ onUnmounted(() => {
   justify-content:flex-end;
   margin-top:18px;
 }
-
 .btn-group {
   display: flex;
   gap: 10px;
