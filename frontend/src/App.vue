@@ -57,7 +57,7 @@
       </span>
     </div>
 
-    <!-- JS横向优先瀑布流容器 方案A 290px卡片 -->
+    <!-- JS横向优先瀑布流容器 MacBook优选270px -->
     <div ref="waterfallBoxRef" class="waterfall-wrap">
       <div
         v-for="item in mediaList"
@@ -326,9 +326,9 @@ let statusPollTimer = null
 
 const STORAGE_KEY = "waterfall_last_dir"
 
-// ========= JS瀑布流配置【方案A：卡片290px｜横向优先行优先排序】 =========
+// ========= JS瀑布流配置【MacBook优选：卡片270px｜横向优先行优先排序】 =========
 const waterfallConfig = {
-  cardWidth: 290,
+  cardWidth: 270,
   gap: 14
 }
 let resizeTimer = null
@@ -1119,14 +1119,14 @@ onUnmounted(() => {
   margin: 0 6px;
 }
 
-/* ========= JS横向优先瀑布流容器｜方案A卡片290px ========= */
+/* ========= JS横向优先瀑布流容器｜Mac优选270px ========= */
 .waterfall-wrap {
   width: 100%;
   position: relative;
 }
 
 .media-card {
-  width: 290px;
+  width: 270px;
   position: absolute;
   background: #1e1e1e;
   border-radius: 10px;
