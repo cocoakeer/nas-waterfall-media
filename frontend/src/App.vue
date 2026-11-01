@@ -71,21 +71,32 @@
       <div class="preview-box">
         <button class="close-btn" @click="closePreview">×</button>
 
-        <div v-if="previewItem.type === 'image'" class="preview-media">
-          <img :src="getSrcUrl(previewItem.path)" alt="" :style="imgRotateStyle" />
-        </div>
-        <div v-else class="preview-media">
-          <video controls :src="getSrcUrl(previewItem.path)"></video>
+        <!-- 左右翻页箭头 -->
+        <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
+        <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
+
+        <div class="preview-image-area">
+          <img
+            v-if="previewItem.type === 'image'"
+            :src="getSrcUrl(previewItem.path)"
+            alt=""
+            :style="imgRotateStyle"
+          />
+          <video
+            v-else
+            controls
+            :src="getSrcUrl(previewItem.path)"
+          ></video>
         </div>
 
-        <div class="preview-name">{{ previewItem.name }}</div>
-
-        <!-- 图片操作栏：图片外下方 -->
-        <div v-if="previewItem.type === 'image'" class="img-action-bar">
-          <button @click="openOriginal">查看原图</button>
-          <button @click="rotateLeft">↺ 左旋90°</button>
-          <button @click="rotateRight">↻ 右旋90°</button>
-          <button @click="resetRotate">重置旋转</button>
+        <div class="preview-footer">
+          <div class="preview-name">{{ previewItem.name }} ({{ previewCurrentIndex + 1 }} / {{ previewMediaList.length }})</div>
+          <div v-if="previewItem.type === 'image'" class="img-action-bar">
+            <button @click="openOriginal">查看原图</button>
+            <button @click="rotateLeft">↺ 左旋90°</button>
+            <button @click="rotateRight">↻ 右旋90°</button>
+            <button @click="resetRotate">重置旋转</button>
+          </div>
         </div>
       </div>
     </div>
@@ -291,13 +302,11 @@ async function stopCacheTask() {
   }
 }
 
-// 从地址栏读取目录
 function getDirFromUrl() {
   const params = new URLSearchParams(window.location.search)
   return params.get('dir') ?? ''
 }
 
-// 同步目录到地址栏
 function syncDirToUrl(dir) {
   const url = new URL(window.location.href)
   if (dir) {
@@ -425,7 +434,6 @@ function onWindowResize() {
   debounceLayout()
 }
 
-// 浏览器前进后退
 function onPopState(e) {
   const dir = e.state?.dir ?? getDirFromUrl()
   loadMedia(dir, false)
@@ -441,7 +449,6 @@ onMounted(() => {
   })
   if (waterfallRef.value) resizeObserver.observe(waterfallRef.value)
 
-  // 优先地址栏目录，其次本地记忆，最后根目录
   const urlDir = getDirFromUrl()
   const lastDir = localStorage.getItem(STORAGE_KEY) ?? ''
   const initDir = urlDir || lastDir || ''
@@ -591,72 +598,110 @@ onUnmounted(() => {
 .preview-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.85);
+  background: rgba(0, 0, 0, 0.88);
   z-index: 99;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 18px;
 }
 
 .preview-box {
   background: #181818;
   border-radius: 12px;
-  padding: 12px;
-  max-width: 96vw;
-  max-height: 96vh;
+  width: min(97vw, 1280px);
+  height: min(94vh, 960px);
+  max-width: 97vw;
+  max-height: 94vh;
   position: relative;
   display: flex;
   flex-direction: column;
-  align-items: center;
+  overflow: hidden;
 }
 
 .close-btn {
   position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 28px;
-  height: 28px;
+  top: 10px;
+  right: 10px;
+  width: 34px;
+  height: 34px;
   border-radius: 50%;
   background: #333;
   color: #fff;
   border: none;
   font-size: 20px;
   cursor: pointer;
-  z-index: 2;
+  z-index: 4;
 }
 
-.preview-media {
-  width: 100%;
+.arrow-btn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  background: rgba(40,40,40,0.75);
+  color: #fff;
+  border: none;
+  font-size: 26px;
+  cursor: pointer;
+  z-index: 3;
+  transition: background 0.2s;
+}
+.arrow-btn:hover:not(:disabled) {
+  background: rgba(80,80,80,0.9);
+}
+.arrow-btn:disabled {
+  opacity:0.25;
+  cursor: default;
+}
+.arrow-left {
+  left: 12px;
+}
+.arrow-right {
+  right: 12px;
+}
+
+.preview-image-area {
+  flex: 1;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  margin-top: 10px;
-  flex: 1;
+  overflow: hidden;
+  padding: 18px 18px 10px;
 }
 
-/* 核心修改：图片最大化，不超出屏幕 */
-.preview-media img {
-  max-width: 94vw;
-  max-height: 88vh;
+.preview-image-area img {
+  max-width: 100%;
+  max-height: 100%;
   object-fit: contain;
 }
 
-.preview-media video {
-  max-width: 90vw;
-  max-height: 80vh;
+.preview-image-area video {
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.preview-footer {
+  flex-shrink: 0;
+  background: #181818;
+  padding: 10px 16px 14px;
+  border-top: 1px solid #2a2a2a;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
 }
 
 .preview-name {
-  margin-top: 10px;
   font-size: 14px;
   color: #eee;
   text-align: center;
 }
 
-/* 操作栏放到图片外下方 */
 .img-action-bar {
-  margin-top: 14px;
-  margin-bottom: 6px;
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
