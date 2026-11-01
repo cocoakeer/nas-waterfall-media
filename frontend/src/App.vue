@@ -10,7 +10,7 @@
           取消任务
         </button>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
-        <button @click="startSlide" class="btn primary">开始幻灯片</button>
+        <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
       </div>
     </header>
 
@@ -96,6 +96,8 @@
             <button @click="rotateLeft">↺ 左旋90°</button>
             <button @click="rotateRight">↻ 右旋90°</button>
             <button @click="resetRotate">重置旋转</button>
+            <!-- 新增：从当前图片开始幻灯片 -->
+            <button @click="startSlideFromCurrent">从此处开始幻灯片</button>
           </div>
         </div>
       </div>
@@ -121,11 +123,12 @@
     </div>
 
     <!-- 幻灯片全屏预览 -->
-    <div v-if="slideShow" class="slide-mask" @click="slideShow=false">
+    <div v-if="slideShow" ref="slideRootRef" class="slide-mask">
       <div class="slide-content">
         <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
         <video v-else controls :src="getSrcUrl(currentSlide.path)"></video>
         <div class="slide-name">{{ currentSlide.name }}</div>
+        <button class="slide-exit-btn" @click="exitSlide">退出全屏</button>
       </div>
     </div>
   </div>
@@ -138,6 +141,7 @@ const baseUrl = ''
 const mediaList = ref([])
 const breadcrumbList = ref([])
 const waterfallRef = ref(null)
+const slideRootRef = ref(null)
 
 const previewShow = ref(false)
 const previewItem = ref(null)
@@ -399,12 +403,57 @@ function saveSetting() {
   settingShow.value = false
 }
 
-function startSlide() {
+// 从当前目录第一张开始
+function startSlideFromDir() {
   slideList.value = mediaList.value.filter(i => i.type === 'image')
   if (slideList.value.length === 0) return alert('当前目录没有图片，无法幻灯片')
   slideIndex.value = 0
+  openFullscreen()
   slideShow.value = true
   runSlide()
+}
+
+// 【新增】从当前预览图片开始播放
+function startSlideFromCurrent() {
+  slideList.value = previewMediaList.filter(i => i.type === 'image')
+  if (slideList.value.length === 0) return alert('没有图片可以幻灯片')
+  // 找到当前图片在图片列表里的下标
+  const idx = slideList.value.findIndex(x => x.path === previewItem.value.path)
+  slideIndex.value = Math.max(idx, 0)
+  closePreview()
+  openFullscreen()
+  slideShow.value = true
+  runSlide()
+}
+
+// 开启浏览器全屏
+async function openFullscreen() {
+  const el = slideRootRef.value
+  if (!el) return
+  try {
+    if (el.requestFullscreen) {
+      await el.requestFullscreen()
+    } else if (el.webkitRequestFullscreen) {
+      await el.webkitRequestFullscreen()
+    } else if (el.msRequestFullscreen) {
+      await el.msRequestFullscreen()
+    }
+  } catch (e) {
+    console.warn("无法进入全屏，浏览器权限限制", e)
+  }
+}
+
+// 退出全屏 + 关闭幻灯片
+function exitSlide() {
+  clearTimeout(slideTimer.value)
+  slideShow.value = false
+  if (document.exitFullscreen) {
+    document.exitFullscreen()
+  } else if (document.webkitExitFullscreen) {
+    document.webkitExitFullscreen()
+  } else if (document.msExitFullscreen) {
+    document.msExitFullscreen()
+  }
 }
 
 function runSlide() {
@@ -415,7 +464,7 @@ function runSlide() {
     if (slideIndex.value >= slideList.value.length) {
       if (slideLoop.value) slideIndex.value = 0
       else {
-        slideShow.value = false
+        exitSlide()
         return
       }
     }
@@ -444,6 +493,13 @@ onMounted(() => {
   window.addEventListener('resize', onWindowResize)
   window.addEventListener('popstate', onPopState)
 
+  // 监听ESC退出全屏
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && slideShow.value) {
+      exitSlide()
+    }
+  })
+
   resizeObserver = new ResizeObserver(() => {
     debounceLayout()
   })
@@ -464,6 +520,7 @@ onUnmounted(() => {
   if (resizeObserver) resizeObserver.disconnect()
   clearTimeout(layoutDebounceTimer)
   if (statusPollTimer) clearInterval(statusPollTimer)
+  clearTimeout(slideTimer.value)
 })
 </script>
 
@@ -607,7 +664,6 @@ onUnmounted(() => {
 }
 
 .preview-box {
-  /* 重点修改：去掉背景色，透明 */
   background: transparent;
   border-radius: 0;
   width: min(97vw, 1280px);
@@ -687,7 +743,6 @@ onUnmounted(() => {
 
 .preview-footer {
   flex-shrink: 0;
-  /* 去掉原来的底板背景、上边框，直接透明 */
   background: transparent;
   padding: 10px 16px 14px;
   border-top: none;
@@ -756,6 +811,11 @@ onUnmounted(() => {
 
 .slide-content {
   position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .slide-content img,
@@ -766,11 +826,26 @@ onUnmounted(() => {
 
 .slide-name {
   position: absolute;
-  bottom: 16px;
+  bottom: 60px;
   left: 0;
   right: 0;
   text-align: center;
   color: #fff;
   font-size: 14px;
+}
+
+.slide-exit-btn {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  padding: 8px 14px;
+  background: rgba(40,40,40,0.75);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.slide-exit-btn:hover {
+  background: rgba(80,80,80,0.9);
 }
 </style>
