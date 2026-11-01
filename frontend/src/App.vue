@@ -1,886 +1,163 @@
 <template>
-  <!-- 初始化加载中，完全屏蔽登录/主页面闪烁 -->
-  <div v-if="initLoading" class="init-loading-mask">
-    <div class="loading-text">正在加载...</div>
-  </div>
-
-  <!-- 登录弹窗 -->
-  <div v-else-if="!isLogin" class="login-mask">
-    <div class="login-box">
-      <h2>NAS媒体瀑布流 - 登录</h2>
-      <div class="form-item">
-        <label>用户名</label>
-        <input v-model="loginForm.username" type="text" @keyup.enter="doLogin" />
+  <div class="app-container">
+    <!-- 顶部导航栏 -->
+    <header class="header-bar">
+      <div class="breadcrumb">
+        <span @click="goRoot" class="crumb-item">根目录</span>
+        <span v-for="(item, idx) in breadcrumbs" :key="idx" class="crumb-sep">/</span>
+        <span v-for="(item, idx) in breadcrumbs" :key="idx" @click="clickCrumb(idx)" class="crumb-item">{{ item.name }}</span>
       </div>
-      <div class="form-item">
-        <label>密码</label>
-        <input v-model="loginForm.password" type="password" @keyup.enter="doLogin" />
-      </div>
-      <div class="login-error" v-if="loginErr">{{loginErr}}</div>
-      <div class="login-btn-group">
-        <button @click="doLogin" class="btn primary">登录</button>
-      </div>
-    </div>
-  </div>
-  <div v-else class="app-container">
-    <header class="header">
-      <h1>NAS 媒体瀑布流</h1>
       <div class="header-actions">
-        <button @click="runCacheTask" class="btn" :disabled="cacheRunning">
-          {{ cacheRunning ? `处理中 ${cachePercent}%` : "预生成缓存" }}
-        </button>
-        <button v-if="cacheRunning" @click="stopCacheTask" class="btn btn-danger">
-          取消任务
-        </button>
-        <button @click="openSlideSetting" class="btn">幻灯片设置</button>
-        <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
-        <!-- 用户头像下拉菜单 -->
-        <div class="user-dropdown-wrap">
-          <div class="avatar-btn" @click="toggleUserDrop">
-            <span class="avatar-icon">👤</span>
-            <span class="avatar-name">{{userInfo.username}}</span>
-          </div>
-          <div v-if="showUserDrop" class="user-dropdown">
-            <div class="drop-item" @click="openChangePwdModal">修改密码</div>
-            <div v-if="userInfo.is_admin" class="drop-item" @click="openUserManageModal">用户管理</div>
-            <div class="drop-item drop-divider"></div>
-            <div class="drop-item" @click="doLogout">退出登录</div>
-          </div>
-        </div>
+        <button @click="viewMode = 'waterfall'" :class="{active: viewMode === 'waterfall'}">瀑布流</button>
+        <button @click="viewMode = 'list'" :class="{active: viewMode === 'list'}">平铺目录</button>
+        <button @click="openSetting">设置</button>
       </div>
     </header>
-    <div class="breadcrumb">
-      <span @click="changeDir('')" class="breadcrumb-item">根目录</span>
-      <span v-for="(item, idx) in breadcrumbList" :key="idx">
-        <span class="separator">/</span>
-        <span @click="changeDir(item.path)" class="breadcrumb-item">{{ item.name }}</span>
-      </span>
-    </div>
-    <!-- CSS Grid masonry 横向优先瀑布流 -->
-    <div class="waterfall-wrap">
-      <div
-        v-for="item in mediaList"
-        :key="item.id"
-        class="media-card"
-        @click="handleCardClick(item)"
-      >
-        <div class="card-thumb">
-          <template v-if="item.type === 'folder'">
-            <img
-              v-if="item.cover_path"
-              :src="getThumbUrl(item.cover_path)"
-              alt=""
-              loading="lazy"
-            />
-            <svg v-else width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
-              <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" />
-            </svg>
-          </template>
-          <img
-            v-else-if="item.type === 'image'"
-            :src="getThumbUrl(item.path)"
-            alt=""
-            loading="lazy"
-          />
-          <div v-else-if="item.type === 'video'" class="video-wrap">
-            <img
-              :src="getThumbUrl(item.path)"
-              alt=""
-              loading="lazy"
-            />
-            <div class="play-icon">▶</div>
-          </div>
+
+    <!-- 内容区域 -->
+    <main class="main-content">
+      <!-- 平铺列表模式 -->
+      <div v-if="viewMode === 'list'" class="folder-list">
+        <div v-for="item in folderData" :key="item.path" class="folder-row" @click="enterFolder(item)">
+          <span class="folder-icon">📁</span>
+          <span class="folder-name">{{ item.name }}</span>
         </div>
-        <div class="card-name">{{ item.name }}</div>
       </div>
-    </div>
-    <!-- 预览弹窗 -->
-    <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
-      <div class="preview-box">
-        <button class="close-btn" @click="closePreview">×</button>
-        <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
-        <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
-        <div class="preview-image-area">
-          <img
-            v-if="previewItem.type === 'image'"
-            :src="getSrcUrl(previewItem.path)"
-            alt=""
-            :style="imgRotateStyle"
-          />
-          <video
-            v-else
-            controls
-            :src="getSrcUrl(previewItem.path)"
-          ></video>
-        </div>
-        <div class="preview-footer">
-          <div class="preview-name">{{ previewItem.name }} ({{ previewCurrentIndex + 1 }} / {{ previewMediaList.length }})</div>
-          <div v-if="previewItem.type === 'image'" class="img-action-bar">
-            <button @click="openOriginal">查看原图</button>
-            <button @click="rotateLeft">↺ 左旋90°</button>
-            <button @click="rotateRight">↻ 右旋90°</button>
-            <button @click="resetRotate">重置旋转</button>
-            <button @click="startSlideFromCurrent">从此处开始幻灯片</button>
+
+      <!-- 瀑布流模式（重点优化，大图卡片） -->
+      <div v-if="viewMode === 'waterfall'" class="waterfall-wrap">
+        <div v-for="item in mediaData" :key="item.path" class="media-card" @click="openMedia(item)">
+          <div class="card-thumb">
+            <img v-if="item.type === 'image'" :src="`/api/media?path=${encodeURIComponent(item.path)}`" alt="">
+            <img v-if="item.type === 'video'" :src="`/api/thumb?path=${encodeURIComponent(item.path)}`" alt="">
+            <div v-if="item.type === 'video'" class="play-icon">▶</div>
           </div>
+          <div class="card-name">{{ item.name }}</div>
+        </div>
+      </div>
+    </main>
+
+    <!-- 图片/视频弹窗查看器 -->
+    <div v-if="viewerShow" class="viewer-mask" @click.self="closeViewer">
+      <div class="viewer-wrap">
+        <button class="close-btn" @click="closeViewer">×</button>
+        <div v-if="currentMedia.type === 'image'" class="image-viewer">
+          <img :src="`/api/media?path=${encodeURIComponent(currentMedia.path)}`" alt="">
+        </div>
+        <div v-if="currentMedia.type === 'video'" class="video-viewer">
+          <video controls autoplay :src="`/api/media?path=${encodeURIComponent(currentMedia.path)}`"></video>
+        </div>
+        <div class="slide-control">
+          <button @click="prevMedia">上一张</button>
+          <button @click="nextMedia">下一张</button>
+          <button @click="toggleSlidePlay">{{ slidePlaying ? '停止轮播' : '幻灯片播放' }}</button>
         </div>
       </div>
     </div>
-    <!-- 幻灯片设置弹窗 -->
-    <div v-if="settingShow" class="preview-mask" @click.self="settingShow=false">
-      <div class="setting-box">
-        <h3>幻灯片设置</h3>
-        <div class="form-row">
-          <label>切换间隔（秒）</label>
-          <input v-model.number="slideDelay" type="number" min="1" />
+
+    <!-- 设置弹窗 -->
+    <div v-if="settingShow" class="setting-mask" @click.self="settingShow=false">
+      <div class="setting-panel">
+        <h3>设置</h3>
+        <div class="setting-row">
+          <label>幻灯片间隔（秒）：</label>
+          <input v-model.number="slideDelay" type="number" min="1">
         </div>
-        <div class="form-row">
-          <label>循环播放</label>
-          <input v-model="slideLoop" type="checkbox" />
-        </div>
-        <div class="btn-group">
-          <button @click="saveSetting" class="btn primary">保存</button>
-          <button @click="settingShow=false" class="btn">取消</button>
-        </div>
-      </div>
-    </div>
-    <!-- 修改本人密码弹窗 -->
-    <div v-if="changePwdModal" class="preview-mask" @click.self="changePwdModal=false">
-      <div class="setting-box">
-        <h3>修改登录密码</h3>
-        <div class="form-row">
-          <label>原密码</label>
-          <input v-model="pwdForm.old" type="password" />
-        </div>
-        <div class="form-row">
-          <label>新密码</label>
-          <input v-model="pwdForm.new" type="password" />
-        </div>
-        <div class="form-row">
-          <label>确认新密码</label>
-          <input v-model="pwdForm.confirm" type="password" />
-        </div>
-        <div class="msg-tip">{{pwdMsg}}</div>
-        <div class="btn-group">
-          <button @click="submitChangePwd" class="btn primary">保存</button>
-          <button @click="changePwdModal=false" class="btn">取消</button>
-        </div>
-      </div>
-    </div>
-    <!-- ========== 用户管理弹窗【新版：列表 + 表单分离】 ========== -->
-    <div v-if="userManageModal" class="preview-mask" @click.self="closeUserManageModal">
-      <div class="user-manage-box">
-        <div class="um-header">
-          <h3>用户管理（管理员）</h3>
-          <button class="um-close-btn" @click="closeUserManageModal">×</button>
-        </div>
-        <!-- 列表视图 -->
-        <div v-if="umView === 'list'" class="um-content-wrap">
-          <div class="um-top-bar">
-            <button class="btn primary" @click="switchToAddForm">+ 新增用户</button>
-          </div>
-          <div class="um-table">
-            <div class="um-table-head">
-              <div class="col-uname">用户名</div>
-              <div class="col-role">角色</div>
-              <div class="col-dir">允许目录</div>
-              <div class="col-op">操作</div>
-            </div>
-            <div class="um-table-row" v-for="u in adminUserList" :key="u.username">
-              <div class="col-uname">{{u.username}}</div>
-              <div class="col-role">
-                <span v-if="u.is_admin" class="tag-admin">管理员</span>
-                <span v-else class="tag-user">普通用户</span>
-              </div>
-              <div class="col-dir">{{u.allow_dirs.join("; ")}}</div>
-              <div class="col-op">
-                <button class="btn btn-sm" @click="switchToEditForm(u)">编辑</button>
-                <button class="btn btn-sm btn-danger" @click="openDelConfirm(u)">删除</button>
-              </div>
-            </div>
-          </div>
-        </div>
-        <!-- 新增/编辑表单视图 -->
-        <div v-if="umView === 'form'" class="um-content-wrap">
-          <div class="um-form-title">{{editUser ? "编辑用户":"新增用户"}}</div>
-          <div class="um-form-item">
-            <label>用户名</label>
-            <div style="display:flex;gap:8px;">
-              <input v-model="umForm.username" :disabled="!!editUser" />
-              <button v-if="editUser" class="btn btn-sm" @click="triggerRename">修改用户名</button>
-            </div>
-          </div>
-          <div class="um-form-item">
-            <label>密码（编辑留空不修改）</label>
-            <input v-model="umForm.password" type="password" placeholder="新增用户必填" />
-          </div>
-          <div class="um-form-item">
-            <label>是否管理员</label>
-            <input type="checkbox" v-model="umForm.is_admin" />
-          </div>
-          <div class="um-form-item">
-            <label>允许访问目录（多选）</label>
-            <div class="multi-select-wrap">
-              <div v-for="opt in dirOptions" class="check-item">
-                <input type="checkbox" :value="opt" v-model="umForm.allow_dirs" :id="'umdir_'+opt" />
-                <label :for="'umdir_'+opt">{{opt}}</label>
-              </div>
-            </div>
-          </div>
-          <div class="msg-tip">{{adminMsg}}</div>
-          <div class="um-form-buttons">
-            <button class="btn" @click="switchToList">返回列表</button>
-            <button class="btn primary" @click="submitUmForm">保存</button>
-          </div>
-        </div>
-      </div>
-      <!-- 删除确认弹窗 -->
-      <div v-if="umDelConfirm.show" class="inner-confirm-mask">
-        <div class="confirm-box">
-          <p>确认删除用户【{{umDelConfirm.user.username}}】？</p>
-          <div class="confirm-btn-row">
-            <button class="btn" @click="umDelConfirm.show=false">取消</button>
-            <button class="btn btn-danger" @click="doInnerDelete">确认删除</button>
-          </div>
-        </div>
-      </div>
-    </div>
-    <!-- 幻灯片全屏渲染层 -->
-    <div v-if="slideShow" class="slide-root">
-      <div class="slide-content">
-        <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
-        <video v-else controls :src="getSrcUrl(currentSlide.path)"></video>
-        <div class="slide-name">{{ currentSlide.name }}</div>
-        <button class="slide-exit-btn" @click="exitSlide">退出全屏</button>
-        <button class="slide-prev-btn" @click="slidePrev">‹</button>
-        <button class="slide-next-btn" @click="slideNext">›</button>
+        <button @click="saveSetting">保存</button>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 
-const baseUrl = ''
-// 初始化加载标记：修复刷新闪现登录页
-const initLoading = ref(true)
-const isLogin = ref(false)
-const userInfo = ref({})
-const loginForm = ref({username:'', password:''})
-const loginErr = ref('')
+const viewMode = ref('waterfall')
+const breadcrumbs = ref([])
+const folderData = ref([])
+const mediaData = ref([])
 
-// 用户下拉菜单
-const showUserDrop = ref(false)
-// 修改密码弹窗
-const changePwdModal = ref(false)
-const pwdForm = ref({old:"",new:"",confirm:""})
-const pwdMsg = ref("")
-
-// ========= 用户管理【新版状态】 =========
-const userManageModal = ref(false)
-const umView = ref('list') // list / form
-const editUser = ref(null) // null=新增；对象=编辑
-const adminUserList = ref([])
-const dirOptions = ref([])
-const adminMsg = ref("")
-const umForm = ref({
-  username:"",
-  password:"",
-  is_admin:false,
-  allow_dirs:[]
-})
-// 删除确认内部弹窗
-const umDelConfirm = ref({
-  show:false,
-  user:null
-})
-
-const mediaList = ref([])
-const breadcrumbList = ref([])
-
-const previewShow = ref(false)
-const previewItem = ref(null)
-let previewMediaList = []
-let previewCurrentIndex = 0
-const imgRotateDeg = ref(0)
+const viewerShow = ref(false)
+const currentMedia = ref(null)
+const mediaIndex = ref(0)
+const slidePlaying = ref(false)
+const slideDelay = ref(3)
+let slideTimer = null
 
 const settingShow = ref(false)
-const slideDelay = ref(3)
-const slideLoop = ref(true)
-const slideShow = ref(false)
-const slideIndex = ref(0)
-const slideTimer = ref(null)
-const slideList = ref([])
-const currentSlide = ref({})
 
-const cacheRunning = ref(false)
-const cachePercent = ref(0)
-let statusPollTimer = null
-
-const STORAGE_KEY = "waterfall_last_dir"
-
-const getThumbUrl = (path) => {
-  return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
-}
-const getSrcUrl = (path) => {
-  return `${baseUrl}/api/src?path=${encodeURIComponent(path)}`
+// 加载目录
+async function loadDir(path = '/') {
+  const res = await fetch(`/api/list?path=${encodeURIComponent(path)}`)
+  const json = await res.json()
+  folderData.value = json.folders
+  mediaData.value = json.files
 }
 
-const imgRotateStyle = ref({
-  transform: 'rotate(0deg)',
-  transition: 'transform 0.25s ease'
-})
-
-function rotateLeft() {
-  imgRotateDeg.value -= 90
-  imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
+// 面包屑
+function goRoot() {
+  breadcrumbs.value = []
+  loadDir('/')
 }
-function rotateRight() {
-  imgRotateDeg.value += 90
-  imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
+function clickCrumb(idx) {
+  breadcrumbs.value = breadcrumbs.value.slice(0, idx + 1)
+  const fullPath = breadcrumbs.value.map(i => i.name).join('/')
+  loadDir('/' + fullPath)
 }
-function resetRotate() {
-  imgRotateDeg.value = 0
-  imgRotateStyle.value.transform = 'rotate(0deg)'
-}
-function openOriginal() {
-  window.open(getSrcUrl(previewItem.value.path), '_blank')
+function enterFolder(item) {
+  breadcrumbs.value.push(item)
+  loadDir(item.path)
 }
 
-async function pollCacheStatus() {
-  try {
-    const res = await fetch(`${baseUrl}/api/cache-status`)
-    if (!res.ok) { checkAuthResp(res); return }
-    const st = await res.json()
-    cachePercent.value = st.percent
-    if (!st.running) {
-      clearInterval(statusPollTimer)
-      statusPollTimer = null
-      cacheRunning.value = false
-      alert(`✅缓存任务结束！\n${st.message}\n处理文件:${st.processed}/${st.total}`)
-    }
-  } catch (err) {
-    console.error("查询任务状态失败", err)
-  }
+// 媒体弹窗
+function openMedia(item) {
+  currentMedia.value = item
+  mediaIndex.value = mediaData.value.findIndex(m => m.path === item.path)
+  viewerShow.value = true
 }
-
-async function initCheckCacheTask() {
-  try {
-    const res = await fetch(`${baseUrl}/api/cache-status`)
-    if (!res.ok) { checkAuthResp(res); return }
-    const st = await res.json()
-    if (st.running) {
-      cacheRunning.value = true
-      cachePercent.value = st.percent
-      statusPollTimer = setInterval(pollCacheStatus, 800)
-    }
-  } catch (err) {
-    console.error("初始化检查缓存任务失败", err)
-  }
+function closeViewer() {
+  viewerShow.value = false
+  slidePlaying.value = false
+  clearInterval(slideTimer)
 }
-
-async function runCacheTask() {
-  if (cacheRunning.value) return
-  cacheRunning.value = true
-  cachePercent.value = 0
-  try {
-    const res = await fetch(`${baseUrl}/api/cache-run`)
-    if (!res.ok) { checkAuthResp(res); return }
-    const ret = await res.json()
-    if (ret.code !== 0) {
-      alert("❌" + ret.msg)
-      cacheRunning.value = false
-      return
-    }
-    statusPollTimer = setInterval(pollCacheStatus, 800)
-  } catch (err) {
-    console.error(err)
-    alert("❌请求失败，提交任务出错！")
-    cacheRunning.value = false
-  }
-}
-
-async function stopCacheTask() {
-  if (!confirm("确认要终止缓存任务吗？")) return
-  try {
-    const res = await fetch(`${baseUrl}/api/cache-stop`)
-    if (!res.ok) { checkAuthResp(res); return }
-    const ret = await res.json()
-    if (ret.code !== 0) {
-      alert("❌" + ret.msg)
-    }
-  } catch (err) {
-    console.error(err)
-    alert("❌发送停止指令失败")
-  }
-}
-
-function getDirFromUrl() {
-  const params = new URLSearchParams(window.location.search)
-  return params.get('dir') ?? ''
-}
-
-function syncDirToUrl(dir) {
-  const url = new URL(window.location.href)
-  if (dir) {
-    url.searchParams.set('dir', dir)
-  } else {
-    url.searchParams.delete('dir')
-  }
-  window.history.pushState({ dir }, '', url.toString())
-}
-
-function checkAuthResp(r) {
-  if (r.status === 401) {
-    isLogin.value = false
-    userInfo.value = {}
-  }
-}
-
-let isLoading = ref(false)
-async function loadMedia(dir = '', pushHistory = false) {
-  if(isLoading.value) return
-  isLoading.value = true
-  mediaList.value = []
-  breadcrumbList.value = []
-  try {
-    const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
-    if (!res.ok) { checkAuthResp(res); return }
-    const data = await res.json()
-    mediaList.value = data.list || []
-    breadcrumbList.value = data.breadcrumb || []
-    localStorage.setItem(STORAGE_KEY, dir)
-    if (pushHistory) {
-      syncDirToUrl(dir)
-    }
-  } catch (err) {
-    console.error(err)
-    mediaList.value = []
-  }finally{
-    isLoading.value = false
-  }
-}
-
-function changeDir(path) {
-  loadMedia(path, true)
-}
-
-function handleCardClick(item) {
-  if(isLoading.value) return
-  if (item.type === 'folder') {
-    changeDir(item.path)
-  } else {
-    previewMediaList = mediaList.value.filter(x => x.type !== 'folder')
-    previewCurrentIndex = previewMediaList.findIndex(x => x.id === item.id)
-    previewItem.value = item
-    imgRotateDeg.value = 0
-    imgRotateStyle.value.transform = 'rotate(0deg)'
-    previewShow.value = true
-  }
-}
-
 function prevMedia() {
-  if (previewCurrentIndex > 0) {
-    previewCurrentIndex -= 1
-    previewItem.value = previewMediaList[previewCurrentIndex]
-    imgRotateDeg.value = 0
-    imgRotateStyle.value.transform = 'rotate(0deg)'
-  }
+  mediaIndex.value = mediaIndex.value <= 0 ? mediaData.value.length -1 : mediaIndex.value -1
+  currentMedia.value = mediaData.value[mediaIndex.value]
 }
-
 function nextMedia() {
-  if (previewCurrentIndex < previewMediaList.length - 1) {
-    previewCurrentIndex += 1
-    previewItem.value = previewMediaList[previewCurrentIndex]
-    imgRotateDeg.value = 0
-    imgRotateStyle.value.transform = 'rotate(0deg)'
+  mediaIndex.value = mediaIndex.value >= mediaData.value.length -1 ? 0 : mediaIndex.value +1
+  currentMedia.value = mediaData.value[mediaIndex.value]
+}
+function toggleSlidePlay() {
+  slidePlaying.value = !slidePlaying.value
+  if (slidePlaying.value) {
+    slideTimer = setInterval(()=> nextMedia(), slideDelay.value * 1000)
+  } else {
+    clearInterval(slideTimer)
   }
 }
 
-function handleKeydown(e) {
-  if (slideShow.value) {
-    if (e.key === 'ArrowLeft') {
-      e.preventDefault()
-      slidePrev()
-    } else if (e.key === 'ArrowRight') {
-      e.preventDefault()
-      slideNext()
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      exitSlide()
-    }
-    return
-  }
-  if (!previewShow.value) return
-  switch (e.key) {
-    case 'ArrowLeft':
-      e.preventDefault()
-      prevMedia()
-      break
-    case 'ArrowRight':
-      e.preventDefault()
-      nextMedia()
-      break
-    case 'Escape':
-      e.preventDefault()
-      closePreview()
-      break
-  }
-}
-
-function openSlideSetting() {
+// 设置
+function openSetting() {
   settingShow.value = true
 }
-
-function saveSetting() {
+async function saveSetting() {
+  await fetch('/api/config', {
+    method:'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({slideDelay: slideDelay.value})
+  })
   settingShow.value = false
 }
-
-function startSlideFromDir() {
-  slideList.value = mediaList.value.filter(i => i.type === 'image')
-  if (slideList.value.length === 0) return alert('当前目录没有图片，无法幻灯片')
-  slideIndex.value = 0
-  openRootFullscreen()
-  slideShow.value = true
-  runSlide()
+async function loadConfig() {
+  const res = await fetch('/api/config')
+  const cfg = await res.json()
+  slideDelay.value = cfg.slideDelay ?? 3
 }
 
-function startSlideFromCurrent() {
-  slideList.value = previewMediaList.filter(i => i.type === 'image')
-  if (slideList.value.length === 0) return alert('没有图片可以幻灯片')
-  const idx = slideList.value.findIndex(x => x.path === previewItem.value.path)
-  slideIndex.value = Math.max(idx, 0)
-  closePreview()
-  openRootFullscreen()
-  slideShow.value = true
-  runSlide()
-}
-
-async function openRootFullscreen() {
-  const docEl = document.documentElement
-  try {
-    if (docEl.requestFullscreen) {
-      await docEl.requestFullscreen()
-    } else if (docEl.webkitRequestFullscreen) {
-      await docEl.webkitRequestFullscreen()
-    } else if (docEl.msRequestFullscreen) {
-      await docEl.msRequestFullscreen()
-    }
-  } catch (e) {
-    console.warn("无法进入全屏，浏览器策略限制", e)
-  }
-}
-
-function exitSlide() {
-  clearTimeout(slideTimer.value)
-  slideShow.value = false
-  if (document.exitFullscreen) {
-    document.exitFullscreen()
-  } else if (document.webkitExitFullscreen) {
-    document.webkitExitFullscreen()
-  } else if (document.msExitFullscreen) {
-    document.msExitFullscreen()
-  }
-}
-
-function runSlide() {
-  clearTimeout(slideTimer.value)
-  currentSlide.value = slideList.value[slideIndex.value]
-  slideTimer.value = setTimeout(() => {
-    slideNext()
-  }, slideDelay.value * 1000)
-}
-
-function slideNext() {
-  slideIndex.value++
-  if (slideIndex.value >= slideList.value.length) {
-    if (slideLoop.value) slideIndex.value = 0
-    else {
-      exitSlide()
-      return
-    }
-  }
-  runSlide()
-}
-function slidePrev() {
-  slideIndex.value--
-  if (slideIndex.value < 0) {
-    if (slideLoop.value) slideIndex.value = slideList.value.length - 1
-    else slideIndex.value = 0
-  }
-  runSlide()
-}
-
-function closePreview() {
-  previewShow.value = false
-  previewItem.value = null
-  previewMediaList = []
-  previewCurrentIndex = 0
-}
-
-function onWindowResize() {
-  // grid masonry 浏览器原生处理，不需要JS
-}
-
-function onPopState(e) {
-  const dir = e.state?.dir ?? getDirFromUrl()
-  loadMedia(dir, false)
-}
-
-// ========== 登录登出 ==========
-async function doLogin() {
-  loginErr.value = ''
-  try {
-    const res = await fetch(`${baseUrl}/api/login`, {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(loginForm.value)
-    })
-    const ret = await res.json()
-    if (!res.ok || ret.code !==0) {
-      loginErr.value = "账号或密码错误"
-      return
-    }
-    await checkLoginStatus()
-  } catch(err) {
-    loginErr.value = "网络异常"
-  }
-}
-
-async function doLogout() {
-  await fetch(`${baseUrl}/api/logout`, {method:"POST"})
-  isLogin.value = false
-  userInfo.value = {}
-  showUserDrop.value = false
-}
-
-async function checkLoginStatus() {
-  try {
-    const res = await fetch(`${baseUrl}/api/whoami`)
-    if (res.ok) {
-      const ret = await res.json()
-      isLogin.value = true
-      userInfo.value = ret
-      const urlDir = getDirFromUrl()
-      const initDir = urlDir ?? ''
-      await loadMedia(initDir, !!urlDir)
-      initCheckCacheTask()
-    } else {
-      isLogin.value = false
-    }
-  } catch(e) {
-    isLogin.value = false
-  } finally {
-    initLoading.value = false
-  }
-}
-
-// ========= 用户头像下拉 =========
-function toggleUserDrop(){
-  showUserDrop.value = !showUserDrop.value
-}
-function openChangePwdModal(){
-  showUserDrop.value = false
-  changePwdModal.value = true
-  pwdForm.value = {old:"",new:"",confirm:""}
-  pwdMsg.value = ""
-}
-async function submitChangePwd(){
-  pwdMsg.value = ""
-  const f = pwdForm.value
-  if(!f.old || !f.new || !f.confirm){
-    pwdMsg.value = "全部字段不能为空"
-    return
-  }
-  if(f.new !== f.confirm){
-    pwdMsg.value = "两次新密码不一致"
-    return
-  }
-  try{
-    const res = await fetch("/api/user/change-password",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({old_password:f.old, new_password:f.new})
-    })
-    const json = await res.json()
-    if(res.ok && json.code ===0){
-      pwdMsg.value = "密码修改成功！"
-      setTimeout(()=>{changePwdModal.value=false},1200)
-    }else{
-      pwdMsg.value = json.detail || "修改失败"
-    }
-  }catch(e){
-    pwdMsg.value = "网络错误"
-  }
-}
-
-// ========= 用户管理新版逻辑 =========
-async function openUserManageModal(){
-  showUserDrop.value = false
-  userManageModal.value = true
-  umView.value = 'list'
-  editUser.value = null
-  adminMsg.value = ""
-  umDelConfirm.value.show = false
-  await reloadDirOptions()
-  await reloadAdminUserList()
-}
-function closeUserManageModal(){
-  userManageModal.value = false
-}
-async function reloadDirOptions(){
-  try{
-    const res = await fetch("/api/admin/dirs")
-    const json = await res.json()
-    if(json.code===0){
-      dirOptions.value = json.options
-    }
-  }catch(e){}
-}
-async function reloadAdminUserList(){
-  try{
-    const res = await fetch("/api/admin/users")
-    const json = await res.json()
-    if(json.code===0){
-      adminUserList.value = json.list
-    }
-  }catch(e){
-    adminMsg.value = "获取用户列表失败"
-  }
-}
-function switchToList(){
-  umView.value = 'list'
-  editUser.value = null
-  adminMsg.value = ""
-}
-function switchToAddForm(){
-  editUser.value = null
-  umForm.value = {username:"",password:"",is_admin:false,allow_dirs:[]}
-  adminMsg.value = ""
-  umView.value = 'form'
-}
-function switchToEditForm(u){
-  editUser.value = u
-  umForm.value = {
-    username: u.username,
-    password:"",
-    is_admin: u.is_admin,
-    allow_dirs:[...u.allow_dirs]
-  }
-  adminMsg.value = ""
-  umView.value = 'form'
-}
-// 修改用户名（弹窗prompt）
-async function triggerRename(){
-  if(!editUser.value) return
-  const oldU = editUser.value.username
-  const newName = prompt("输入新用户名", oldU)
-  if(!newName || !newName.trim()) return
-  const newTrim = newName.trim()
-  if(newTrim === oldU){
-    adminMsg.value = "用户名未变化"
-    return
-  }
-  try{
-    const res = await fetch("/api/admin/user-rename",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({old_username:oldU, new_username:newTrim})
-    })
-    const json = await res.json()
-    if(json.code===0){
-      adminMsg.value = "用户名修改成功"
-      umForm.value.username = newTrim
-      await reloadAdminUserList()
-    }else{
-      adminMsg.value = json.detail || "修改失败"
-    }
-  }catch(e){
-    adminMsg.value = "网络异常"
-  }
-}
-// 提交保存新增/编辑
-async function submitUmForm(){
-  adminMsg.value = ""
-  const username = umForm.value.username.trim()
-  if(!username){
-    adminMsg.value = "用户名不能为空"
-    return
-  }
-  if(umForm.value.allow_dirs.length===0){
-    adminMsg.value = "至少勾选一个允许访问目录"
-    return
-  }
-  const body = {
-    username: username,
-    password: umForm.value.password.trim() || null,
-    allow_dirs: umForm.value.allow_dirs,
-    is_admin: umForm.value.is_admin
-  }
-  try{
-    const res = await fetch("/api/admin/user-save",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify(body)
-    })
-    const json = await res.json()
-    if(json.code===0){
-      adminMsg.value = json.msg || "保存成功"
-      await reloadAdminUserList()
-      switchToList()
-    }else{
-      adminMsg.value = json.detail || "保存失败"
-    }
-  }catch(e){
-    adminMsg.value = "网络异常"
-  }
-}
-// 删除确认
-function openDelConfirm(u){
-  umDelConfirm.value.user = u
-  umDelConfirm.value.show = true
-}
-async function doInnerDelete(){
-  const uname = umDelConfirm.value.user.username
-  try{
-    const res = await fetch(`/api/admin/user/${encodeURIComponent(uname)}`,{method:"DELETE"})
-    const json = await res.json()
-    if(json.code===0){
-      await reloadAdminUserList()
-    }
-  }catch(e){}
-  umDelConfirm.value.show = false
-}
-
-// 点击外部关闭下拉
-function onClickOutsideDrop(e){
-  const el = document.querySelector(".user-dropdown-wrap")
-  if(el && !el.contains(e.target)){
-    showUserDrop.value = false
-  }
-}
-
-onMounted(() => {
-  checkLoginStatus()
-  document.addEventListener('keydown', handleKeydown)
-  window.addEventListener('resize', onWindowResize)
-  window.addEventListener('popstate', onPopState)
-  document.addEventListener("click", onClickOutsideDrop)
-
-  document.addEventListener('fullscreenchange', () => {
-    if (!document.fullscreenElement && slideShow.value) {
-      exitSlide()
-    }
-  })
-})
-
-onUnmounted(() => {
-  document.removeEventListener('keydown', handleKeydown)
-  window.removeEventListener('resize', onWindowResize)
-  window.removeEventListener('popstate', onPopState)
-  document.removeEventListener("click", onClickOutsideDrop)
-  if (statusPollTimer) clearInterval(statusPollTimer)
-  clearTimeout(slideTimer.value)
+onMounted(()=>{
+  loadDir('/')
+  loadConfig()
 })
 </script>
 
@@ -890,561 +167,186 @@ onUnmounted(() => {
   padding: 0;
   box-sizing: border-box;
 }
-/* 初始化加载遮罩，修复刷新闪现登录页 */
-.init-loading-mask{
-  position:fixed;
-  inset:0;
-  background:#000;
-  z-index:999999;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-}
-.loading-text{
-  color:#fff;
-  font-size:16px;
-}
-
-.login-mask {
-  position: fixed;
-  inset:0;
-  background:#000;
-  z-index:99999;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-}
-.login-box {
-  background:#1e1e1e;
-  padding:32px;
-  border-radius:12px;
-  width:340px;
-}
-.login-box h2 {
-  color:#fff;
-  margin-bottom:24px;
-  text-align:center;
-}
-.form-item {
-  margin-bottom:14px;
-}
-.form-item label {
-  display:block;
-  color:#ccc;
-  margin-bottom:6px;
-  font-size:14px;
-}
-.form-item input {
-  width:100%;
-  padding:10px;
-  border-radius:6px;
-  border:none;
-  background:#2d2d2d;
-  color:#fff;
-}
-.login-error {
-  color:#ff5555;
-  font-size:13px;
-  margin:8px 0;
-  text-align:center;
-}
-.login-btn-group {
-  margin-top:20px;
-}
-
-/* 用户头像下拉 */
-.user-dropdown-wrap {
-  position:relative;
-}
-.avatar-btn {
-  display:flex;
-  align-items:center;
-  gap:6px;
-  padding:6px 10px;
-  background:#2a2a2a;
-  border-radius:6px;
-  cursor:pointer;
-  color:#fff;
-}
-.avatar-icon {
-  font-size:18px;
-}
-.user-dropdown {
-  position:absolute;
-  top:calc(100% + 6px);
-  right:0;
-  min-width:160px;
-  background:#222;
-  border-radius:8px;
-  z-index:200;
-  overflow:hidden;
-}
-.drop-item {
-  padding:9px 14px;
-  color:#eee;
-  cursor:pointer;
-}
-.drop-item:hover {
-  background:#333;
-}
-.drop-divider {
-  height:1px;
-  background:#444;
-  padding:0;
-}
-
 .app-container {
   min-height: 100vh;
-  background: #121212;
+  background-color: #121212;
   color: #eee;
-  padding: 16px;
 }
-
-.header {
+.header-bar {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 16px;
-  flex-wrap: wrap;
-  gap: 12px;
+  padding: 16px 20px;
+  background: #1e1e1e;
+  border-bottom: 1px solid #2d2d2d;
+  position: sticky;
+  top:0;
+  z-index: 10;
 }
-
-.header h1 {
-  font-size: 22px;
-  color: #fff;
-}
-
-.header-actions {
+.breadcrumb {
   display: flex;
-  gap: 10px;
-  align-items:center;
+  align-items: center;
+  gap: 6px;
 }
-
-.btn {
+.crumb-item {
+  color: #8ab4f8;
+  cursor: pointer;
+}
+.crumb-sep {
+  color:#666;
+}
+.header-actions button {
   padding: 6px 12px;
+  margin-left: 6px;
+  background:#2b2b2b;
+  color:#fff;
   border: none;
   border-radius: 6px;
-  background: #2a2a2a;
-  color: #fff;
   cursor: pointer;
 }
-.btn-sm{
-  padding:4px 8px;
-  font-size:13px;
+.header-actions button.active {
+  background:#3b78d9;
 }
-.btn:disabled {
-  opacity: 0.65;
-  cursor: not-allowed;
-}
-.btn.primary {
-  background: #2563eb;
-}
-.btn-danger {
-  background: #dc2626;
+.main-content {
+  padding: 16px;
 }
 
-.breadcrumb {
-  margin-bottom: 16px;
-  color: #aaa;
-}
-.breadcrumb-item {
-  color: #60a5fa;
-  cursor: pointer;
-}
-.separator {
-  margin: 0 6px;
-}
-
-/* ========= Grid masonry 【图片自适应原始宽高比】 ========= */
+/* ========== 重点：优化后的瀑布流样式，匹配你效果图 ========== */
 .waterfall-wrap {
   width: 100%;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
   grid-template-rows: masonry;
 }
-
 .media-card {
   background: #1e1e1e;
-  border-radius: 6px;
+  border-radius: 10px;
   overflow: hidden;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
-  /* 图片未加载完成预留占位高度，减少布局跳动 */
-  contain-intrinsic-size: 240px;
 }
 .media-card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  transform: translateY(-4px);
+  box-shadow: 0 8px 22px rgba(0,0,0,0.45);
 }
-
 .card-thumb {
-  width: 100%;
-  overflow: hidden;
-  background: #222;
-  display: block;
+  width:100%;
+  overflow:hidden;
+  background:#222;
 }
 .card-thumb img {
-  width: 100%;
-  /* ✅关键：height:auto，图片高度跟随原图宽高比，完整展示不裁切 */
-  height: auto;
-  display: block;
-}
-
-.play-icon {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 40px;
-  height: 40px;
-  background: rgba(0, 0, 0, 0.6);
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-  color: #fff;
-}
-.video-wrap{
-  position:relative;
-}
-
-.card-name {
-  padding: 8px 10px;
-  font-size: 12px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.preview-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.88);
-  z-index: 99;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 18px;
-}
-
-.preview-box {
-  background: transparent;
-  border-radius: 0;
-  width: min(97vw, 1280px);
-  height: min(94vh, 960px);
-  max-width: 97vw;
-  max-height: 94vh;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.close-btn {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  background: rgba(40,40,40,0.75);
-  color: #fff;
-  border: none;
-  font-size: 20px;
-  cursor: pointer;
-  z-index: 4;
-}
-
-.arrow-btn {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 46px;
-  height: 46px;
-  border-radius: 50%;
-  background: rgba(40,40,40,0.75);
-  color: #fff;
-  border: none;
-  font-size: 26px;
-  cursor: pointer;
-  z-index: 3;
-  transition: background 0.2s;
-}
-.arrow-btn:hover:not(:disabled) {
-  background: rgba(80,80,80,0.9);
-}
-.arrow-btn:disabled {
-  opacity:0.25;
-  cursor: default;
-}
-.arrow-left {
-  left: 12px;
-}
-.arrow-right {
-  right: 12px;
-}
-
-.preview-image-area {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  padding: 18px 18px 10px;
-}
-.preview-image-area img {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-}
-.preview-image-area video {
-  max-width: 100%;
-  max-height: 100%;
-}
-
-.preview-footer {
-  flex-shrink: 0;
-  background: transparent;
-  padding: 10px 16px 14px;
-  border-top: none;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-}
-.preview-name {
-  font-size: 14px;
-  color: #eee;
-  text-align: center;
-}
-.img-action-bar {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  justify-content: center;
-}
-.img-action-bar button {
-  padding: 6px 12px;
-  background: rgba(42,42,42,0.75);
-  color: #fff;
-  border: 0;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.img-action-bar button:hover {
-  background: rgba(58,58,58,0.9);
-}
-
-.setting-box {
-  background: #181818;
-  border-radius: 12px;
-  padding:24px;
-  width:380px;
-}
-
-/* =========新版用户管理弹窗样式 ========= */
-.user-manage-box{
-  background:#181818;
-  border-radius:12px;
-  width:720px;
-  max-height:85vh;
-  display:flex;
-  flex-direction:column;
-  overflow:hidden;
-}
-.um-header{
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
-  padding:14px 18px;
-  border-bottom:1px solid #333;
-}
-.um-close-btn{
-  background:transparent;
-  border:none;
-  color:#aaa;
-  font-size:22px;
-  cursor:pointer;
-}
-.um-content-wrap{
-  flex:1;
-  overflow-y:auto;
-  padding:16px 18px;
-}
-.um-top-bar{
-  margin-bottom:14px;
-}
-.um-table{
-  border:1px solid #333;
-  border-radius:8px;
-}
-.um-table-head,.um-table-row{
-  display:grid;
-  grid-template-columns:140px 100px 1fr 160px;
-  padding:10px 12px;
-  align-items:center;
-  border-bottom:1px solid #333;
-}
-.um-table-head{
-  background:#242424;
-  font-weight:bold;
-}
-.um-table-row:last-child{
-  border-bottom:none;
-}
-.tag-admin{
-  color:#ffd044;
-  font-size:12px;
-}
-.tag-user{
-  color:#aaa;
-  font-size:12px;
-}
-.um-form-title{
-  font-size:16px;
-  font-weight:bold;
-  margin-bottom:16px;
-}
-.um-form-item{
-  margin-bottom:14px;
-  display:flex;
-  flex-direction:column;
-  gap:6px;
-}
-.um-form-item label{
-  font-size:14px;
-  color:#ccc;
-}
-.um-form-item input{
-  padding:9px;
-  background:#2a2a2a;
-  border:1px solid #444;
-  border-radius:6px;
-  color:#fff;
-}
-.multi-select-wrap {
   width:100%;
-  max-height:220px;
-  overflow-y:auto;
-  background:#2a2a2a;
-  border-radius:6px;
-  padding:10px;
+  height:auto;
+  display:block;
 }
-.check-item {
-  display:flex;
-  align-items:center;
-  gap:8px;
-  padding:4px 0;
-}
-.check-item label {
-  color:#eee;
-  font-size:14px;
-}
-.um-form-buttons{
-  display:flex;
-  gap:10px;
-  justify-content:flex-end;
-  margin-top:22px;
-  padding-top:12px;
-  border-top:1px solid #333;
-  flex-shrink:0;
-}
-.msg-tip {
-  color:#ffdd77;
-  font-size:13px;
-  min-height:20px;
-}
-
-.inner-confirm-mask{
+.play-icon {
   position:absolute;
-  inset:0;
-  background:rgba(0,0,0,0.65);
+  top: 50%;
+  left:50%;
+  transform: translate(-50%, -50%);
+  font-size:32px;
+  color:#fff;
+  background:rgba(0,0,0,0.45);
+  width: 48px;
+  height:48px;
+  border-radius: 50%;
   display:flex;
   align-items:center;
   justify-content:center;
-  z-index:100;
 }
-.confirm-box{
-  background:#1c1c1c;
-  padding:20px 24px;
-  border-radius:10px;
+.card-thumb {
+  position: relative;
 }
-.confirm-btn-row{
-  display:flex;
-  gap:10px;
-  justify-content:flex-end;
-  margin-top:18px;
-}
-.btn-group {
-  display: flex;
-  gap: 10px;
-  justify-content: flex-end;
-  margin-top: 20px;
+.card-name {
+  padding: 8px 10px;
+  font-size: 13px;
+  color:#ccc;
+  white-space: nowrap;
+  overflow:hidden;
+  text-overflow: ellipsis;
 }
 
-.slide-root {
+/* 平铺目录 */
+.folder-list {
+  display:flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.folder-row {
+  padding:10px 14px;
+  background:#1e1e1e;
+  border-radius:8px;
+  cursor:pointer;
+}
+.folder-icon {
+  margin-right:8px;
+}
+
+/* 查看弹窗 */
+.viewer-mask {
   position: fixed;
-  inset: 0;
-  background: #000;
-  z-index: 9999;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  inset:0;
+  background:rgba(0,0,0,0.88);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:99;
 }
-.slide-content {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.viewer-wrap {
+  max-width: 90vw;
+  max-height:90vh;
+  position:relative;
 }
-.slide-content img,
-.slide-content video {
-  max-width: 98vw;
-  max-height: 98vh;
-  object-fit: contain;
+.close-btn {
+  position:absolute;
+  top:-32px;
+  right:0;
+  font-size:28px;
+  color:#fff;
+  background:none;
+  border:none;
+  cursor:pointer;
 }
-.slide-name {
-  position: absolute;
-  bottom: 60px;
-  left: 0;
-  right: 0;
-  text-align: center;
-  color: #fff;
-  font-size: 14px;
+.image-viewer img {
+  max-width:90vw;
+  max-height:85vh;
+  display:block;
 }
-.slide-exit-btn {
-  position: absolute;
-  top: 16px;
-  right: 16px;
-  padding: 8px 14px;
-  background: rgba(40,40,40,0.75);
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
+.video-viewer video {
+  max-width:90vw;
+  max-height:85vh;
 }
-.slide-exit-btn:hover {
-  background: rgba(80,80,80,0.9);
+.slide-control {
+  margin-top:12px;
+  display:flex;
+  gap:10px;
+  justify-content:center;
 }
-.slide-prev-btn,
-.slide-next-btn {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 50px;
-  height: 50px;
-  border-radius: 50%;
-  background: rgba(40,40,40,0.7);
-  color: #fff;
-  border: none;
-  font-size: 28px;
-  cursor: pointer;
+.slide-control button {
+  padding:6px 12px;
 }
-.slide-prev-btn { left: 20px; }
-.slide-next-btn { right: 20px; }
+
+/* 设置弹窗 */
+.setting-mask {
+  position:fixed;
+  inset:0;
+  background:rgba(0,0,0,0.75);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:99;
+}
+.setting-panel {
+  background:#1e1e1e;
+  padding:24px;
+  border-radius:10px;
+}
+.setting-row {
+  margin:14px 0;
+}
+.setting-row input {
+  width: 80px;
+  padding:4px;
+}
 </style>
