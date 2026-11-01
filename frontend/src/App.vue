@@ -176,63 +176,84 @@
       </div>
     </div>
 
-    <!-- 管理员：用户管理弹窗 -->
-    <div v-if="userManageModal" class="preview-mask" @click.self="userManageModal=false">
+    <!-- ========== 用户管理弹窗【新版：列表 + 表单分离】 ========== -->
+    <div v-if="userManageModal" class="preview-mask" @click.self="closeUserManageModal">
       <div class="user-manage-box">
-        <h3>用户管理（管理员）</h3>
-        <div class="user-list">
-          <div class="user-row" v-for="u in adminUserList" :key="u.username">
-            <div class="u-name">{{u.username}}</div>
-            <div class="u-tag">
-              <span v-if="u.is_admin" class="admin-tag">管理员</span>
-            </div>
-            <div class="u-dir">{{u.allow_dirs.join("; ")}}</div>
-            <div class="u-op">
-              <button @click="editUser(u)" class="btn">编辑</button>
-              <button @click="delUser(u.username)" class="btn btn-danger">删除</button>
-            </div>
+        <div class="um-header">
+          <h3>用户管理（管理员）</h3>
+          <button class="um-close-btn" @click="closeUserManageModal">×</button>
+        </div>
+
+        <!-- 列表视图 -->
+        <div v-if="umView === 'list'" class="um-content-wrap">
+          <div class="um-top-bar">
+            <button class="btn primary" @click="switchToAddForm">+ 新增用户</button>
           </div>
-        </div>
-        <div class="divider"></div>
-
-        <div class="form-row">
-          <label>用户名</label>
-          <div style="display:flex;gap:8px;">
-            <input v-model="editUserForm.username" style="flex:1"/>
-            <button @click="submitRenameUser" class="btn">修改用户名</button>
-          </div>
-        </div>
-
-        <div class="form-row">
-          <label>密码(编辑留空不修改)</label>
-          <input v-model="editUserForm.password" type="password" placeholder="新增必填"/>
-        </div>
-
-        <div class="form-row">
-          <label>是否管理员</label>
-          <input type="checkbox" v-model="editUserForm.is_admin"/>
-        </div>
-
-        <div class="form-row">
-          <label>允许访问目录（多选）</label>
-          <div class="multi-select-wrap">
-            <div v-for="opt in dirOptions" class="check-item">
-              <input
-                type="checkbox"
-                :value="opt"
-                v-model="selectedDirList"
-                :id="'dir_'+opt"
-              />
-              <label :for="'dir_'+opt">{{opt}}</label>
+          <div class="um-table">
+            <div class="um-table-head">
+              <div class="col-uname">用户名</div>
+              <div class="col-role">角色</div>
+              <div class="col-dir">允许目录</div>
+              <div class="col-op">操作</div>
+            </div>
+            <div class="um-table-row" v-for="u in adminUserList" :key="u.username">
+              <div class="col-uname">{{u.username}}</div>
+              <div class="col-role">
+                <span v-if="u.is_admin" class="tag-admin">管理员</span>
+                <span v-else class="tag-user">普通用户</span>
+              </div>
+              <div class="col-dir">{{u.allow_dirs.join("; ")}}</div>
+              <div class="col-op">
+                <button class="btn btn-sm" @click="switchToEditForm(u)">编辑</button>
+                <button class="btn btn-sm btn-danger" @click="openDelConfirm(u)">删除</button>
+              </div>
             </div>
           </div>
         </div>
 
-        <div class="msg-tip">{{adminMsg}}</div>
-        <div class="btn-group">
-          <button @click="clearEditForm" class="btn">清空新增</button>
-          <button @click="submitSaveUser" class="btn primary">保存用户</button>
-          <button @click="userManageModal=false" class="btn">关闭</button>
+        <!-- 新增/编辑表单视图 -->
+        <div v-if="umView === 'form'" class="um-content-wrap">
+          <div class="um-form-title">{{editUser ? "编辑用户":"新增用户"}}</div>
+          <div class="um-form-item">
+            <label>用户名</label>
+            <div style="display:flex;gap:8px;">
+              <input v-model="umForm.username" :disabled="!!editUser"/>
+              <button v-if="editUser" class="btn btn-sm" @click="triggerRename">修改用户名</button>
+            </div>
+          </div>
+          <div class="um-form-item">
+            <label>密码（编辑留空不修改）</label>
+            <input v-model="umForm.password" type="password" placeholder="新增用户必填"/>
+          </div>
+          <div class="um-form-item">
+            <label>是否管理员</label>
+            <input type="checkbox" v-model="umForm.is_admin"/>
+          </div>
+          <div class="um-form-item">
+            <label>允许访问目录（多选）</label>
+            <div class="multi-select-wrap">
+              <div v-for="opt in dirOptions" class="check-item">
+                <input type="checkbox" :value="opt" v-model="umForm.allow_dirs" :id="'umdir_'+opt"/>
+                <label :for="'umdir_'+opt">{{opt}}</label>
+              </div>
+            </div>
+          </div>
+          <div class="msg-tip">{{adminMsg}}</div>
+          <div class="um-form-buttons">
+            <button class="btn" @click="switchToList">返回列表</button>
+            <button class="btn primary" @click="submitUmForm">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 删除确认弹窗 -->
+      <div v-if="umDelConfirm.show" class="inner-confirm-mask">
+        <div class="confirm-box">
+          <p>确认删除用户【{{umDelConfirm.user.username}}】？</p>
+          <div class="confirm-btn-row">
+            <button class="btn" @click="umDelConfirm.show=false">取消</button>
+            <button class="btn btn-danger" @click="doInnerDelete">确认删除</button>
+          </div>
         </div>
       </div>
     </div>
@@ -266,14 +287,25 @@ const showUserDrop = ref(false)
 const changePwdModal = ref(false)
 const pwdForm = ref({old:"",new:"",confirm:""})
 const pwdMsg = ref("")
-// 用户管理弹窗（管理员）
+
+// ========= 用户管理【新版状态】 =========
 const userManageModal = ref(false)
+const umView = ref('list') // list / form
+const editUser = ref(null) // null=新增；对象=编辑
 const adminUserList = ref([])
-const adminMsg = ref("")
-const editUserForm = ref({username:"",password:"",is_admin:false})
-// 目录多选下拉
 const dirOptions = ref([])
-const selectedDirList = ref([])
+const adminMsg = ref("")
+const umForm = ref({
+  username:"",
+  password:"",
+  is_admin:false,
+  allow_dirs:[]
+})
+// 删除确认内部弹窗
+const umDelConfirm = ref({
+  show:false,
+  user:null
+})
 
 const mediaList = ref([])
 const breadcrumbList = ref([])
@@ -688,9 +720,7 @@ async function checkLoginStatus() {
       const ret = await res.json()
       isLogin.value = true
       userInfo.value = ret
-      // --------------------------改动点：登录后默认打开根目录，不再读取localStorage上次目录
       const urlDir = getDirFromUrl()
-      // 只有URL地址栏带?dir=xxx参数才使用该目录，登录默认打开根目录
       const initDir = urlDir ?? ''
       loadMedia(initDir, !!urlDir)
       initCheckCacheTask()
@@ -706,7 +736,6 @@ async function checkLoginStatus() {
 function toggleUserDrop(){
   showUserDrop.value = !showUserDrop.value
 }
-// 修改密码弹窗
 function openChangePwdModal(){
   showUserDrop.value = false
   changePwdModal.value = true
@@ -742,14 +771,19 @@ async function submitChangePwd(){
   }
 }
 
-// 管理员：用户管理
+// ========= 用户管理新版逻辑 =========
 async function openUserManageModal(){
   showUserDrop.value = false
   userManageModal.value = true
+  umView.value = 'list'
+  editUser.value = null
   adminMsg.value = ""
-  clearEditForm()
+  umDelConfirm.value.show = false
   await reloadDirOptions()
   await reloadAdminUserList()
+}
+function closeUserManageModal(){
+  userManageModal.value = false
 }
 async function reloadDirOptions(){
   try{
@@ -771,27 +805,32 @@ async function reloadAdminUserList(){
     adminMsg.value = "获取用户列表失败"
   }
 }
-function clearEditForm(){
-  editUserForm.value = {username:"",password:"",is_admin:false}
-  selectedDirList.value = []
+function switchToList(){
+  umView.value = 'list'
+  editUser.value = null
   adminMsg.value = ""
 }
-function editUser(u){
-  editUserForm.value.username = u.username
-  editUserForm.value.password = ""
-  editUserForm.value.is_admin = u.is_admin
-  selectedDirList.value = [...u.allow_dirs]
+function switchToAddForm(){
+  editUser.value = null
+  umForm.value = {username:"",password:"",is_admin:false,allow_dirs:[]}
   adminMsg.value = ""
+  umView.value = 'form'
 }
-
-// 修改用户名
-async function submitRenameUser(){
-  adminMsg.value = ""
-  const oldU = editUserForm.value.username.trim()
-  if(!oldU){
-    adminMsg.value = "请先编辑选中一个用户"
-    return
+function switchToEditForm(u){
+  editUser.value = u
+  umForm.value = {
+    username: u.username,
+    password:"",
+    is_admin: u.is_admin,
+    allow_dirs:[...u.allow_dirs]
   }
+  adminMsg.value = ""
+  umView.value = 'form'
+}
+// 修改用户名（弹窗prompt）
+async function triggerRename(){
+  if(!editUser.value) return
+  const oldU = editUser.value.username
   const newName = prompt("输入新用户名", oldU)
   if(!newName || !newName.trim()) return
   const newTrim = newName.trim()
@@ -808,7 +847,7 @@ async function submitRenameUser(){
     const json = await res.json()
     if(json.code===0){
       adminMsg.value = "用户名修改成功"
-      editUserForm.value.username = newTrim
+      umForm.value.username = newTrim
       await reloadAdminUserList()
     }else{
       adminMsg.value = json.detail || "修改失败"
@@ -817,23 +856,23 @@ async function submitRenameUser(){
     adminMsg.value = "网络异常"
   }
 }
-
-async function submitSaveUser(){
+// 提交保存新增/编辑
+async function submitUmForm(){
   adminMsg.value = ""
-  const username = editUserForm.value.username.trim()
+  const username = umForm.value.username.trim()
   if(!username){
     adminMsg.value = "用户名不能为空"
     return
   }
-  if(selectedDirList.value.length===0){
+  if(umForm.value.allow_dirs.length===0){
     adminMsg.value = "至少勾选一个允许访问目录"
     return
   }
   const body = {
-    username:username,
-    password: editUserForm.value.password.trim() || null,
-    allow_dirs: selectedDirList.value,
-    is_admin: editUserForm.value.is_admin
+    username: username,
+    password: umForm.value.password.trim() || null,
+    allow_dirs: umForm.value.allow_dirs,
+    is_admin: umForm.value.is_admin
   }
   try{
     const res = await fetch("/api/admin/user-save",{
@@ -844,8 +883,8 @@ async function submitSaveUser(){
     const json = await res.json()
     if(json.code===0){
       adminMsg.value = json.msg || "保存成功"
-      clearEditForm()
       await reloadAdminUserList()
+      switchToList()
     }else{
       adminMsg.value = json.detail || "保存失败"
     }
@@ -853,15 +892,21 @@ async function submitSaveUser(){
     adminMsg.value = "网络异常"
   }
 }
-async function delUser(username){
-  if(!confirm(`确认删除用户【${username}】？`)) return
+// 删除确认
+function openDelConfirm(u){
+  umDelConfirm.value.user = u
+  umDelConfirm.value.show = true
+}
+async function doInnerDelete(){
+  const uname = umDelConfirm.value.user.username
   try{
-    const res = await fetch(`/api/admin/user/${encodeURIComponent(username)}`,{method:"DELETE"})
+    const res = await fetch(`/api/admin/user/${encodeURIComponent(uname)}`,{method:"DELETE"})
     const json = await res.json()
     if(json.code===0){
       await reloadAdminUserList()
     }
   }catch(e){}
+  umDelConfirm.value.show = false
 }
 
 // 点击外部关闭下拉
@@ -1033,16 +1078,17 @@ onUnmounted(() => {
   color: #fff;
   cursor: pointer;
 }
-
+.btn-sm{
+  padding:4px 8px;
+  font-size:13px;
+}
 .btn:disabled {
   opacity: 0.65;
   cursor: not-allowed;
 }
-
 .btn.primary {
   background: #2563eb;
 }
-
 .btn-danger {
   background: #dc2626;
 }
@@ -1051,12 +1097,10 @@ onUnmounted(() => {
   margin-bottom: 16px;
   color: #aaa;
 }
-
 .breadcrumb-item {
   color: #60a5fa;
   cursor: pointer;
 }
-
 .separator {
   margin: 0 6px;
 }
@@ -1074,12 +1118,10 @@ onUnmounted(() => {
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
-
 .media-card:hover {
   transform: translateY(-3px);
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.32);
 }
-
 .card-thumb {
   width: 100%;
   overflow: hidden;
@@ -1089,13 +1131,11 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
 }
-
 .card-thumb img {
   width: 100%;
   height: auto;
   display: block;
 }
-
 .play-icon {
   position: absolute;
   top: 50%;
@@ -1111,7 +1151,6 @@ onUnmounted(() => {
   font-size: 18px;
   color: #fff;
 }
-
 .card-name {
   padding: 10px 12px;
   font-size: 13px;
@@ -1197,13 +1236,11 @@ onUnmounted(() => {
   overflow: hidden;
   padding: 18px 18px 10px;
 }
-
 .preview-image-area img {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
 }
-
 .preview-image-area video {
   max-width: 100%;
   max-height: 100%;
@@ -1219,20 +1256,17 @@ onUnmounted(() => {
   align-items: center;
   gap: 10px;
 }
-
 .preview-name {
   font-size: 14px;
   color: #eee;
   text-align: center;
 }
-
 .img-action-bar {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
   justify-content: center;
 }
-
 .img-action-bar button {
   padding: 6px 12px;
   background: rgba(42,42,42,0.75);
@@ -1241,7 +1275,6 @@ onUnmounted(() => {
   border-radius: 6px;
   cursor: pointer;
 }
-
 .img-action-bar button:hover {
   background: rgba(58,58,58,0.9);
 }
@@ -1252,74 +1285,87 @@ onUnmounted(() => {
   padding:24px;
   width:380px;
 }
-.user-manage-box {
+
+/* =========新版用户管理弹窗样式 ========= */
+.user-manage-box{
   background:#181818;
   border-radius:12px;
-  padding:24px;
-  width:680px;
+  width:720px;
   max-height:85vh;
-  overflow-y:auto;
-}
-.user-list {
-  margin-bottom:16px;
-}
-.user-row {
   display:flex;
-  gap:10px;
+  flex-direction:column;
+  overflow:hidden;
+}
+.um-header{
+  display:flex;
+  justify-content:space-between;
   align-items:center;
-  padding:8px 0;
+  padding:14px 18px;
   border-bottom:1px solid #333;
 }
-.u-name {
-  width:140px;
+.um-close-btn{
+  background:transparent;
+  border:none;
+  color:#aaa;
+  font-size:22px;
+  cursor:pointer;
 }
-.u-tag {
-  width:80px;
+.um-content-wrap{
+  flex:1;
+  overflow-y:auto;
+  padding:16px 18px;
 }
-.admin-tag {
+.um-top-bar{
+  margin-bottom:14px;
+}
+.um-table{
+  border:1px solid #333;
+  border-radius:8px;
+}
+.um-table-head,.um-table-row{
+  display:grid;
+  grid-template-columns:140px 100px 1fr 160px;
+  padding:10px 12px;
+  align-items:center;
+  border-bottom:1px solid #333;
+}
+.um-table-head{
+  background:#242424;
+  font-weight:bold;
+}
+.um-table-row:last-child{
+  border-bottom:none;
+}
+.tag-admin{
   color:#ffd044;
   font-size:12px;
 }
-.u-dir {
-  flex:1;
-  font-size:13px;
+.tag-user{
   color:#aaa;
+  font-size:12px;
 }
-.u-op {
+.um-form-title{
+  font-size:16px;
+  font-weight:bold;
+  margin-bottom:16px;
+}
+.um-form-item{
+  margin-bottom:14px;
   display:flex;
-  gap:6px;
-}
-.divider {
-  height:1px;
-  background:#333;
-  margin:16px 0;
-}
-.msg-tip {
-  color:#ffdd77;
-  font-size:13px;
-  min-height:20px;
-}
-
-.form-row {
-  margin: 14px 0;
-  display: flex;
   flex-direction:column;
   gap:6px;
-  align-items:flex-start;
 }
-.form-row label {
+.um-form-item label{
   font-size:14px;
   color:#ccc;
 }
-.form-row input {
-  width:100%;
+.um-form-item input{
   padding:9px;
   background:#2a2a2a;
-  border:none;
+  border:1px solid #444;
   border-radius:6px;
   color:#fff;
 }
-
 .multi-select-wrap {
   width:100%;
   max-height:220px;
@@ -1337,6 +1383,41 @@ onUnmounted(() => {
 .check-item label {
   color:#eee;
   font-size:14px;
+}
+.um-form-buttons{
+  display:flex;
+  gap:10px;
+  justify-content:flex-end;
+  margin-top:22px;
+  padding-top:12px;
+  border-top:1px solid #333;
+  flex-shrink:0;
+}
+.msg-tip {
+  color:#ffdd77;
+  font-size:13px;
+  min-height:20px;
+}
+
+.inner-confirm-mask{
+  position:absolute;
+  inset:0;
+  background:rgba(0,0,0,0.65);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:100;
+}
+.confirm-box{
+  background:#1c1c1c;
+  padding:20px 24px;
+  border-radius:10px;
+}
+.confirm-btn-row{
+  display:flex;
+  gap:10px;
+  justify-content:flex-end;
+  margin-top:18px;
 }
 
 .btn-group {
