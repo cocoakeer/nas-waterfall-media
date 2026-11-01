@@ -71,7 +71,13 @@
       <div class="preview-box">
         <button class="close-btn" @click="closePreview">×</button>
         <div v-if="previewItem.type === 'image'" class="preview-media">
-          <img :src="getSrcUrl(previewItem.path)" alt="" />
+          <img :src="getSrcUrl(previewItem.path)" alt="" :style="imgRotateStyle" />
+          <!-- 图片操作按钮组 -->
+          <div class="img-action-bar">
+            <button @click="openOriginal">查看原图</button>
+            <button @click="rotateLeft">↺ 左旋90°</button>
+            <button @click="rotateRight">↻ 右旋90°</button>
+          </div>
         </div>
         <div v-else class="preview-media">
           <video controls :src="getSrcUrl(previewItem.path)"></video>
@@ -122,6 +128,8 @@ const previewShow = ref(false)
 const previewItem = ref(null)
 let previewMediaList = []
 let previewCurrentIndex = 0
+// 图片旋转角度
+const imgRotateDeg = ref(0)
 
 const settingShow = ref(false)
 const slideDelay = ref(3)
@@ -145,6 +153,24 @@ const getThumbUrl = (path) => {
 }
 const getSrcUrl = (path) => {
   return `${baseUrl}/api/src?path=${encodeURIComponent(path)}`
+}
+
+// 旋转样式
+const imgRotateStyle = ref({
+  transform: 'rotate(0deg)',
+  transition: 'transform 0.25s ease'
+})
+
+function rotateLeft() {
+  imgRotateDeg.value -= 90
+  imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
+}
+function rotateRight() {
+  imgRotateDeg.value += 90
+  imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
+}
+function openOriginal() {
+  window.open(getSrcUrl(previewItem.value.path), '_blank')
 }
 
 function getColumnCount() {
@@ -297,6 +323,9 @@ function handleCardClick(item) {
     previewMediaList = mediaList.value.filter(x => x.type !== 'folder')
     previewCurrentIndex = previewMediaList.findIndex(x => x.id === item.id)
     previewItem.value = item
+    // 打开新图片时重置旋转角度
+    imgRotateDeg.value = 0
+    imgRotateStyle.value.transform = 'rotate(0deg)'
     previewShow.value = true
   }
 }
@@ -305,12 +334,16 @@ function prevMedia() {
   if (previewCurrentIndex > 0) {
     previewCurrentIndex -= 1
     previewItem.value = previewMediaList[previewCurrentIndex]
+    imgRotateDeg.value = 0
+    imgRotateStyle.value.transform = 'rotate(0deg)'
   }
 }
 function nextMedia() {
   if (previewCurrentIndex < previewMediaList.length - 1) {
     previewCurrentIndex += 1
     previewItem.value = previewMediaList[previewCurrentIndex]
+    imgRotateDeg.value = 0
+    imgRotateStyle.value.transform = 'rotate(0deg)'
   }
 }
 
@@ -539,11 +572,30 @@ onUnmounted(()=>{
 .preview-media {
   max-width:85vw;
   max-height:80vh;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
 }
 .preview-media img, .preview-media video {
   max-width:100%;
-  max-height:80vh;
+  max-height:70vh;
   display:block;
+}
+.img-action-bar {
+  margin-top:12px;
+  display:flex;
+  gap:10px;
+}
+.img-action-bar button {
+  padding:5px 10px;
+  background:#2a2a2a;
+  color:#fff;
+  border:0;
+  border-radius:6px;
+  cursor:pointer;
+}
+.img-action-bar button:hover {
+  background:#3a3a3a;
 }
 .preview-name {
   text-align:center;
