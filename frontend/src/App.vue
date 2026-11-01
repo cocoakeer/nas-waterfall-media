@@ -4,7 +4,10 @@
       <h1>NAS 媒体瀑布流</h1>
       <div class="header-actions">
         <button @click="runCacheTask" class="btn" :disabled="cacheRunning">
-          {{ cacheRunning ? "处理中…" : "预生成缓存" }}
+          {{ cacheRunning ? `处理中 ${cachePercent}%` : "预生成缓存" }}
+        </button>
+        <button v-if="cacheRunning" @click="stopCacheTask" class="btn btn-danger">
+          取消任务
         </button>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
         <button @click="startSlide" class="btn primary">开始幻灯片</button>
@@ -132,8 +135,10 @@ const currentSlide = ref({})
 let resizeObserver = null
 let layoutDebounceTimer = null
 
-// 缓存任务按钮状态
+// ==========缓存任务状态==========
 const cacheRunning = ref(false)
+const cachePercent = ref(0)
+let statusPollTimer = null
 
 const getThumbUrl = (path) => {
   return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
@@ -189,23 +194,71 @@ function onMediaImgFinish() {
   debounceLayout()
 }
 
-// 调用后端预缓存接口
+// 轮询任务状态
+async function pollCacheStatus(){
+  try{
+    const res = await fetch(`${baseUrl}/api/cache-status`)
+    const st = await res.json()
+    cachePercent.value = st.percent
+    if(!st.running){
+      clearInterval(statusPollTimer)
+      statusPollTimer = null
+      cacheRunning.value = false
+      alert(`✅缓存任务结束！\n${st.message}\n处理文件:${st.processed}/${st.total}`)
+    }
+  }catch(err){
+    console.error("查询任务状态失败",err)
+  }
+}
+
+// 页面载入自动检查任务状态
+async function initCheckCacheTask() {
+  try {
+    const res = await fetch(`${baseUrl}/api/cache-status`)
+    const st = await res.json()
+    if (st.running) {
+      cacheRunning.value = true
+      cachePercent.value = st.percent
+      statusPollTimer = setInterval(pollCacheStatus, 800)
+    }
+  } catch (err) {
+    console.error("初始化检查缓存任务失败", err)
+  }
+}
+
+// 启动缓存任务
 async function runCacheTask(){
   if(cacheRunning.value) return
   cacheRunning.value = true
+  cachePercent.value = 0
   try {
     const res = await fetch(`${baseUrl}/api/cache-run`)
     const ret = await res.json()
-    if(ret.code === 0){
-      alert("✅预缓存任务执行完成！\n已经预生成缩略图并清理无效缓存。")
-    }else{
-      alert("❌任务异常：" + ret.msg + " " + ret.error)
+    if(ret.code !== 0){
+      alert("❌"+ret.msg)
+      cacheRunning.value = false
+      return
     }
+    statusPollTimer = setInterval(pollCacheStatus, 800)
   }catch(err){
     console.error(err)
-    alert("❌请求失败，后端接口调用出错！")
-  }finally{
+    alert("❌请求失败，提交任务出错！")
     cacheRunning.value = false
+  }
+}
+
+// 取消任务
+async function stopCacheTask() {
+  if (!confirm("确认要终止缓存任务吗？")) return
+  try {
+    const res = await fetch(`${baseUrl}/api/cache-stop`)
+    const ret = await res.json()
+    if(ret.code !==0){
+      alert("❌"+ret.msg)
+    }
+  } catch(err) {
+    console.error(err)
+    alert("❌发送停止指令失败")
   }
 }
 
@@ -314,6 +367,8 @@ onMounted(()=>{
     debounceLayout()
   })
   if(waterfallRef.value) resizeObserver.observe(waterfallRef.value)
+  loadMedia()
+  initCheckCacheTask()
 })
 
 onUnmounted(()=>{
@@ -321,9 +376,9 @@ onUnmounted(()=>{
   window.removeEventListener('resize', onWindowResize)
   if(resizeObserver) resizeObserver.disconnect()
   clearTimeout(layoutDebounceTimer)
+  if(statusPollTimer) clearInterval(statusPollTimer)
 })
 
-loadMedia()
 </script>
 
 <style scoped>
@@ -368,6 +423,9 @@ loadMedia()
 }
 .btn.primary {
   background: #2563eb;
+}
+.btn-danger {
+  background: #dc2626;
 }
 .breadcrumb {
   margin-bottom: 16px;

@@ -1,6 +1,7 @@
 import os
 import urllib.parse
 import subprocess
+import threading
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,7 +30,17 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi"}
-COVER_NAMES = {"cover.jpg", "cover.png", "cover.webp", "Cover.jpg", "Cover.png", "Cover.webp"}
+COVER_NAMES = {"cover.jpg", "cover.png", "cover.webp"}
+
+# ========== 缓存任务状态 ==========
+cache_task_lock = threading.Lock()
+cache_task_state = {
+    "running": False,
+    "stop_request": False,
+    "processed": 0,
+    "total": 0,
+    "message": ""
+}
 
 app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="assets")
 
@@ -39,25 +50,17 @@ async def index():
 
 
 def get_folder_cover(folder_abs: str, base_abs: str):
-    """获取文件夹封面：优先cover.*，否则取目录第一个图片；返回相对路径，无则返回None"""
     cover_candidate = None
-    media_first = None
     try:
         for name in os.listdir(folder_abs):
             full = os.path.join(folder_abs, name)
-            if os.path.isfile(full):
-                if name in COVER_NAMES:
-                    rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
-                    cover_candidate = "/" + rel
-                ext = os.path.splitext(name)[1].lower()
-                if ext in IMAGE_EXT and media_first is None and name.lower() not in {"cover.jpg", "cover.png", "cover.webp"}:
-                    rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
-                    media_first = "/" + rel
+            if os.path.isfile(full) and name.lower() in COVER_NAMES:
+                rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
+                cover_candidate = "/" + rel
+                break
     except Exception:
         pass
-    if cover_candidate:
-        return cover_candidate
-    return media_first
+    return cover_candidate
 
 
 @app.get("/api/list")
@@ -68,8 +71,8 @@ async def list_dir(dir: str = ""):
         target = os.path.abspath(os.path.join(base, dir.lstrip("/")))
 
         if not target.startswith(base):
-            raise HTTPException(status_code=403, detail="非法路径")
-        if not os.path.exists(target) or not os.path.isdir(target):
+            raise HTTPException(status_code=403, detail="Access denied")
+        if not os.path.isdir(target):
             return {"list": [], "breadcrumb": []}
 
         breadcrumb = []
@@ -81,20 +84,19 @@ async def list_dir(dir: str = ""):
                 breadcrumb.append({"name": p, "path": cur})
 
         items = []
-        for name in os.listdir(target):
-            if name in COVER_NAMES:
-                continue
-            full = os.path.join(target, name)
-            rel_path = os.path.relpath(full, base).replace(os.sep, "/")
+        entries = sorted(os.listdir(target))
+        for name in entries:
+            full_path = os.path.join(target, name)
+            rel_path = os.path.relpath(full_path, base).replace(os.sep, "/")
             ext = os.path.splitext(name)[1].lower()
-            if os.path.isdir(full):
-                cover_path = get_folder_cover(full, base)
+            if os.path.isdir(full_path):
+                cover = get_folder_cover(full_path, base)
                 items.append({
                     "id": rel_path,
                     "name": name,
                     "path": "/" + rel_path,
                     "type": "folder",
-                    "cover_path": cover_path
+                    "cover_path": cover
                 })
             elif ext in IMAGE_EXT:
                 items.append({
@@ -111,155 +113,193 @@ async def list_dir(dir: str = ""):
                     "type": "video"
                 })
         return {"list": items, "breadcrumb": breadcrumb}
-    except Exception:
+    except Exception as e:
         return {"list": [], "breadcrumb": []}
 
 
 def generate_thumb(file_abs: str, cache_out: str):
-    """生成缩略图，图片用PIL，视频调用系统ffmpeg(subprocess)；同步函数，给定时任务&接口共用"""
     ext = os.path.splitext(file_abs)[1].lower()
     try:
         if ext in IMAGE_EXT:
-            img = Image.open(file_abs)
-            img.thumbnail((400, 400))
-            img.save(cache_out, "JPEG")
+            with Image.open(file_abs) as im:
+                im.thumbnail((400, 400))
+                im.save(cache_out, "JPEG")
             return True
         elif ext in VIDEO_EXT:
             cmd = [
-                "ffmpeg",
-                "-ss", "0.5",
+                "ffmpeg", "-y", "-ss", "0.5",
                 "-i", file_abs,
                 "-vframes", "1",
                 "-vf", "scale=400:-1",
-                "-y",
                 cache_out
             ]
             subprocess.run(cmd, capture_output=True, timeout=15)
-            if os.path.exists(cache_out) and os.path.getsize(cache_out) > 0:
-                return True
+            return os.path.exists(cache_out)
     except Exception:
         pass
     return False
 
 
-def pre_cache_all_media():
-    """定时任务1：预生成全部缺失的缩略图（增量，已存在缓存跳过）"""
-    print("[PreCache] start pre‑generate thumbnails")
+def background_cache_work():
+    global cache_task_state
     base = os.path.abspath(MEDIA_ROOT)
-    for root, _, files in os.walk(base):
-        for fname in files:
-            full_abs = os.path.join(root, fname)
-            ext = os.path.splitext(fname)[1].lower()
-            if not (ext in IMAGE_EXT or ext in VIDEO_EXT):
-                continue
+    media_files = []
+    print("[PreCache] background task start")
+    try:
+        for root, _, files in os.walk(base):
+            with cache_task_lock:
+                if cache_task_state["stop_request"]:
+                    raise Exception("task stop requested")
+            for fname in files:
+                full_abs = os.path.join(root, fname)
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in IMAGE_EXT or ext in VIDEO_EXT:
+                    media_files.append(full_abs)
+
+        with cache_task_lock:
+            cache_task_state["total"] = len(media_files)
+            cache_task_state["processed"] = 0
+            cache_task_state["message"] = "正在生成缩略图"
+
+        for full_abs in media_files:
+            with cache_task_lock:
+                if cache_task_state["stop_request"]:
+                    raise Exception("task stop requested")
             rel = os.path.relpath(full_abs, base).replace(os.sep, "/")
-            cache_key = rel.replace("/", "_")
-            cache_file = os.path.join(CACHE_DIR, cache_key + ".jpg")
-            if os.path.exists(cache_file):
-                continue
-            generate_thumb(full_abs, cache_file)
-    print("[PreCache] pre‑generate finished")
+            cache_key = rel.replace("/", "_") + ".jpg"
+            cache_file = os.path.join(CACHE_DIR, cache_key)
+            if not os.path.exists(cache_file):
+                generate_thumb(full_abs, cache_file)
+            with cache_task_lock:
+                cache_task_state["processed"] += 1
+
+        with cache_task_lock:
+            cache_task_state["message"] = "正在清理无效缓存"
+        clean_orphan_cache()
+
+        with cache_task_lock:
+            cache_task_state["message"] = "任务全部完成"
+        print("[PreCache] background task finished")
+    except Exception as e:
+        print("[PreCache] task stopped/error:", str(e))
+        with cache_task_lock:
+            cache_task_state["message"] = f"任务已停止：{str(e)}"
+    finally:
+        with cache_task_lock:
+            cache_task_state["running"] = False
+            cache_task_state["stop_request"] = False
 
 
 def clean_orphan_cache():
-    """定时任务2：清理孤儿缓存：原始文件已经被删除，但缓存还残留的文件"""
-    print("[CacheClean] start clean orphan cache")
     base = os.path.abspath(MEDIA_ROOT)
     if not os.path.isdir(CACHE_DIR):
         return
-    for cache_fname in os.listdir(CACHE_DIR):
-        if not cache_fname.endswith(".jpg"):
+    for fname in os.listdir(CACHE_DIR):
+        if not fname.endswith(".jpg"):
             continue
-        raw_key = cache_fname[:-4]
-        rel_path = raw_key.replace("_", "/")
-        origin_abs = os.path.join(base, rel_path.lstrip("/"))
-        if not os.path.exists(origin_abs):
-            orphan_path = os.path.join(CACHE_DIR, cache_fname)
+        raw_rel = fname[:-4].replace("_", "/")
+        origin_file = os.path.join(base, raw_rel)
+        if not os.path.exists(origin_file):
             try:
-                os.unlink(orphan_path)
+                os.unlink(os.path.join(CACHE_DIR, fname))
             except Exception:
                 pass
-    print("[CacheClean] clean orphan cache finished")
+
+
+@app.get("/api/cache-run", response_class=JSONResponse)
+async def api_cache_run():
+    global cache_task_state
+    with cache_task_lock:
+        if cache_task_state["running"]:
+            return {"code": -1, "msg": "已有任务正在运行，请等待或取消"}
+        cache_task_state["running"] = True
+        cache_task_state["stop_request"] = False
+        cache_task_state["processed"] = 0
+        cache_task_state["total"] = 0
+        cache_task_state["message"] = "开始扫描媒体文件"
+    t = threading.Thread(target=background_cache_work, daemon=True)
+    t.start()
+    return {"code": 0, "msg": "任务已提交后台运行"}
+
+
+@app.get("/api/cache-stop", response_class=JSONResponse)
+async def api_cache_stop():
+    global cache_task_state
+    with cache_task_lock:
+        if not cache_task_state["running"]:
+            return {"code": -1, "msg": "没有正在运行的任务"}
+        cache_task_state["stop_request"] = True
+        cache_task_state["message"] = "收到停止指令，正在终止任务"
+    return {"code": 0, "msg": "已发送停止信号"}
+
+
+@app.get("/api/cache-status", response_class=JSONResponse)
+async def api_cache_status():
+    with cache_task_lock:
+        st = dict(cache_task_state)
+    pct = 0
+    if st["total"] > 0:
+        pct = round(100 * st["processed"] / st["total"], 1)
+    return {
+        "running": st["running"],
+        "processed": st["processed"],
+        "total": st["total"],
+        "percent": pct,
+        "message": st["message"]
+    }
 
 
 @app.get("/api/thumb")
-async def get_thumb(path: str):
-    path = urllib.parse.unquote(path)
+async def get_thumb(path: str = ""):
+    path = urllib.parse.unquote(path.lstrip("/"))
     base = os.path.abspath(MEDIA_ROOT)
-    full_path = os.path.abspath(os.path.join(base, path.lstrip("/")))
-
-    if not full_path.startswith(base):
-        raise HTTPException(status_code=403, detail="非法路径")
-    if not os.path.isfile(full_path):
+    origin = os.path.abspath(os.path.join(base, path))
+    if not origin.startswith(base) or not os.path.isfile(origin):
         return Response(status_code=204)
-
-    cache_key = path.replace("/", "_")
-    cache_file = os.path.join(CACHE_DIR, cache_key + ".jpg")
-
-    if os.path.exists(cache_file):
-        return FileResponse(cache_file, media_type="image/jpeg")
-
-    ok = generate_thumb(full_path, cache_file)
-    if ok and os.path.exists(cache_file):
-        return FileResponse(cache_file, media_type="image/jpeg")
-    return Response(status_code=204)
+    cache_key = path.replace("/", "_") + ".jpg"
+    cache_file = os.path.join(CACHE_DIR, cache_key)
+    if not os.path.exists(cache_file):
+        ok = generate_thumb(origin, cache_file)
+        if not ok:
+            return Response(status_code=204)
+    return FileResponse(cache_file)
 
 
 @app.get("/api/src")
-async def get_src(path: str):
-    path = urllib.parse.unquote(path)
+async def get_src(path: str = ""):
+    path = urllib.parse.unquote(path.lstrip("/"))
     base = os.path.abspath(MEDIA_ROOT)
-    full_path = os.path.abspath(os.path.join(base, path.lstrip("/")))
-
-    if not full_path.startswith(base):
-        raise HTTPException(status_code=403, detail="非法路径")
-    if not os.path.isfile(full_path):
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    ext = os.path.splitext(full_path)[1].lower()
-    mime_map = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-        ".mp4": "video/mp4",
-        ".mov": "video/quicktime",
-        ".mkv": "video/x-matroska",
-        ".avi": "video/x-msvideo"
-    }
-    mime = mime_map.get(ext, "application/octet-stream")
-    return FileResponse(full_path, media_type=mime)
+    target = os.path.abspath(os.path.join(base, path))
+    if not target.startswith(base) or not os.path.isfile(target):
+        raise HTTPException(status_code=404)
+    ext = os.path.splitext(target)[1].lower()
+    mime = "image/jpeg"
+    if ext in IMAGE_EXT:
+        mime = "image/jpeg"
+    elif ext in VIDEO_EXT:
+        mime = "video/mp4"
+    return FileResponse(target, media_type=mime)
 
 
-# 手动触发缓存任务接口
-@app.get("/api/cache-run", response_class=JSONResponse)
-async def api_manual_cache_run():
-    """手动触发：预生成缩略 + 清理孤儿缓存，调试用"""
-    try:
-        pre_cache_all_media()
-        clean_orphan_cache()
-        return {
-            "code":0,
-            "msg":"执行完成：预生成缩略图 + 清理孤儿缓存已执行完毕"
-        }
-    except Exception as e:
-        return {
-            "code":-1,
-            "msg":"执行异常",
-            "error":str(e)
-        }
-
-
-# 后台定时调度：每天凌晨2点执行【预生成缩略 + 清理孤儿缓存】
+# 定时任务
 scheduler = BackgroundScheduler()
-scheduler.add_job(lambda: (pre_cache_all_media(), clean_orphan_cache()), "cron", hour=2, minute=0)
+def cron_job():
+    with cache_task_lock:
+        if not cache_task_state["running"]:
+            cache_task_state["running"] = True
+            cache_task_state["stop_request"] = False
+            cache_task_state["processed"] = 0
+            cache_task_state["total"] = 0
+            cache_task_state["message"] = "定时缓存任务开始"
+    t = threading.Thread(target=background_cache_work, daemon=True)
+    t.start()
+
+scheduler.add_job(cron_job, "cron", hour=2, minute=0)
 scheduler.start()
 
 @app.on_event("shutdown")
-def shutdown_event():
+def shutdown():
     scheduler.shutdown()
-
 
 if __name__ == "__main__":
     import uvicorn
