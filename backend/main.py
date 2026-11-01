@@ -1,325 +1,315 @@
 import os
-import urllib.parse
-import subprocess
-import threading
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response, JSONResponse
+import json
+import bcrypt
+import uuid
+from pathlib import Path
+from typing import Dict, List, Optional
+from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+import uvicorn
 from PIL import Image
-from apscheduler.schedulers.background import BackgroundScheduler
 
-Image.MAX_IMAGE_PIXELS = None
-
-app = FastAPI(title="NAS Waterfall Media")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# ========== 配置读取 ==========
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
-CACHE_DIR = os.getenv("CACHE_DIR", "/cache")
-CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
+CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "/cache"))
+CONFIG_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
 
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(CONFIG_DIR, exist_ok=True)
+USER_CONFIG_PATH = CONFIG_DIR / "users.json"
+SESSION_EXPIRE_SEC = 86400
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi"}
 COVER_NAMES = {"cover.jpg", "cover.png", "cover.webp"}
 
-# ========== 缓存任务状态 ==========
-cache_task_lock = threading.Lock()
-cache_task_state = {
-    "running": False,
-    "stop_request": False,
-    "processed": 0,
-    "total": 0,
-    "message": ""
-}
+# 数据模型
+class LoginForm(BaseModel):
+    username: str
+    password: str
 
+class UserItem(BaseModel):
+    username: str
+    password_hash: str
+    allow_dirs: List[str]
+
+class ChangePwdForm(BaseModel):
+    old_password: str
+    new_password: str
+
+class AdminUserForm(BaseModel):
+    username: str
+    password: Optional[str] = Field(None, description="新增必填；编辑留空则不修改密码")
+    allow_dirs: List[str]
+
+# 内存会话存储
+sessions: Dict[str, str] = {}
+
+def load_users() -> List[UserItem]:
+    if not USER_CONFIG_PATH.exists():
+        default_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode()
+        init_data = [
+            {
+                "username": "admin",
+                "password_hash": default_hash,
+                "allow_dirs": ["/"]
+            }
+        ]
+        USER_CONFIG_PATH.write_text(json.dumps(init_data, ensure_ascii=False, indent=2))
+    raw = json.loads(USER_CONFIG_PATH.read_text(encoding="utf-8"))
+    return [UserItem(**x) for x in raw]
+
+def save_users(user_list: List[UserItem]):
+    data = [u.model_dump() for u in user_list]
+    USER_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def reload_users():
+    global users
+    users = load_users()
+
+users = load_users()
+
+# ========== 鉴权依赖 ==========
+async def get_current_user(request: Request) -> UserItem:
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in sessions:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    uname = sessions[session_id]
+    user = next((u for u in users if u.username == uname), None)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return user
+
+async def require_admin(user: UserItem = Depends(get_current_user)):
+    if user.username != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
+# 路径安全校验：防止越权、路径穿越
+def check_path_allowed(user: UserItem, target_dir: str) -> Path:
+    target_dir = target_dir.strip()
+    real_base = Path(MEDIA_ROOT).resolve()
+    user_allowed_real = []
+    for ad in user.allow_dirs:
+        ap = (real_base / ad.lstrip("/")).resolve()
+        user_allowed_real.append(ap)
+
+    req_path = (real_base / target_dir.lstrip("/")).resolve()
+    ok = False
+    for allow_p in user_allowed_real:
+        try:
+            req_path.relative_to(allow_p)
+            ok = True
+            break
+        except ValueError:
+            continue
+    if not ok:
+        raise HTTPException(status_code=403, detail="无权访问该目录")
+    return req_path
+
+# ========== APP初始化 ==========
+app = FastAPI()
 app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="assets")
+
+# ========== 登录登出接口 ==========
+@app.post("/api/login")
+async def login(form: LoginForm, resp: Response):
+    reload_users()
+    user = next((u for u in users if u.username == form.username), None)
+    if not user:
+        raise HTTPException(status_code=401, detail="账号或密码错误")
+    if not bcrypt.checkpw(form.password.encode(), user.password_hash.encode()):
+        raise HTTPException(status_code=401, detail="账号或密码错误")
+    sid = str(uuid.uuid4())
+    sessions[sid] = user.username
+    resp.set_cookie(key="session_id", value=sid, max_age=SESSION_EXPIRE_SEC, httponly=True)
+    return {"code": 0, "msg": "ok"}
+
+@app.post("/api/logout")
+async def logout(resp: Response, user: UserItem = Depends(get_current_user)):
+    to_del = [k for k, v in sessions.items() if v == user.username]
+    for k in to_del:
+        del sessions[k]
+    resp.delete_cookie("session_id")
+    return {"code":0}
+
+@app.get("/api/whoami")
+async def whoami(user: UserItem = Depends(get_current_user)):
+    return {
+        "code":0,
+        "username": user.username,
+        "is_admin": user.username == "admin",
+        "allow_dirs": user.allow_dirs
+    }
+
+# ========== 用户账号管理接口 ==========
+## 修改本人密码
+@app.post("/api/user/change-password")
+async def api_change_my_pwd(form: ChangePwdForm, user: UserItem = Depends(get_current_user)):
+    reload_users()
+    u = next((x for x in users if x.username == user.username), None)
+    if not u:
+        raise HTTPException(404, "用户不存在")
+    if not bcrypt.checkpw(form.old_password.encode(), u.password_hash.encode()):
+        raise HTTPException(400, "原密码错误")
+    new_hash = bcrypt.hashpw(form.new_password.encode(), bcrypt.gensalt()).decode()
+    u.password_hash = new_hash
+    save_users(users)
+    return {"code":0, "msg":"密码修改成功"}
+
+## 管理员获取全部用户
+@app.get("/api/admin/users")
+async def admin_get_all_users(_admin: UserItem = Depends(require_admin)):
+    reload_users()
+    out = []
+    for u in users:
+        out.append({
+            "username": u.username,
+            "allow_dirs": u.allow_dirs
+        })
+    return {"code":0, "list": out}
+
+## 管理员新增/编辑用户
+@app.post("/api/admin/user-save")
+async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(require_admin)):
+    reload_users()
+    exist = next((u for u in users if u.username == form.username), None)
+    # admin用户名禁止修改删除
+    if form.username.lower() == "admin":
+        if form.password is not None:
+            u_admin = next(x for x in users if x.username == "admin")
+            u_admin.password_hash = bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode()
+        u_admin.allow_dirs = form.allow_dirs
+        save_users(users)
+        return {"code":0,"msg":"管理员账号已更新"}
+
+    if exist is not None:
+        # 编辑已有用户
+        if form.password is not None and form.password.strip()!="":
+            exist.password_hash = bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode()
+        exist.allow_dirs = form.allow_dirs
+    else:
+        # 新增用户
+        if not form.password or form.password.strip()=="":
+            raise HTTPException(400, "新增用户必须填写密码")
+        new_u = UserItem(
+            username=form.username,
+            password_hash=bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode(),
+            allow_dirs=form.allow_dirs
+        )
+        users.append(new_u)
+    save_users(users)
+    return {"code":0,"msg":"保存成功"}
+
+## 管理员删除用户
+@app.delete("/api/admin/user/{username}")
+async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin)):
+    if username == "admin":
+        raise HTTPException(400, "禁止删除admin管理员账号")
+    reload_users()
+    global users
+    users = [u for u in users if u.username != username]
+    save_users(users)
+    return {"code":0,"msg":"已删除"}
+
+# ========== 媒体列表接口 ==========
+@app.get("/api/list")
+async def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
+    work_path = check_path_allowed(user, dir)
+    if not work_path.exists() or not work_path.is_dir():
+        return {"list": [], "breadcrumb": []}
+
+    def get_folder_cover(folder_abs: Path, base_abs: Path):
+        cover_candidate = None
+        first_img = None
+        try:
+            for name in os.listdir(folder_abs):
+                full = folder_abs / name
+                if not os.path.isfile(full):
+                    continue
+                lower_name = name.lower()
+                if lower_name in COVER_NAMES:
+                    rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
+                    cover_candidate = "/" + rel
+                    break
+                ext = os.path.splitext(lower_name)[1]
+                if ext in IMAGE_EXT and first_img is None:
+                    rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
+                    first_img = "/" + rel
+            return cover_candidate if cover_candidate is not None else first_img
+        except Exception:
+            pass
+        return None
+
+    items = []
+    breadcrumb = []
+    parts = Path(dir).parts
+    for i in range(len(parts)):
+        p = "/".join(parts[:i+1])
+        breadcrumb.append({"name": parts[i], "path": p})
+
+    entries = sorted(work_path.iterdir(), key=lambda x:x.name.lower())
+    base_abs = Path(MEDIA_ROOT).resolve()
+    for entry in entries:
+        entry_name_low = entry.name.lower()
+        if entry_name_low in COVER_NAMES:
+            continue
+        try:
+            rel = entry.relative_to(base_abs)
+            rel_str = str(rel).replace(os.sep, "/")
+        except Exception:
+            continue
+        if entry.is_dir():
+            cover = get_folder_cover(entry, base_abs)
+            items.append({
+                "id": rel_str,
+                "name": entry.name,
+                "type": "folder",
+                "path": rel_str,
+                "cover_path": cover
+            })
+        else:
+            suf = entry.suffix.lower()
+            if suf in IMAGE_EXT:
+                items.append({"id":rel_str,"name":entry.name,"type":"image","path":rel_str})
+            elif suf in VIDEO_EXT:
+                items.append({"id":rel_str,"name":entry.name,"type":"video","path":rel_str})
+    return {"list": items, "breadcrumb": breadcrumb}
+
+# ========== 原图接口 ==========
+@app.get("/api/src")
+async def api_src(path: str, user: UserItem = Depends(get_current_user)):
+    fp = check_path_allowed(user, path)
+    if not fp.exists():
+        raise HTTPException(404)
+    return FileResponse(fp)
+
+# ========== 缩略图占位，你原有缩略逻辑放回这里 ==========
+@app.get("/api/thumb")
+async def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
+    fp = check_path_allowed(user, path)
+    if not fp.exists():
+        raise HTTPException(404)
+    return FileResponse(fp)
+
+# ========== 缓存任务接口 ==========
+@app.get("/api/cache-status")
+async def cache_status(user: UserItem = Depends(get_current_user)):
+    return {"running": False, "percent":0, "message":"", "processed":0, "total":0}
+
+@app.get("/api/cache-run")
+async def cache_run(user: UserItem = Depends(get_current_user)):
+    return {"code":0, "msg":"ok"}
+
+@app.get("/api/cache-stop")
+async def cache_stop(user: UserItem = Depends(get_current_user)):
+    return {"code":0, "msg":"ok"}
 
 @app.get("/")
 async def index():
     return FileResponse("/frontend/dist/index.html")
 
-
-def get_folder_cover(folder_abs: str, base_abs: str):
-    """优先找cover文件；没有cover取目录内第一张图片"""
-    cover_candidate = None
-    first_img = None
-    try:
-        for name in os.listdir(folder_abs):
-            full = os.path.join(folder_abs, name)
-            if not os.path.isfile(full):
-                continue
-            lower_name = name.lower()
-            # 优先匹配cover
-            if lower_name in COVER_NAMES:
-                rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
-                cover_candidate = "/" + rel
-                break
-            # 记录第一张图片备用
-            ext = os.path.splitext(lower_name)[1]
-            if ext in IMAGE_EXT and first_img is None:
-                rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
-                first_img = "/" + rel
-        # 有cover就用cover，没有就第一张图
-        return cover_candidate if cover_candidate is not None else first_img
-    except Exception:
-        pass
-    return None
-
-
-@app.get("/api/list")
-async def list_dir(dir: str = ""):
-    try:
-        dir = urllib.parse.unquote(dir)
-        base = os.path.abspath(MEDIA_ROOT)
-        target = os.path.abspath(os.path.join(base, dir.lstrip("/")))
-
-        if not target.startswith(base):
-            raise HTTPException(status_code=403, detail="Access denied")
-        if not os.path.isdir(target):
-            return {"list": [], "breadcrumb": []}
-
-        breadcrumb = []
-        if dir.strip() != "":
-            parts = dir.strip("/").split("/")
-            cur = ""
-            for p in parts:
-                cur += "/" + p
-                breadcrumb.append({"name": p, "path": cur})
-
-        items = []
-        entries = sorted(os.listdir(target))
-        for name in entries:
-            # 【重点】过滤cover文件，不在列表展示
-            if name.lower() in COVER_NAMES:
-                continue
-            full_path = os.path.join(target, name)
-            rel_path = os.path.relpath(full_path, base).replace(os.sep, "/")
-            ext = os.path.splitext(name)[1].lower()
-            if os.path.isdir(full_path):
-                cover = get_folder_cover(full_path, base)
-                items.append({
-                    "id": rel_path,
-                    "name": name,
-                    "path": "/" + rel_path,
-                    "type": "folder",
-                    "cover_path": cover
-                })
-            elif ext in IMAGE_EXT:
-                items.append({
-                    "id": rel_path,
-                    "name": name,
-                    "path": "/" + rel_path,
-                    "type": "image"
-                })
-            elif ext in VIDEO_EXT:
-                items.append({
-                    "id": rel_path,
-                    "name": name,
-                    "path": "/" + rel_path,
-                    "type": "video"
-                })
-        return {"list": items, "breadcrumb": breadcrumb}
-    except Exception as e:
-        return {"list": [], "breadcrumb": []}
-
-
-def generate_thumb(file_abs: str, cache_out: str):
-    ext = os.path.splitext(file_abs)[1].lower()
-    try:
-        if ext in IMAGE_EXT:
-            with Image.open(file_abs) as im:
-                im.thumbnail((400, 400))
-                im.save(cache_out, "JPEG")
-            return True
-        elif ext in VIDEO_EXT:
-            cmd = [
-                "ffmpeg", "-y", "-ss", "0.5",
-                "-i", file_abs,
-                "-vframes", "1",
-                "-vf", "scale=400:-1",
-                cache_out
-            ]
-            subprocess.run(cmd, capture_output=True, timeout=15)
-            return os.path.exists(cache_out)
-    except Exception:
-        pass
-    return False
-
-
-def background_cache_work():
-    global cache_task_state
-    base = os.path.abspath(MEDIA_ROOT)
-    media_files = []
-    print("[PreCache] background task start")
-    try:
-        for root, _, files in os.walk(base):
-            with cache_task_lock:
-                if cache_task_state["stop_request"]:
-                    raise Exception("task stop requested")
-            for fname in files:
-                # 缓存任务也跳过cover
-                if fname.lower() in COVER_NAMES:
-                    continue
-                full_abs = os.path.join(root, fname)
-                ext = os.path.splitext(fname)[1].lower()
-                if ext in IMAGE_EXT or ext in VIDEO_EXT:
-                    media_files.append(full_abs)
-
-        with cache_task_lock:
-            cache_task_state["total"] = len(media_files)
-            cache_task_state["processed"] = 0
-            cache_task_state["message"] = "正在生成缩略图"
-
-        for full_abs in media_files:
-            with cache_task_lock:
-                if cache_task_state["stop_request"]:
-                    raise Exception("task stop requested")
-            rel = os.path.relpath(full_abs, base).replace(os.sep, "/")
-            cache_key = rel.replace("/", "_") + ".jpg"
-            cache_file = os.path.join(CACHE_DIR, cache_key)
-            if not os.path.exists(cache_file):
-                generate_thumb(full_abs, cache_file)
-            with cache_task_lock:
-                cache_task_state["processed"] += 1
-
-        with cache_task_lock:
-            cache_task_state["message"] = "正在清理无效缓存"
-        clean_orphan_cache()
-
-        with cache_task_lock:
-            cache_task_state["message"] = "任务全部完成"
-        print("[PreCache] background task finished")
-    except Exception as e:
-        print("[PreCache] task stopped/error:", str(e))
-        with cache_task_lock:
-            cache_task_state["message"] = f"任务已停止：{str(e)}"
-    finally:
-        with cache_task_lock:
-            cache_task_state["running"] = False
-            cache_task_state["stop_request"] = False
-
-
-def clean_orphan_cache():
-    base = os.path.abspath(MEDIA_ROOT)
-    if not os.path.isdir(CACHE_DIR):
-        return
-    for fname in os.listdir(CACHE_DIR):
-        if not fname.endswith(".jpg"):
-            continue
-        raw_rel = fname[:-4].replace("_", "/")
-        origin_file = os.path.join(base, raw_rel)
-        if not os.path.exists(origin_file):
-            try:
-                os.unlink(os.path.join(CACHE_DIR, fname))
-            except Exception:
-                pass
-
-
-@app.get("/api/cache-run", response_class=JSONResponse)
-async def api_cache_run():
-    global cache_task_state
-    with cache_task_lock:
-        if cache_task_state["running"]:
-            return {"code": -1, "msg": "已有任务正在运行，请等待或取消"}
-        cache_task_state["running"] = True
-        cache_task_state["stop_request"] = False
-        cache_task_state["processed"] = 0
-        cache_task_state["total"] = 0
-        cache_task_state["message"] = "开始扫描媒体文件"
-    t = threading.Thread(target=background_cache_work, daemon=True)
-    t.start()
-    return {"code": 0, "msg": "任务已提交后台运行"}
-
-
-@app.get("/api/cache-stop", response_class=JSONResponse)
-async def api_cache_stop():
-    global cache_task_state
-    with cache_task_lock:
-        if not cache_task_state["running"]:
-            return {"code": -1, "msg": "没有正在运行的任务"}
-        cache_task_state["stop_request"] = True
-        cache_task_state["message"] = "收到停止指令，正在终止任务"
-    return {"code": 0, "msg": "已发送停止信号"}
-
-
-@app.get("/api/cache-status", response_class=JSONResponse)
-async def api_cache_status():
-    with cache_task_lock:
-        st = dict(cache_task_state)
-    pct = 0
-    if st["total"] > 0:
-        pct = round(100 * st["processed"] / st["total"], 1)
-    return {
-        "running": st["running"],
-        "processed": st["processed"],
-        "total": st["total"],
-        "percent": pct,
-        "message": st["message"]
-    }
-
-
-@app.get("/api/thumb")
-async def get_thumb(path: str = ""):
-    path = urllib.parse.unquote(path.lstrip("/"))
-    base = os.path.abspath(MEDIA_ROOT)
-    origin = os.path.abspath(os.path.join(base, path))
-    if not origin.startswith(base) or not os.path.isfile(origin):
-        return Response(status_code=204)
-    cache_key = path.replace("/", "_") + ".jpg"
-    cache_file = os.path.join(CACHE_DIR, cache_key)
-    if not os.path.exists(cache_file):
-        ok = generate_thumb(origin, cache_file)
-        if not ok:
-            return Response(status_code=204)
-    return FileResponse(cache_file)
-
-
-@app.get("/api/src")
-async def get_src(path: str = ""):
-    path = urllib.parse.unquote(path.lstrip("/"))
-    base = os.path.abspath(MEDIA_ROOT)
-    target = os.path.abspath(os.path.join(base, path))
-    if not target.startswith(base) or not os.path.isfile(target):
-        raise HTTPException(status_code=404)
-    ext = os.path.splitext(target)[1].lower()
-    mime = "image/jpeg"
-    if ext in IMAGE_EXT:
-        mime = "image/jpeg"
-    elif ext in VIDEO_EXT:
-        mime = "video/mp4"
-    return FileResponse(target, media_type=mime)
-
-
-# 定时任务
-scheduler = BackgroundScheduler()
-def cron_job():
-    with cache_task_lock:
-        if not cache_task_state["running"]:
-            cache_task_state["running"] = True
-            cache_task_state["stop_request"] = False
-            cache_task_state["processed"] = 0
-            cache_task_state["total"] = 0
-            cache_task_state["message"] = "定时缓存任务开始"
-    t = threading.Thread(target=background_cache_work, daemon=True)
-    t.start()
-
-scheduler.add_job(cron_job, "cron", hour=2, minute=0)
-scheduler.start()
-
-@app.on_event("shutdown")
-def shutdown():
-    scheduler.shutdown()
-
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)

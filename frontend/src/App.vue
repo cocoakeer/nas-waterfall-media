@@ -1,5 +1,24 @@
 <template>
-  <div class="app-container">
+  <!-- 登录弹窗 -->
+  <div v-if="!isLogin" class="login-mask">
+    <div class="login-box">
+      <h2>NAS媒体瀑布流 - 登录</h2>
+      <div class="form-item">
+        <label>用户名</label>
+        <input v-model="loginForm.username" type="text" @keyup.enter="doLogin"/>
+      </div>
+      <div class="form-item">
+        <label>密码</label>
+        <input v-model="loginForm.password" type="password" @keyup.enter="doLogin"/>
+      </div>
+      <div class="login-error" v-if="loginErr">{{loginErr}}</div>
+      <div class="login-btn-group">
+        <button @click="doLogin" class="btn primary">登录</button>
+      </div>
+    </div>
+  </div>
+
+  <div v-else class="app-container">
     <header class="header">
       <h1>NAS 媒体瀑布流</h1>
       <div class="header-actions">
@@ -11,6 +30,20 @@
         </button>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
         <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
+
+        <!-- 用户头像下拉菜单 -->
+        <div class="user-dropdown-wrap">
+          <div class="avatar-btn" @click="toggleUserDrop">
+            <span class="avatar-icon">👤</span>
+            <span class="avatar-name">{{userInfo.username}}</span>
+          </div>
+          <div v-if="showUserDrop" class="user-dropdown">
+            <div class="drop-item" @click="openChangePwdModal">修改密码</div>
+            <div v-if="userInfo.is_admin" class="drop-item" @click="openUserManageModal">用户管理</div>
+            <div class="drop-item drop-divider"></div>
+            <div class="drop-item" @click="doLogout">退出登录</div>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -70,7 +103,6 @@
     <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
       <div class="preview-box">
         <button class="close-btn" @click="closePreview">×</button>
-
         <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
         <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
 
@@ -120,7 +152,67 @@
       </div>
     </div>
 
-    <!-- 幻灯片全屏渲染层（根全屏，铺满整个显示器） -->
+    <!-- 修改本人密码弹窗 -->
+    <div v-if="changePwdModal" class="preview-mask" @click.self="changePwdModal=false">
+      <div class="setting-box">
+        <h3>修改登录密码</h3>
+        <div class="form-row">
+          <label>原密码</label>
+          <input v-model="pwdForm.old" type="password"/>
+        </div>
+        <div class="form-row">
+          <label>新密码</label>
+          <input v-model="pwdForm.new" type="password"/>
+        </div>
+        <div class="form-row">
+          <label>确认新密码</label>
+          <input v-model="pwdForm.confirm" type="password"/>
+        </div>
+        <div class="msg-tip">{{pwdMsg}}</div>
+        <div class="btn-group">
+          <button @click="submitChangePwd" class="btn primary">保存</button>
+          <button @click="changePwdModal=false" class="btn">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 管理员：用户管理弹窗 -->
+    <div v-if="userManageModal" class="preview-mask" @click.self="userManageModal=false">
+      <div class="user-manage-box">
+        <h3>用户管理（管理员）</h3>
+        <div class="user-list">
+          <div class="user-row" v-for="u in adminUserList" :key="u.username">
+            <div class="u-name">{{u.username}}</div>
+            <div class="u-dir">{{u.allow_dirs.join("; ")}}</div>
+            <div class="u-op">
+              <button @click="editUser(u)" class="btn">编辑</button>
+              <button v-if="u.username!=='admin'" @click="delUser(u.username)" class="btn btn-danger">删除</button>
+            </div>
+          </div>
+        </div>
+        <div class="divider"></div>
+        <div class="form-row">
+          <label>用户名</label>
+          <input v-model="editUserForm.username" :disabled="editUserForm.username==='admin'" />
+        </div>
+        <div class="form-row">
+          <label>密码(编辑留空不修改)</label>
+          <input v-model="editUserForm.password" type="password" placeholder="新增必填"/>
+        </div>
+        <div class="form-row">
+          <label>允许访问目录，分号分隔 例：/photos;/video</label>
+          <input v-model="editDirText" placeholder="/photos;/movie"/>
+        </div>
+        <div class="msg-tip">{{adminMsg}}</div>
+        <div class="btn-group">
+          <button @click="clearEditForm" class="btn">清空新增</button>
+          <button @click="submitSaveUser" class="btn primary">保存用户</button>
+          <button @click="userManageModal=false" class="btn">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 幻灯片全屏渲染层 -->
     <div v-if="slideShow" class="slide-root">
       <div class="slide-content">
         <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
@@ -138,6 +230,24 @@
 import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 
 const baseUrl = ''
+const isLogin = ref(false)
+const userInfo = ref({})
+const loginForm = ref({username:'', password:''})
+const loginErr = ref('')
+
+// 用户下拉菜单
+const showUserDrop = ref(false)
+// 修改密码弹窗
+const changePwdModal = ref(false)
+const pwdForm = ref({old:"",new:"",confirm:""})
+const pwdMsg = ref("")
+// 用户管理弹窗（管理员）
+const userManageModal = ref(false)
+const adminUserList = ref([])
+const adminMsg = ref("")
+const editUserForm = ref({username:"",password:""})
+const editDirText = ref("")
+
 const mediaList = ref([])
 const breadcrumbList = ref([])
 const waterfallRef = ref(null)
@@ -244,6 +354,7 @@ function onMediaImgFinish() {
 async function pollCacheStatus() {
   try {
     const res = await fetch(`${baseUrl}/api/cache-status`)
+    if (!res.ok) { checkAuthResp(res); return }
     const st = await res.json()
     cachePercent.value = st.percent
     if (!st.running) {
@@ -260,6 +371,7 @@ async function pollCacheStatus() {
 async function initCheckCacheTask() {
   try {
     const res = await fetch(`${baseUrl}/api/cache-status`)
+    if (!res.ok) { checkAuthResp(res); return }
     const st = await res.json()
     if (st.running) {
       cacheRunning.value = true
@@ -277,6 +389,7 @@ async function runCacheTask() {
   cachePercent.value = 0
   try {
     const res = await fetch(`${baseUrl}/api/cache-run`)
+    if (!res.ok) { checkAuthResp(res); return }
     const ret = await res.json()
     if (ret.code !== 0) {
       alert("❌" + ret.msg)
@@ -295,6 +408,7 @@ async function stopCacheTask() {
   if (!confirm("确认要终止缓存任务吗？")) return
   try {
     const res = await fetch(`${baseUrl}/api/cache-stop`)
+    if (!res.ok) { checkAuthResp(res); return }
     const ret = await res.json()
     if (ret.code !== 0) {
       alert("❌" + ret.msg)
@@ -320,10 +434,17 @@ function syncDirToUrl(dir) {
   window.history.pushState({ dir }, '', url.toString())
 }
 
+function checkAuthResp(r) {
+  if (r.status === 401) {
+    isLogin.value = false
+    userInfo.value = {}
+  }
+}
+
 async function loadMedia(dir = '', pushHistory = false) {
   try {
     const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
-    if (!res.ok) throw new Error()
+    if (!res.ok) { checkAuthResp(res); return }
     const data = await res.json()
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
@@ -377,7 +498,6 @@ function nextMedia() {
 }
 
 function handleKeydown(e) {
-  // 幻灯片键盘控制
   if (slideShow.value) {
     if (e.key === 'ArrowLeft') {
       e.preventDefault()
@@ -416,7 +536,6 @@ function saveSetting() {
   settingShow.value = false
 }
 
-// 从当前目录第一张开始
 function startSlideFromDir() {
   slideList.value = mediaList.value.filter(i => i.type === 'image')
   if (slideList.value.length === 0) return alert('当前目录没有图片，无法幻灯片')
@@ -426,7 +545,6 @@ function startSlideFromDir() {
   runSlide()
 }
 
-// 从此预览图片开始
 function startSlideFromCurrent() {
   slideList.value = previewMediaList.filter(i => i.type === 'image')
   if (slideList.value.length === 0) return alert('没有图片可以幻灯片')
@@ -438,7 +556,6 @@ function startSlideFromCurrent() {
   runSlide()
 }
 
-// ✅ 改为文档根全屏（整个显示器全屏）
 async function openRootFullscreen() {
   const docEl = document.documentElement
   try {
@@ -454,7 +571,6 @@ async function openRootFullscreen() {
   }
 }
 
-// 退出全屏 + 关闭幻灯片
 function exitSlide() {
   clearTimeout(slideTimer.value)
   slideShow.value = false
@@ -511,12 +627,184 @@ function onPopState(e) {
   loadMedia(dir, false)
 }
 
+// ========== 登录登出 ==========
+async function doLogin() {
+  loginErr.value = ''
+  try {
+    const res = await fetch(`${baseUrl}/api/login`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(loginForm.value)
+    })
+    const ret = await res.json()
+    if (!res.ok || ret.code !==0) {
+      loginErr.value = "账号或密码错误"
+      return
+    }
+    await checkLoginStatus()
+  } catch(err) {
+    loginErr.value = "网络异常"
+  }
+}
+
+async function doLogout() {
+  await fetch(`${baseUrl}/api/logout`, {method:"POST"})
+  isLogin.value = false
+  userInfo.value = {}
+  showUserDrop.value = false
+}
+
+async function checkLoginStatus() {
+  try {
+    const res = await fetch(`${baseUrl}/api/whoami`)
+    if (res.ok) {
+      const ret = await res.json()
+      isLogin.value = true
+      userInfo.value = ret
+      const urlDir = getDirFromUrl()
+      const lastDir = localStorage.getItem(STORAGE_KEY) ?? ''
+      const initDir = urlDir || lastDir || ''
+      loadMedia(initDir, !!urlDir)
+      initCheckCacheTask()
+    } else {
+      isLogin.value = false
+    }
+  } catch(e) {
+    isLogin.value = false
+  }
+}
+
+// ========= 用户头像下拉 =========
+function toggleUserDrop(){
+  showUserDrop.value = !showUserDrop.value
+}
+// 修改密码弹窗
+function openChangePwdModal(){
+  showUserDrop.value = false
+  changePwdModal.value = true
+  pwdForm.value = {old:"",new:"",confirm:""}
+  pwdMsg.value = ""
+}
+async function submitChangePwd(){
+  pwdMsg.value = ""
+  const f = pwdForm.value
+  if(!f.old || !f.new || !f.confirm){
+    pwdMsg.value = "全部字段不能为空"
+    return
+  }
+  if(f.new !== f.confirm){
+    pwdMsg.value = "两次新密码不一致"
+    return
+  }
+  try{
+    const res = await fetch("/api/user/change-password",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({old_password:f.old, new_password:f.new})
+    })
+    const json = await res.json()
+    if(res.ok && json.code ===0){
+      pwdMsg.value = "密码修改成功！"
+      setTimeout(()=>{changePwdModal.value=false},1200)
+    }else{
+      pwdMsg.value = json.detail || "修改失败"
+    }
+  }catch(e){
+    pwdMsg.value = "网络错误"
+  }
+}
+
+// 管理员用户管理
+async function openUserManageModal(){
+  showUserDrop.value = false
+  userManageModal.value = true
+  adminMsg.value = ""
+  clearEditForm()
+  await reloadAdminUserList()
+}
+async function reloadAdminUserList(){
+  try{
+    const res = await fetch("/api/admin/users")
+    const json = await res.json()
+    if(json.code===0){
+      adminUserList.value = json.list
+    }
+  }catch(e){
+    adminMsg.value = "获取用户列表失败"
+  }
+}
+function clearEditForm(){
+  editUserForm.value = {username:"",password:""}
+  editDirText.value = ""
+  adminMsg.value = ""
+}
+function editUser(u){
+  editUserForm.value.username = u.username
+  editUserForm.value.password = ""
+  editDirText.value = u.allow_dirs.join(";")
+  adminMsg.value = ""
+}
+async function submitSaveUser(){
+  adminMsg.value = ""
+  const username = editUserForm.value.username.trim()
+  if(!username){
+    adminMsg.value = "用户名不能为空"
+    return
+  }
+  const dirArr = editDirText.value.split(";").map(s=>s.trim()).filter(s=>!!s)
+  if(dirArr.length===0){
+    adminMsg.value = "至少填写一个允许访问目录"
+    return
+  }
+  const body = {
+    username:username,
+    password: editUserForm.value.password.trim() || null,
+    allow_dirs: dirArr
+  }
+  try{
+    const res = await fetch("/api/admin/user-save",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body)
+    })
+    const json = await res.json()
+    if(json.code===0){
+      adminMsg.value = json.msg || "保存成功"
+      clearEditForm()
+      await reloadAdminUserList()
+    }else{
+      adminMsg.value = json.detail || "保存失败"
+    }
+  }catch(e){
+    adminMsg.value = "网络异常"
+  }
+}
+async function delUser(username){
+  if(!confirm(`确认删除用户【${username}】？`)) return
+  try{
+    const res = await fetch(`/api/admin/user/${encodeURIComponent(username)}`,{method:"DELETE"})
+    const json = await res.json()
+    if(json.code===0){
+      await reloadAdminUserList()
+    }
+  }catch(e){}
+}
+
+// 点击外部关闭下拉
+function onClickOutsideDrop(e){
+  const el = document.querySelector(".user-dropdown-wrap")
+  if(el && !el.contains(e.target)){
+    showUserDrop.value = false
+  }
+}
+
 onMounted(() => {
+  checkLoginStatus()
   document.addEventListener('keydown', handleKeydown)
   window.addEventListener('resize', onWindowResize)
   window.addEventListener('popstate', onPopState)
+  document.addEventListener("click", onClickOutsideDrop)
 
-  // 监听浏览器原生退出全屏（ESC、F11），自动关闭幻灯片
   document.addEventListener('fullscreenchange', () => {
     if (!document.fullscreenElement && slideShow.value) {
       exitSlide()
@@ -527,19 +815,13 @@ onMounted(() => {
     debounceLayout()
   })
   if (waterfallRef.value) resizeObserver.observe(waterfallRef.value)
-
-  const urlDir = getDirFromUrl()
-  const lastDir = localStorage.getItem(STORAGE_KEY) ?? ''
-  const initDir = urlDir || lastDir || ''
-
-  loadMedia(initDir, !!urlDir)
-  initCheckCacheTask()
 })
 
 onUnmounted(() => {
   document.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('popstate', onPopState)
+  document.removeEventListener("click", onClickOutsideDrop)
   if (resizeObserver) resizeObserver.disconnect()
   clearTimeout(layoutDebounceTimer)
   if (statusPollTimer) clearInterval(statusPollTimer)
@@ -552,6 +834,94 @@ onUnmounted(() => {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+}
+
+.login-mask {
+  position: fixed;
+  inset:0;
+  background:#000;
+  z-index:99999;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+.login-box {
+  background:#1e1e1e;
+  padding:32px;
+  border-radius:12px;
+  width:340px;
+}
+.login-box h2 {
+  color:#fff;
+  margin-bottom:24px;
+  text-align:center;
+}
+.form-item {
+  margin-bottom:14px;
+}
+.form-item label {
+  display:block;
+  color:#ccc;
+  margin-bottom:6px;
+  font-size:14px;
+}
+.form-item input {
+  width:100%;
+  padding:10px;
+  border-radius:6px;
+  border:none;
+  background:#2d2d2d;
+  color:#fff;
+}
+.login-error {
+  color:#ff5555;
+  font-size:13px;
+  margin:8px 0;
+  text-align:center;
+}
+.login-btn-group {
+  margin-top:20px;
+}
+
+/* 用户头像下拉 */
+.user-dropdown-wrap {
+  position:relative;
+}
+.avatar-btn {
+  display:flex;
+  align-items:center;
+  gap:6px;
+  padding:6px 10px;
+  background:#2a2a2a;
+  border-radius:6px;
+  cursor:pointer;
+  color:#fff;
+}
+.avatar-icon {
+  font-size:18px;
+}
+.user-dropdown {
+  position:absolute;
+  top:calc(100% + 6px);
+  right:0;
+  min-width:160px;
+  background:#222;
+  border-radius:8px;
+  z-index:200;
+  overflow:hidden;
+}
+.drop-item {
+  padding:9px 14px;
+  color:#eee;
+  cursor:pointer;
+}
+.drop-item:hover {
+  background:#333;
+}
+.drop-divider {
+  height:1px;
+  background:#444;
+  padding:0;
 }
 
 .app-container {
@@ -578,6 +948,7 @@ onUnmounted(() => {
 .header-actions {
   display: flex;
   gap: 10px;
+  align-items:center;
 }
 
 .btn {
@@ -804,15 +1175,68 @@ onUnmounted(() => {
 .setting-box {
   background: #181818;
   border-radius: 12px;
-  padding: 24px;
-  width: 360px;
+  padding:24px;
+  width:380px;
+}
+.user-manage-box {
+  background:#181818;
+  border-radius:12px;
+  padding:24px;
+  width:620px;
+  max-height:85vh;
+  overflow-y:auto;
+}
+.user-list {
+  margin-bottom:16px;
+}
+.user-row {
+  display:flex;
+  gap:10px;
+  align-items:center;
+  padding:8px 0;
+  border-bottom:1px solid #333;
+}
+.u-name {
+  width:120px;
+}
+.u-dir {
+  flex:1;
+  font-size:13px;
+  color:#aaa;
+}
+.u-op {
+  display:flex;
+  gap:6px;
+}
+.divider {
+  height:1px;
+  background:#333;
+  margin:16px 0;
+}
+.msg-tip {
+  color:#ffdd77;
+  font-size:13px;
+  min-height:20px;
 }
 
 .form-row {
   margin: 14px 0;
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  flex-direction:column;
+  gap:6px;
+  align-items:flex-start;
+}
+.form-row label {
+  font-size:14px;
+  color:#ccc;
+}
+.form-row input {
+  width:100%;
+  padding:9px;
+  background:#2a2a2a;
+  border:none;
+  border-radius:6px;
+  color:#fff;
 }
 
 .btn-group {
@@ -822,7 +1246,6 @@ onUnmounted(() => {
   margin-top: 20px;
 }
 
-/* ========== 幻灯片根全屏样式 ========== */
 .slide-root {
   position: fixed;
   inset: 0;
