@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  media-waterfall:
+    build: .
+    container_name: nas-waterfall-media
+    ports:
+      - "8000:8000"
+    volumes:
+      - /Volumes/你的NAS共享目录:/media
+      - ./cache:/app/cache
+      - ./config:/app/config
+    restart: unless-stopped
