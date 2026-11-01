@@ -607,8 +607,9 @@ onUnmounted(() => {
 }
 
 .preview-box {
-  background: #181818;
-  border-radius: 12px;
+  /* 重点修改：去掉背景色，透明 */
+  background: transparent;
+  border-radius: 0;
   width: min(97vw, 1280px);
   height: min(94vh, 960px);
   max-width: 97vw;
@@ -626,7 +627,7 @@ onUnmounted(() => {
   width: 34px;
   height: 34px;
   border-radius: 50%;
-  background: #333;
+  background: rgba(40,40,40,0.75);
   color: #fff;
   border: none;
   font-size: 20px;
@@ -686,9 +687,10 @@ onUnmounted(() => {
 
 .preview-footer {
   flex-shrink: 0;
-  background: #181818;
+  /* 去掉原来的底板背景、上边框，直接透明 */
+  background: transparent;
   padding: 10px 16px 14px;
-  border-top: 1px solid #2a2a2a;
+  border-top: none;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -710,7 +712,7 @@ onUnmounted(() => {
 
 .img-action-bar button {
   padding: 6px 12px;
-  background: #2a2a2a;
+  background: rgba(42,42,42,0.75);
   color: #fff;
   border: 0;
   border-radius: 6px;
@@ -718,7 +720,7 @@ onUnmounted(() => {
 }
 
 .img-action-bar button:hover {
-  background: #3a3a3a;
+  background: rgba(58,58,58,0.9);
 }
 
 .setting-box {
