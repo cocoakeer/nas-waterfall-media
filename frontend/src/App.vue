@@ -5,11 +5,11 @@
       <h2>NAS媒体瀑布流 - 登录</h2>
       <div class="form-item">
         <label>用户名</label>
-        <input v-model="loginForm.username" type="text" @keyup.enter="doLogin"/>
+        <input v-model="loginForm.username" type="text" @keyup.enter="doLogin" />
       </div>
       <div class="form-item">
         <label>密码</label>
-        <input v-model="loginForm.password" type="password" @keyup.enter="doLogin"/>
+        <input v-model="loginForm.password" type="password" @keyup.enter="doLogin" />
       </div>
       <div class="login-error" v-if="loginErr">{{loginErr}}</div>
       <div class="login-btn-group">
@@ -17,7 +17,6 @@
       </div>
     </div>
   </div>
-
   <div v-else class="app-container">
     <header class="header">
       <h1>NAS 媒体瀑布流</h1>
@@ -30,7 +29,6 @@
         </button>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
         <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
-
         <!-- 用户头像下拉菜单 -->
         <div class="user-dropdown-wrap">
           <div class="avatar-btn" @click="toggleUserDrop">
@@ -46,7 +44,6 @@
         </div>
       </div>
     </header>
-
     <div class="breadcrumb">
       <span @click="changeDir('')" class="breadcrumb-item">根目录</span>
       <span v-for="(item, idx) in breadcrumbList" :key="idx">
@@ -54,7 +51,6 @@
         <span @click="changeDir(item.path)" class="breadcrumb-item">{{ item.name }}</span>
       </span>
     </div>
-
     <div ref="waterfallRef" class="waterfall-wrap">
       <div
         v-for="item in mediaList"
@@ -73,7 +69,7 @@
               @error="onMediaImgFinish"
             />
             <svg v-else width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
-              <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
+              <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" />
             </svg>
           </template>
           <img
@@ -98,14 +94,12 @@
         <div class="card-name">{{ item.name }}</div>
       </div>
     </div>
-
     <!-- 预览弹窗 -->
     <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
       <div class="preview-box">
         <button class="close-btn" @click="closePreview">×</button>
         <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
         <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
-
         <div class="preview-image-area">
           <img
             v-if="previewItem.type === 'image'"
@@ -119,7 +113,6 @@
             :src="getSrcUrl(previewItem.path)"
           ></video>
         </div>
-
         <div class="preview-footer">
           <div class="preview-name">{{ previewItem.name }} ({{ previewCurrentIndex + 1 }} / {{ previewMediaList.length }})</div>
           <div v-if="previewItem.type === 'image'" class="img-action-bar">
@@ -132,7 +125,6 @@
         </div>
       </div>
     </div>
-
     <!-- 幻灯片设置弹窗 -->
     <div v-if="settingShow" class="preview-mask" @click.self="settingShow=false">
       <div class="setting-box">
@@ -151,22 +143,21 @@
         </div>
       </div>
     </div>
-
     <!-- 修改本人密码弹窗 -->
     <div v-if="changePwdModal" class="preview-mask" @click.self="changePwdModal=false">
       <div class="setting-box">
         <h3>修改登录密码</h3>
         <div class="form-row">
           <label>原密码</label>
-          <input v-model="pwdForm.old" type="password"/>
+          <input v-model="pwdForm.old" type="password" />
         </div>
         <div class="form-row">
           <label>新密码</label>
-          <input v-model="pwdForm.new" type="password"/>
+          <input v-model="pwdForm.new" type="password" />
         </div>
         <div class="form-row">
           <label>确认新密码</label>
-          <input v-model="pwdForm.confirm" type="password"/>
+          <input v-model="pwdForm.confirm" type="password" />
         </div>
         <div class="msg-tip">{{pwdMsg}}</div>
         <div class="btn-group">
@@ -175,7 +166,6 @@
         </div>
       </div>
     </div>
-
     <!-- ========== 用户管理弹窗【新版：列表 + 表单分离】 ========== -->
     <div v-if="userManageModal" class="preview-mask" @click.self="closeUserManageModal">
       <div class="user-manage-box">
@@ -183,7 +173,6 @@
           <h3>用户管理（管理员）</h3>
           <button class="um-close-btn" @click="closeUserManageModal">×</button>
         </div>
-
         <!-- 列表视图 -->
         <div v-if="umView === 'list'" class="um-content-wrap">
           <div class="um-top-bar">
@@ -210,30 +199,29 @@
             </div>
           </div>
         </div>
-
         <!-- 新增/编辑表单视图 -->
         <div v-if="umView === 'form'" class="um-content-wrap">
           <div class="um-form-title">{{editUser ? "编辑用户":"新增用户"}}</div>
           <div class="um-form-item">
             <label>用户名</label>
             <div style="display:flex;gap:8px;">
-              <input v-model="umForm.username" :disabled="!!editUser"/>
+              <input v-model="umForm.username" :disabled="!!editUser" />
               <button v-if="editUser" class="btn btn-sm" @click="triggerRename">修改用户名</button>
             </div>
           </div>
           <div class="um-form-item">
             <label>密码（编辑留空不修改）</label>
-            <input v-model="umForm.password" type="password" placeholder="新增用户必填"/>
+            <input v-model="umForm.password" type="password" placeholder="新增用户必填" />
           </div>
           <div class="um-form-item">
             <label>是否管理员</label>
-            <input type="checkbox" v-model="umForm.is_admin"/>
+            <input type="checkbox" v-model="umForm.is_admin" />
           </div>
           <div class="um-form-item">
             <label>允许访问目录（多选）</label>
             <div class="multi-select-wrap">
               <div v-for="opt in dirOptions" class="check-item">
-                <input type="checkbox" :value="opt" v-model="umForm.allow_dirs" :id="'umdir_'+opt"/>
+                <input type="checkbox" :value="opt" v-model="umForm.allow_dirs" :id="'umdir_'+opt" />
                 <label :for="'umdir_'+opt">{{opt}}</label>
               </div>
             </div>
@@ -245,7 +233,6 @@
           </div>
         </div>
       </div>
-
       <!-- 删除确认弹窗 -->
       <div v-if="umDelConfirm.show" class="inner-confirm-mask">
         <div class="confirm-box">
@@ -257,7 +244,6 @@
         </div>
       </div>
     </div>
-
     <!-- 幻灯片全屏渲染层 -->
     <div v-if="slideShow" class="slide-root">
       <div class="slide-content">
@@ -310,6 +296,8 @@ const umDelConfirm = ref({
 const mediaList = ref([])
 const breadcrumbList = ref([])
 const waterfallRef = ref(null)
+// 加载状态：修复刷新/切换目录点击无响应
+const isLoading = ref(false)
 
 const previewShow = ref(false)
 const previewItem = ref(null)
@@ -381,6 +369,10 @@ function layoutWaterfall() {
   container.style.position = 'relative'
   cards.forEach(card => {
     card.style.position = 'absolute'
+    // 关键修复：图片未加载完成，强制最小占位高度，保证点击区域可用
+    if (!card.offsetHeight || card.offsetHeight < 120) {
+      card.style.height = '220px'
+    }
   })
 
   const colHeights = new Array(colCount).fill(0)
@@ -403,7 +395,7 @@ function debounceLayout() {
   clearTimeout(layoutDebounceTimer)
   layoutDebounceTimer = setTimeout(() => {
     layoutWaterfall()
-  }, 120)
+  }, 80)
 }
 
 function onMediaImgFinish() {
@@ -501,6 +493,11 @@ function checkAuthResp(r) {
 }
 
 async function loadMedia(dir = '', pushHistory = false) {
+  if(isLoading.value) return
+  isLoading.value = true
+  // 切换目录立刻清空旧DOM，避免旧元素干扰
+  mediaList.value = []
+  breadcrumbList.value = []
   try {
     const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
     if (!res.ok) { checkAuthResp(res); return }
@@ -512,12 +509,14 @@ async function loadMedia(dir = '', pushHistory = false) {
     if (pushHistory) {
       syncDirToUrl(dir)
     }
-
+    // DOM渲染完成，立刻执行布局，不等图片加载
     await nextTick()
-    debounceLayout()
+    layoutWaterfall()
   } catch (err) {
     console.error(err)
     mediaList.value = []
+  }finally{
+    isLoading.value = false
   }
 }
 
@@ -526,6 +525,7 @@ function changeDir(path) {
 }
 
 function handleCardClick(item) {
+  if(isLoading.value) return
   if (item.type === 'folder') {
     changeDir(item.path)
   } else {
