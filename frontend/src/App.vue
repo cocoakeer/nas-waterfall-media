@@ -3,9 +3,6 @@
     <header class="header">
       <h1>NAS 媒体瀑布流</h1>
       <div class="header-actions">
-        <button @click="toggleLayout" class="btn">
-          {{ layoutMode === 'waterfall' ? '平铺模式' : '瀑布流模式' }}
-        </button>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
         <button @click="startSlide" class="btn primary">开始幻灯片</button>
       </div>
@@ -19,37 +16,12 @@
       </span>
     </div>
 
-    <div v-if="layoutMode === 'waterfall'" class="waterfall">
+    <!-- 仅瀑布流布局 -->
+    <div class="waterfall">
       <div
         v-for="item in mediaList"
         :key="item.id"
         class="media-card"
-        @click="handleCardClick(item)"
-      >
-        <div class="card-thumb">
-          <!--文件夹-->
-          <template v-if="item.type === 'folder'">
-            <svg width="64" height="64" viewBox="0 0 24 24" fill="#999">
-              <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
-            </svg>
-          </template>
-          <!--图片-->
-          <img v-else-if="item.type === 'image'" :src="getThumbUrl(item.path)" alt="" />
-          <!--视频-->
-          <div v-else-if="item.type === 'video'" class="video-wrap">
-            <img :src="getThumbUrl(item.path)" alt="" />
-            <div class="play-icon">▶</div>
-          </div>
-        </div>
-        <div class="card-name">{{ item.name }}</div>
-      </div>
-    </div>
-
-    <div v-else class="grid-layout">
-      <div
-        v-for="item in mediaList"
-        :key="item.id"
-        class="grid-card"
         @click="handleCardClick(item)"
       >
         <div class="card-thumb">
@@ -113,15 +85,16 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 
 const baseUrl = ''
 const mediaList = ref([])
 const breadcrumbList = ref([])
-const layoutMode = ref('waterfall')
 
 const previewShow = ref(false)
 const previewItem = ref(null)
+let previewMediaList = [] // 当前目录媒体（图片+视频，排除文件夹）
+let previewCurrentIndex = 0
 
 const settingShow = ref(false)
 const slideDelay = ref(3)
@@ -156,17 +129,50 @@ function changeDir(path) {
   loadMedia(path)
 }
 
-function toggleLayout() {
-  layoutMode.value = layoutMode.value === 'waterfall' ? 'grid' : 'waterfall'
-}
-
 // 区分文件夹 / 媒体文件点击
 function handleCardClick(item) {
   if (item.type === 'folder') {
     changeDir(item.path)
   } else {
+    // 打开预览，生成当前目录媒体数组（排除folder）
+    previewMediaList = mediaList.value.filter(x => x.type !== 'folder')
+    previewCurrentIndex = previewMediaList.findIndex(x => x.id === item.id)
     previewItem.value = item
     previewShow.value = true
+  }
+}
+
+// 上一张
+function prevMedia() {
+  if (previewCurrentIndex > 0) {
+    previewCurrentIndex -= 1
+    previewItem.value = previewMediaList[previewCurrentIndex]
+  }
+}
+// 下一张
+function nextMedia() {
+  if (previewCurrentIndex < previewMediaList.length - 1) {
+    previewCurrentIndex += 1
+    previewItem.value = previewMediaList[previewCurrentIndex]
+  }
+}
+
+// 全局键盘监听
+function handleKeydown(e) {
+  if (!previewShow.value) return
+  switch(e.key) {
+    case 'ArrowLeft':
+      e.preventDefault()
+      prevMedia()
+      break
+    case 'ArrowRight':
+      e.preventDefault()
+      nextMedia()
+      break
+    case 'Escape':
+      e.preventDefault()
+      closePreview()
+      break
   }
 }
 
@@ -199,7 +205,16 @@ function runSlide() {
 function closePreview() {
   previewShow.value = false
   previewItem.value = null
+  previewMediaList = []
+  previewCurrentIndex = 0
 }
+
+onMounted(()=>{
+  document.addEventListener('keydown', handleKeydown)
+})
+onUnmounted(()=>{
+  document.removeEventListener('keydown', handleKeydown)
+})
 
 loadMedia()
 </script>
@@ -255,31 +270,43 @@ loadMedia()
   margin: 0 6px;
 }
 
+/* 响应式瀑布流column‑count */
 .waterfall {
-  column-count: 4;
   column-gap: 14px;
+  column-count: 4;
 }
-.grid-layout {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap:14px;
+@media (max-width:1200px) {
+  .waterfall {
+    column-count:3;
+  }
 }
-.media-card, .grid-card {
+@media (max-width:768px) {
+  .waterfall {
+    column-count:2;
+  }
+}
+@media (max-width:480px) {
+  .waterfall {
+    column-count:1;
+  }
+}
+
+.media-card {
   break-inside: avoid;
   background: #1e1e1e;
   border-radius: 10px;
   overflow: hidden;
   margin-bottom:14px;
   cursor: pointer;
-  transition: 0.2s ease;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
-.media-card:hover, .grid-card:hover {
+.media-card:hover {
   transform: translateY(-3px);
-  box-shadow: 0 8px 20px #0005;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.32);
 }
 .card-thumb {
   width:100%;
-  height: 180px;
+  min-height: 140px;
   overflow: hidden;
   background:#222;
   position:relative;
@@ -289,8 +316,8 @@ loadMedia()
 }
 .card-thumb img {
   width:100%;
-  height:100%;
-  object-fit:cover;
+  height:auto;
+  display:block;
 }
 .play-icon {
   position:absolute;
@@ -305,9 +332,10 @@ loadMedia()
   align-items:center;
   justify-content:center;
   font-size:18px;
+  color:#fff;
 }
 .card-name {
-  padding:8px 10px;
+  padding:10px 12px;
   font-size:13px;
   white-space: nowrap;
   overflow: hidden;
