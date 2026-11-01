@@ -16,7 +16,6 @@
       </span>
     </div>
 
-    <!-- 瀑布流容器 -->
     <div ref="waterfallRef" class="waterfall-wrap">
       <div
         v-for="item in mediaList"
@@ -26,14 +25,34 @@
       >
         <div class="card-thumb">
           <template v-if="item.type === 'folder'">
-            <img v-if="item.cover_path" :src="getThumbUrl(item.cover_path)" alt="" />
+            <img
+              v-if="item.cover_path"
+              :src="getThumbUrl(item.cover_path)"
+              alt=""
+              loading="lazy"
+              @load="onMediaImgFinish"
+              @error="onMediaImgFinish"
+            />
             <svg v-else width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
               <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
             </svg>
           </template>
-          <img v-else-if="item.type === 'image'" :src="getThumbUrl(item.path)" alt="" />
+          <img
+            v-else-if="item.type === 'image'"
+            :src="getThumbUrl(item.path)"
+            alt=""
+            loading="lazy"
+            @load="onMediaImgFinish"
+            @error="onMediaImgFinish"
+          />
           <div v-else-if="item.type === 'video'" class="video-wrap">
-            <img :src="getThumbUrl(item.path)" alt="" />
+            <img
+              :src="getThumbUrl(item.path)"
+              alt=""
+              loading="lazy"
+              @load="onMediaImgFinish"
+              @error="onMediaImgFinish"
+            />
             <div class="play-icon">▶</div>
           </div>
         </div>
@@ -86,7 +105,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 
 const baseUrl = ''
 const mediaList = ref([])
@@ -108,6 +127,7 @@ const slideList = ref([])
 const currentSlide = ref({})
 
 let resizeObserver = null
+let layoutDebounceTimer = null
 
 const getThumbUrl = (path) => {
   return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
@@ -116,7 +136,6 @@ const getSrcUrl = (path) => {
   return `${baseUrl}/api/src?path=${encodeURIComponent(path)}`
 }
 
-// 获取当前屏幕列数
 function getColumnCount() {
   const w = window.innerWidth
   if(w <= 480) return 1
@@ -125,7 +144,6 @@ function getColumnCount() {
   return 4
 }
 
-// JS瀑布流重排：按顺序放入高度最小的列，实现横向顺序+参差高度
 function layoutWaterfall(){
   if(!waterfallRef.value) return
   const container = waterfallRef.value
@@ -133,18 +151,15 @@ function layoutWaterfall(){
   const colCount = getColumnCount()
   const gap = 14
 
-  // 重置样式
   container.style.position = 'relative'
   cards.forEach(card=>{
     card.style.position = 'absolute'
   })
 
-  // 记录每列高度
   const colHeights = new Array(colCount).fill(0)
   const cardWidth = (container.clientWidth - gap*(colCount-1)) / colCount
 
   for(const card of cards){
-    // 找到当前高度最小的列
     let minCol = 0
     for(let i=0;i<colCount;i++){
       if(colHeights[i] < colHeights[minCol]) minCol = i
@@ -152,11 +167,21 @@ function layoutWaterfall(){
     card.style.width = cardWidth + 'px'
     card.style.left = minCol * (cardWidth + gap) + 'px'
     card.style.top = colHeights[minCol] + 'px'
-    // 更新列高度
     colHeights[minCol] += card.offsetHeight + gap
   }
-  // 设置容器总高度
   container.style.height = Math.max(...colHeights) + 'px'
+}
+
+function debounceLayout() {
+  clearTimeout(layoutDebounceTimer)
+  layoutDebounceTimer = setTimeout(()=>{
+    layoutWaterfall()
+  }, 100)
+}
+
+// 图片load/error都会触发，图片失败也不会卡住布局
+function onMediaImgFinish() {
+  debounceLayout()
 }
 
 async function loadMedia(dir = '') {
@@ -167,7 +192,8 @@ async function loadMedia(dir = '') {
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
     await nextTick()
-    layoutWaterfall()
+    // DOM渲染完立刻执行一次布局（此时图片还没加载，卡片高度预估；图片加载后会自动重排）
+    debounceLayout()
   } catch (err) {
     console.error(err)
     mediaList.value = []
@@ -254,15 +280,14 @@ function closePreview() {
 }
 
 function onWindowResize(){
-  layoutWaterfall()
+  debounceLayout()
 }
 
 onMounted(()=>{
   document.addEventListener('keydown', handleKeydown)
   window.addEventListener('resize', onWindowResize)
-  // 图片加载完成后重新布局，防止高度计算错误
   resizeObserver = new ResizeObserver(()=>{
-    layoutWaterfall()
+    debounceLayout()
   })
   if(waterfallRef.value) resizeObserver.observe(waterfallRef.value)
 })
@@ -271,6 +296,7 @@ onUnmounted(()=>{
   document.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', onWindowResize)
   if(resizeObserver) resizeObserver.disconnect()
+  clearTimeout(layoutDebounceTimer)
 })
 
 loadMedia()
