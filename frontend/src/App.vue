@@ -24,12 +24,20 @@
         v-for="item in mediaList"
         :key="item.id"
         class="media-card"
-        @click="openPreview(item)"
+        @click="handleCardClick(item)"
       >
         <div class="card-thumb">
-          <img v-if="item.type === 'image'" :src="item.thumb" alt="" />
-          <div v-if="item.type === 'video'" class="video-wrap">
-            <img :src="item.thumb" alt="" />
+          <!--文件夹-->
+          <template v-if="item.type === 'folder'">
+            <svg width="64" height="64" viewBox="0 0 24 24" fill="#999">
+              <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
+            </svg>
+          </template>
+          <!--图片-->
+          <img v-else-if="item.type === 'image'" :src="getThumbUrl(item.path)" alt="" />
+          <!--视频-->
+          <div v-else-if="item.type === 'video'" class="video-wrap">
+            <img :src="getThumbUrl(item.path)" alt="" />
             <div class="play-icon">▶</div>
           </div>
         </div>
@@ -42,12 +50,17 @@
         v-for="item in mediaList"
         :key="item.id"
         class="grid-card"
-        @click="openPreview(item)"
+        @click="handleCardClick(item)"
       >
         <div class="card-thumb">
-          <img v-if="item.type === 'image'" :src="item.thumb" alt="" />
-          <div v-if="item.type === 'video'" class="video-wrap">
-            <img :src="item.thumb" alt="" />
+          <template v-if="item.type === 'folder'">
+            <svg width="64" height="64" viewBox="0 0 24 24" fill="#999">
+              <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
+            </svg>
+          </template>
+          <img v-else-if="item.type === 'image'" :src="getThumbUrl(item.path)" alt="" />
+          <div v-else-if="item.type === 'video'" class="video-wrap">
+            <img :src="getThumbUrl(item.path)" alt="" />
             <div class="play-icon">▶</div>
           </div>
         </div>
@@ -60,10 +73,10 @@
       <div class="preview-box">
         <button class="close-btn" @click="closePreview">×</button>
         <div v-if="previewItem.type === 'image'" class="preview-media">
-          <img :src="previewItem.src" alt="" />
+          <img :src="getSrcUrl(previewItem.path)" alt="" />
         </div>
         <div v-else class="preview-media">
-          <video controls :src="previewItem.src"></video>
+          <video controls :src="getSrcUrl(previewItem.path)"></video>
         </div>
         <div class="preview-name">{{ previewItem.name }}</div>
       </div>
@@ -91,8 +104,8 @@
     <!-- 幻灯片全屏预览 -->
     <div v-if="slideShow" class="slide-mask" @click="slideShow=false">
       <div class="slide-content">
-        <img v-if="currentSlide.type==='image'" :src="currentSlide.src" alt="" />
-        <video v-else controls :src="currentSlide.src"></video>
+        <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
+        <video v-else controls :src="getSrcUrl(currentSlide.path)"></video>
         <div class="slide-name">{{ currentSlide.name }}</div>
       </div>
     </div>
@@ -100,19 +113,16 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch } from 'vue'
+import { ref } from 'vue'
 
 const baseUrl = ''
 const mediaList = ref([])
-const currentDir = ref('')
 const breadcrumbList = ref([])
 const layoutMode = ref('waterfall')
 
-// 预览
 const previewShow = ref(false)
 const previewItem = ref(null)
 
-// 幻灯片
 const settingShow = ref(false)
 const slideDelay = ref(3)
 const slideLoop = ref(true)
@@ -122,36 +132,44 @@ const slideTimer = ref(null)
 const slideList = ref([])
 const currentSlide = ref({})
 
-// 加载目录媒体列表
-async function loadMedia(dir = '') {
-  const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
-  const data = await res.json()
-  mediaList.value = data.list || []
-  currentDir.value = dir
-  breadcrumbList.value = data.breadcrumb || []
+const getThumbUrl = (path) => {
+  return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
+}
+const getSrcUrl = (path) => {
+  return `${baseUrl}/api/src?path=${encodeURIComponent(path)}`
 }
 
-// 切换目录
+async function loadMedia(dir = '') {
+  try {
+    const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
+    if (!res.ok) throw new Error()
+    const data = await res.json()
+    mediaList.value = data.list || []
+    breadcrumbList.value = data.breadcrumb || []
+  } catch (err) {
+    console.error(err)
+    mediaList.value = []
+  }
+}
+
 function changeDir(path) {
   loadMedia(path)
 }
 
-// 切换布局
 function toggleLayout() {
   layoutMode.value = layoutMode.value === 'waterfall' ? 'grid' : 'waterfall'
 }
 
-// 【重点修复】打开预览，path 和缩略图保持一致，带 /media/ 前缀
-function openPreview(item) {
-  previewItem.value = {
-    ...item,
-    // 这里和 thumb 的 path 完全对齐，后端 /api/thumb 是 /media/xxx，src 也用一样的
-    src: `${baseUrl}/api/src?path=${encodeURIComponent(item.path)}`
+// 区分文件夹 / 媒体文件点击
+function handleCardClick(item) {
+  if (item.type === 'folder') {
+    changeDir(item.path)
+  } else {
+    previewItem.value = item
+    previewShow.value = true
   }
-  previewShow.value = true
 }
 
-// 幻灯片
 function openSlideSetting() {
   settingShow.value = true
 }
@@ -168,7 +186,6 @@ function startSlide() {
 function runSlide() {
   clearTimeout(slideTimer.value)
   currentSlide.value = slideList.value[slideIndex.value]
-  currentSlide.value.src = `${baseUrl}/api/src?path=${encodeURIComponent(currentSlide.value.path)}`
   slideTimer.value = setTimeout(() => {
     slideIndex.value++
     if (slideIndex.value >= slideList.value.length) {
@@ -266,6 +283,9 @@ loadMedia()
   overflow: hidden;
   background:#222;
   position:relative;
+  display:flex;
+  align-items:center;
+  justify-content:center;
 }
 .card-thumb img {
   width:100%;
