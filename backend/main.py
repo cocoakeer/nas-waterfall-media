@@ -50,17 +50,30 @@ async def index():
 
 
 def get_folder_cover(folder_abs: str, base_abs: str):
+    """优先找cover文件；没有cover取目录内第一张图片"""
     cover_candidate = None
+    first_img = None
     try:
         for name in os.listdir(folder_abs):
             full = os.path.join(folder_abs, name)
-            if os.path.isfile(full) and name.lower() in COVER_NAMES:
+            if not os.path.isfile(full):
+                continue
+            lower_name = name.lower()
+            # 优先匹配cover
+            if lower_name in COVER_NAMES:
                 rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
                 cover_candidate = "/" + rel
                 break
+            # 记录第一张图片备用
+            ext = os.path.splitext(lower_name)[1]
+            if ext in IMAGE_EXT and first_img is None:
+                rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
+                first_img = "/" + rel
+        # 有cover就用cover，没有就第一张图
+        return cover_candidate if cover_candidate is not None else first_img
     except Exception:
         pass
-    return cover_candidate
+    return None
 
 
 @app.get("/api/list")
@@ -86,6 +99,9 @@ async def list_dir(dir: str = ""):
         items = []
         entries = sorted(os.listdir(target))
         for name in entries:
+            # 【重点】过滤cover文件，不在列表展示
+            if name.lower() in COVER_NAMES:
+                continue
             full_path = os.path.join(target, name)
             rel_path = os.path.relpath(full_path, base).replace(os.sep, "/")
             ext = os.path.splitext(name)[1].lower()
@@ -151,6 +167,9 @@ def background_cache_work():
                 if cache_task_state["stop_request"]:
                     raise Exception("task stop requested")
             for fname in files:
+                # 缓存任务也跳过cover
+                if fname.lower() in COVER_NAMES:
+                    continue
                 full_abs = os.path.join(root, fname)
                 ext = os.path.splitext(fname)[1].lower()
                 if ext in IMAGE_EXT or ext in VIDEO_EXT:

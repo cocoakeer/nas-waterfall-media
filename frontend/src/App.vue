@@ -155,6 +155,7 @@ function getColumnCount() {
   return 4
 }
 
+// ✅ 修复：标准横向多列瀑布流
 function layoutWaterfall(){
   if(!waterfallRef.value) return
   const container = waterfallRef.value
@@ -171,6 +172,7 @@ function layoutWaterfall(){
   const cardWidth = (container.clientWidth - gap*(colCount-1)) / colCount
 
   for(const card of cards){
+    // 找到当前高度最小的列
     let minCol = 0
     for(let i=0;i<colCount;i++){
       if(colHeights[i] < colHeights[minCol]) minCol = i
@@ -178,6 +180,7 @@ function layoutWaterfall(){
     card.style.width = cardWidth + 'px'
     card.style.left = minCol * (cardWidth + gap) + 'px'
     card.style.top = colHeights[minCol] + 'px'
+    // 更新这一列高度
     colHeights[minCol] += card.offsetHeight + gap
   }
   container.style.height = Math.max(...colHeights) + 'px'
@@ -187,7 +190,7 @@ function debounceLayout() {
   clearTimeout(layoutDebounceTimer)
   layoutDebounceTimer = setTimeout(()=>{
     layoutWaterfall()
-  }, 100)
+  }, 120)
 }
 
 function onMediaImgFinish() {
@@ -262,6 +265,10 @@ async function stopCacheTask() {
   }
 }
 
+// ========== 目录记忆相关 ==========
+const STORAGE_KEY = "waterfall_last_dir"
+
+// 加载目录，并且保存路径到localStorage
 async function loadMedia(dir = '') {
   try {
     const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
@@ -269,6 +276,8 @@ async function loadMedia(dir = '') {
     const data = await res.json()
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
+    // 保存当前路径到本地存储
+    localStorage.setItem(STORAGE_KEY, dir)
     await nextTick()
     debounceLayout()
   } catch (err) {
@@ -367,7 +376,11 @@ onMounted(()=>{
     debounceLayout()
   })
   if(waterfallRef.value) resizeObserver.observe(waterfallRef.value)
-  loadMedia()
+
+  // 读取上次保存的目录，没有就默认根目录
+  const lastDir = localStorage.getItem(STORAGE_KEY) ?? ""
+  loadMedia(lastDir)
+
   initCheckCacheTask()
 })
 
@@ -442,6 +455,7 @@ onUnmounted(()=>{
 .waterfall-wrap {
   width: 100%;
   min-height: 200px;
+  position: relative;
 }
 .media-card {
   background: #1e1e1e;
