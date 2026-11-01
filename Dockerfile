@@ -16,9 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制后端依赖 & 代码
-COPY backend/requirements.txt ./
+# ✅ 修改点：从仓库根目录复制requirements.txt
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制后端业务代码(main.py等)
 COPY backend ./backend
 
 # 复制前端构建产物
