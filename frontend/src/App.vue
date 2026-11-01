@@ -3,6 +3,9 @@
     <header class="header">
       <h1>NAS 媒体瀑布流</h1>
       <div class="header-actions">
+        <button @click="runCacheTask" class="btn" :disabled="cacheRunning">
+          {{ cacheRunning ? "处理中…" : "预生成缓存" }}
+        </button>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
         <button @click="startSlide" class="btn primary">开始幻灯片</button>
       </div>
@@ -129,6 +132,9 @@ const currentSlide = ref({})
 let resizeObserver = null
 let layoutDebounceTimer = null
 
+// 缓存任务按钮状态
+const cacheRunning = ref(false)
+
 const getThumbUrl = (path) => {
   return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
 }
@@ -179,9 +185,28 @@ function debounceLayout() {
   }, 100)
 }
 
-// 图片load/error都会触发，图片失败也不会卡住布局
 function onMediaImgFinish() {
   debounceLayout()
+}
+
+// 调用后端预缓存接口
+async function runCacheTask(){
+  if(cacheRunning.value) return
+  cacheRunning.value = true
+  try {
+    const res = await fetch(`${baseUrl}/api/cache-run`)
+    const ret = await res.json()
+    if(ret.code === 0){
+      alert("✅预缓存任务执行完成！\n已经预生成缩略图并清理无效缓存。")
+    }else{
+      alert("❌任务异常：" + ret.msg + " " + ret.error)
+    }
+  }catch(err){
+    console.error(err)
+    alert("❌请求失败，后端接口调用出错！")
+  }finally{
+    cacheRunning.value = false
+  }
 }
 
 async function loadMedia(dir = '') {
@@ -192,7 +217,6 @@ async function loadMedia(dir = '') {
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
     await nextTick()
-    // DOM渲染完立刻执行一次布局（此时图片还没加载，卡片高度预估；图片加载后会自动重排）
     debounceLayout()
   } catch (err) {
     console.error(err)
@@ -337,6 +361,10 @@ loadMedia()
   background: #2a2a2a;
   color: #fff;
   cursor: pointer;
+}
+.btn:disabled {
+  opacity:0.65;
+  cursor:not-allowed;
 }
 .btn.primary {
   background: #2563eb;
