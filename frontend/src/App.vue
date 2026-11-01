@@ -71,7 +71,6 @@
       <div class="preview-box">
         <button class="close-btn" @click="closePreview">×</button>
 
-        <!-- 左右翻页箭头 -->
         <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
         <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
 
@@ -96,7 +95,6 @@
             <button @click="rotateLeft">↺ 左旋90°</button>
             <button @click="rotateRight">↻ 右旋90°</button>
             <button @click="resetRotate">重置旋转</button>
-            <!-- 新增：从当前图片开始幻灯片 -->
             <button @click="startSlideFromCurrent">从此处开始幻灯片</button>
           </div>
         </div>
@@ -122,13 +120,15 @@
       </div>
     </div>
 
-    <!-- 幻灯片全屏预览 -->
-    <div v-if="slideShow" ref="slideRootRef" class="slide-mask">
+    <!-- 幻灯片全屏渲染层（根全屏，铺满整个显示器） -->
+    <div v-if="slideShow" class="slide-root">
       <div class="slide-content">
         <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
         <video v-else controls :src="getSrcUrl(currentSlide.path)"></video>
         <div class="slide-name">{{ currentSlide.name }}</div>
         <button class="slide-exit-btn" @click="exitSlide">退出全屏</button>
+        <button class="slide-prev-btn" @click="slidePrev">‹</button>
+        <button class="slide-next-btn" @click="slideNext">›</button>
       </div>
     </div>
   </div>
@@ -141,7 +141,6 @@ const baseUrl = ''
 const mediaList = ref([])
 const breadcrumbList = ref([])
 const waterfallRef = ref(null)
-const slideRootRef = ref(null)
 
 const previewShow = ref(false)
 const previewItem = ref(null)
@@ -378,6 +377,20 @@ function nextMedia() {
 }
 
 function handleKeydown(e) {
+  // 幻灯片键盘控制
+  if (slideShow.value) {
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault()
+      slidePrev()
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault()
+      slideNext()
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      exitSlide()
+    }
+    return
+  }
   if (!previewShow.value) return
   switch (e.key) {
     case 'ArrowLeft':
@@ -408,38 +421,36 @@ function startSlideFromDir() {
   slideList.value = mediaList.value.filter(i => i.type === 'image')
   if (slideList.value.length === 0) return alert('当前目录没有图片，无法幻灯片')
   slideIndex.value = 0
-  openFullscreen()
+  openRootFullscreen()
   slideShow.value = true
   runSlide()
 }
 
-// 【新增】从当前预览图片开始播放
+// 从此预览图片开始
 function startSlideFromCurrent() {
   slideList.value = previewMediaList.filter(i => i.type === 'image')
   if (slideList.value.length === 0) return alert('没有图片可以幻灯片')
-  // 找到当前图片在图片列表里的下标
   const idx = slideList.value.findIndex(x => x.path === previewItem.value.path)
   slideIndex.value = Math.max(idx, 0)
   closePreview()
-  openFullscreen()
+  openRootFullscreen()
   slideShow.value = true
   runSlide()
 }
 
-// 开启浏览器全屏
-async function openFullscreen() {
-  const el = slideRootRef.value
-  if (!el) return
+// ✅ 改为文档根全屏（整个显示器全屏）
+async function openRootFullscreen() {
+  const docEl = document.documentElement
   try {
-    if (el.requestFullscreen) {
-      await el.requestFullscreen()
-    } else if (el.webkitRequestFullscreen) {
-      await el.webkitRequestFullscreen()
-    } else if (el.msRequestFullscreen) {
-      await el.msRequestFullscreen()
+    if (docEl.requestFullscreen) {
+      await docEl.requestFullscreen()
+    } else if (docEl.webkitRequestFullscreen) {
+      await docEl.webkitRequestFullscreen()
+    } else if (docEl.msRequestFullscreen) {
+      await docEl.msRequestFullscreen()
     }
   } catch (e) {
-    console.warn("无法进入全屏，浏览器权限限制", e)
+    console.warn("无法进入全屏，浏览器策略限制", e)
   }
 }
 
@@ -460,16 +471,28 @@ function runSlide() {
   clearTimeout(slideTimer.value)
   currentSlide.value = slideList.value[slideIndex.value]
   slideTimer.value = setTimeout(() => {
-    slideIndex.value++
-    if (slideIndex.value >= slideList.value.length) {
-      if (slideLoop.value) slideIndex.value = 0
-      else {
-        exitSlide()
-        return
-      }
-    }
-    runSlide()
+    slideNext()
   }, slideDelay.value * 1000)
+}
+
+function slideNext() {
+  slideIndex.value++
+  if (slideIndex.value >= slideList.value.length) {
+    if (slideLoop.value) slideIndex.value = 0
+    else {
+      exitSlide()
+      return
+    }
+  }
+  runSlide()
+}
+function slidePrev() {
+  slideIndex.value--
+  if (slideIndex.value < 0) {
+    if (slideLoop.value) slideIndex.value = slideList.value.length - 1
+    else slideIndex.value = 0
+  }
+  runSlide()
 }
 
 function closePreview() {
@@ -493,7 +516,7 @@ onMounted(() => {
   window.addEventListener('resize', onWindowResize)
   window.addEventListener('popstate', onPopState)
 
-  // 监听ESC退出全屏
+  // 监听浏览器原生退出全屏（ESC、F11），自动关闭幻灯片
   document.addEventListener('fullscreenchange', () => {
     if (!document.fullscreenElement && slideShow.value) {
       exitSlide()
@@ -799,16 +822,16 @@ onUnmounted(() => {
   margin-top: 20px;
 }
 
-.slide-mask {
+/* ========== 幻灯片根全屏样式 ========== */
+.slide-root {
   position: fixed;
   inset: 0;
   background: #000;
-  z-index: 100;
+  z-index: 9999;
   display: flex;
   align-items: center;
   justify-content: center;
 }
-
 .slide-content {
   position: relative;
   width: 100%;
@@ -817,13 +840,12 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
 }
-
 .slide-content img,
 .slide-content video {
   max-width: 98vw;
   max-height: 98vh;
+  object-fit: contain;
 }
-
 .slide-name {
   position: absolute;
   bottom: 60px;
@@ -833,7 +855,6 @@ onUnmounted(() => {
   color: #fff;
   font-size: 14px;
 }
-
 .slide-exit-btn {
   position: absolute;
   top: 16px;
@@ -848,4 +869,20 @@ onUnmounted(() => {
 .slide-exit-btn:hover {
   background: rgba(80,80,80,0.9);
 }
+.slide-prev-btn,
+.slide-next-btn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background: rgba(40,40,40,0.7);
+  color: #fff;
+  border: none;
+  font-size: 28px;
+  cursor: pointer;
+}
+.slide-prev-btn { left: 20px; }
+.slide-next-btn { right: 20px; }
 </style>
