@@ -15,11 +15,9 @@ from PIL import Image
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
 CONFIG_DIR = Path(os.getenv("CONFIG_PATH", "/app/config"))
 CACHE_DIR = Path(os.getenv("CACHE_PATH", "/app/cache"))
-
 # 创建目录并设置权限，打印路径用于排错
 CONFIG_DIR.mkdir(exist_ok=True, mode=0o775)
 CACHE_DIR.mkdir(exist_ok=True, mode=0o775)
-
 USER_CONFIG_PATH = CONFIG_DIR / "users.json"
 print(f"[CONFIG] 用户配置文件路径: {USER_CONFIG_PATH}")
 
@@ -265,14 +263,14 @@ async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(requir
     save_users(users)
     return {"code":0,"msg":"保存成功"}
 
-## 管理员删除用户
+## 管理员删除用户【修复：global放到函数第一行】
 @app.delete("/api/admin/user/{username}")
 async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin)):
+    global users
     reload_users()
     target_user = next((u for u in users if u.username == username), None)
     if not target_user:
         raise HTTPException(404, "用户不存在")
-    global users
     users = [u for u in users if u.username != username]
     # 删除之后校验至少还有一个管理员
     check_at_least_one_admin(users)
