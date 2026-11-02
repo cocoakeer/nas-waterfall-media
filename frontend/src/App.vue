@@ -26,12 +26,15 @@
     <header class="header">
       <h1>NAS 媒体瀑布流</h1>
       <div class="header-actions">
-        <button @click="runCacheTask" class="btn" :disabled="cacheRunning">
-          {{ cacheRunning ? `处理中 ${cachePercent}%` : "预生成缓存" }}
-        </button>
-        <button v-if="cacheRunning" @click="stopCacheTask" class="btn btn-danger">
-          取消任务
-        </button>
+        <div class="search-box">
+          <input v-model="searchQuery" type="text" placeholder="搜索文件名" />
+          <span v-if="searchQuery" class="search-clear" @click="searchQuery=''">×</span>
+        </div>
+        <select v-model="sortBy" class="sort-select">
+          <option value="name">按名称</option>
+          <option value="time">按时间</option>
+          <option value="size">按大小</option>
+        </select>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
         <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
         <!-- 用户头像下拉菜单 -->
@@ -41,6 +44,10 @@
             <span class="avatar-name">{{userInfo.username}}</span>
           </div>
           <div v-if="showUserDrop" class="user-dropdown">
+            <div v-if="cacheRunning" class="drop-item cache-status-item">缓存处理中 {{cachePercent}}%</div>
+            <div v-else class="drop-item" @click="runCacheTask">预生成缓存</div>
+            <div v-if="cacheRunning" class="drop-item" @click="stopCacheTask">取消缓存任务</div>
+            <div class="drop-item drop-divider"></div>
             <div class="drop-item" @click="openChangePwdModal">修改密码</div>
             <div v-if="userInfo.is_admin" class="drop-item" @click="openUserManageModal">用户管理</div>
             <div class="drop-item drop-divider"></div>
@@ -59,8 +66,12 @@
 
     <!-- JS横向优先瀑布流容器 MacBook优选270px -->
     <div ref="waterfallBoxRef" class="waterfall-wrap">
+      <div v-if="!displayList.length" class="empty-state">
+        <template v-if="searchQuery">没有匹配「{{ searchQuery }}」的文件</template>
+        <template v-else>当前目录为空</template>
+      </div>
       <div
-        v-for="item in mediaList"
+        v-for="item in displayList"
         :key="item.id"
         class="media-card"
         :style="{left: item._left + 'px', top: item._top + 'px'}"
@@ -74,11 +85,14 @@
               alt=""
               loading="lazy"
               decoding="async"
-              @load="onImageLoaded"
+              :class="{loaded: item._loaded}"
+              @load="onImageLoaded(item)"
             />
-            <svg v-else width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
-              <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" />
-            </svg>
+            <div v-else class="folder-placeholder">
+              <svg width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
+                <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" />
+              </svg>
+            </div>
           </template>
           <img
             v-else-if="item.type === 'image'"
@@ -86,7 +100,8 @@
             alt=""
             loading="lazy"
             decoding="async"
-            @load="onImageLoaded"
+            :class="{loaded: item._loaded}"
+            @load="onImageLoaded(item)"
           />
           <div v-else-if="item.type === 'video'" class="video-wrap">
             <img
@@ -94,9 +109,20 @@
               alt=""
               loading="lazy"
               decoding="async"
-              @load="onImageLoaded"
+              :class="{loaded: item._loaded}"
+              @load="onImageLoaded(item)"
             />
             <div class="play-icon">▶</div>
+          </div>
+          <!-- 角标 -->
+          <div v-if="item.type === 'folder'" class="card-badge badge-count">{{ item.count }}</div>
+          <div v-else-if="item.type === 'video' && item.duration" class="card-badge badge-duration">{{ formatDuration(item.duration) }}</div>
+          <!-- hover 元信息 -->
+          <div class="card-overlay">
+            <div class="card-overlay-name">{{ item.name }}</div>
+            <div class="card-overlay-meta">
+              <template v-if="item.size">{{ formatSize(item.size) }} · </template>{{ formatDate(item.mtime) }}
+            </div>
           </div>
         </div>
         <div class="card-name">{{ item.name }}</div>
@@ -268,7 +294,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 
 const baseUrl = ''
 // 初始化加载标记：修复刷新闪现登录页
@@ -308,6 +334,52 @@ const mediaList = ref([])
 const breadcrumbList = ref([])
 const waterfallBoxRef = ref(null)
 
+// 搜索与排序
+const searchQuery = ref('')
+const sortBy = ref('name') // name | time | size
+
+// 工具：格式化文件大小 / 日期 / 视频时长
+function formatSize(bytes) {
+  if (bytes == null) return ''
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+  return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB'
+}
+function formatDate(ts) {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+function formatDuration(sec) {
+  if (sec == null) return ''
+  const s = Math.round(sec)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const ss = s % 60
+  const p = (n) => String(n).padStart(2, '0')
+  return h > 0 ? `${h}:${p(m)}:${p(ss)}` : `${m}:${p(ss)}`
+}
+
+// 过滤 + 排序后的展示列表
+const displayList = computed(() => {
+  let list = mediaList.value
+  const q = searchQuery.value.trim().toLowerCase()
+  if (q) {
+    list = list.filter((x) => x.name.toLowerCase().includes(q))
+  }
+  const sorted = [...list]
+  if (sortBy.value === 'name') {
+    sorted.sort((a, b) => a.name.localeCompare(b.name, 'zh'))
+  } else if (sortBy.value === 'time') {
+    sorted.sort((a, b) => (b.mtime || 0) - (a.mtime || 0))
+  } else if (sortBy.value === 'size') {
+    sorted.sort((a, b) => (b.size || 0) - (a.size || 0))
+  }
+  return sorted
+})
+
 const previewShow = ref(false)
 const previewItem = ref(null)
 let previewMediaList = []
@@ -341,14 +413,15 @@ let resizeTimer = null
  * 逻辑：一行排满列数，再下一行
  */
 function layoutWaterfall(){
-  if(!waterfallBoxRef.value || !mediaList.value.length) return
+  const list = displayList.value
+  if(!waterfallBoxRef.value || !list.length) return
   const boxWidth = waterfallBoxRef.value.clientWidth
   const colCount = Math.max(1, Math.floor((boxWidth + waterfallConfig.gap) / (waterfallConfig.cardWidth + waterfallConfig.gap)))
 
   // 每列高度记录
   const colHeights = new Array(colCount).fill(0)
 
-  mediaList.value.forEach((item, idx)=>{
+  list.forEach((item, idx)=>{
     // 行优先逻辑：索引 % 列数，实现一行一行横向排布
     const colIndex = idx % colCount
     const left = colIndex * (waterfallConfig.cardWidth + waterfallConfig.gap)
@@ -369,18 +442,19 @@ function layoutWaterfall(){
   waterfallBoxRef.value.style.height = maxH + 'px'
 }
 
-// 图片加载完成防抖重布局
-function onImageLoaded(){
+// 图片加载完成：标记已加载（触发渐显）+ 防抖重布局
+function onImageLoaded(item){
+  item._loaded = true
   clearTimeout(resizeTimer)
   resizeTimer = setTimeout(()=>{
     layoutWaterfall()
   },120)
 }
 
-watch(mediaList, async ()=>{
+watch(displayList, async ()=>{
   await nextTick()
   layoutWaterfall()
-},{deep:true})
+})
 
 function onWindowResize(){
   clearTimeout(resizeTimer)
@@ -540,7 +614,7 @@ function handleCardClick(item) {
   if (item.type === 'folder') {
     changeDir(item.path)
   } else {
-    previewMediaList = mediaList.value.filter(x => x.type !== 'folder')
+    previewMediaList = displayList.value.filter(x => x.type !== 'folder')
     previewCurrentIndex = previewMediaList.findIndex(x => x.id === item.id)
     previewItem.value = item
     imgRotateDeg.value = 0
@@ -631,7 +705,7 @@ async function saveSetting() {
 }
 
 function startSlideFromDir() {
-  slideList.value = mediaList.value.filter(i => i.type === 'image')
+  slideList.value = displayList.value.filter(i => i.type === 'image')
   if (slideList.value.length === 0) return alert('当前目录没有图片，无法幻灯片')
   slideIndex.value = 0
   openRootFullscreen()
@@ -1084,6 +1158,13 @@ onUnmounted(() => {
   background:#444;
   padding:0;
 }
+.cache-status-item {
+  color: #ffd044;
+  cursor: default;
+}
+.cache-status-item:hover {
+  background: transparent;
+}
 
 .app-container {
   min-height: 100vh;
@@ -1110,6 +1191,42 @@ onUnmounted(() => {
   display: flex;
   gap: 10px;
   align-items:center;
+}
+.search-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.search-box input {
+  width: 180px;
+  padding: 7px 26px 7px 10px;
+  background: #2a2a2a;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 13px;
+  outline: none;
+}
+.search-box input:focus {
+  border-color: #2563eb;
+}
+.search-clear {
+  position: absolute;
+  right: 8px;
+  color: #999;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+.sort-select {
+  padding: 7px 8px;
+  background: #2a2a2a;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
 }
 
 .btn {
@@ -1178,6 +1295,56 @@ onUnmounted(() => {
   width: 100%;
   height: auto;
   display: block;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.card-thumb img.loaded {
+  opacity: 1;
+}
+.folder-placeholder {
+  width: 100%;
+  min-height: 140px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #222;
+}
+.card-badge {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  z-index: 2;
+}
+.card-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 10px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  z-index: 3;
+}
+.media-card:hover .card-overlay {
+  opacity: 1;
+}
+.card-overlay-name {
+  font-size: 13px;
+  word-break: break-all;
+  line-height: 1.4;
+}
+.card-overlay-meta {
+  font-size: 12px;
+  color: #ccc;
+  margin-top: 4px;
 }
 
 .play-icon {
@@ -1201,6 +1368,13 @@ onUnmounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.empty-state {
+  width: 100%;
+  padding: 60px 0;
+  text-align: center;
+  color: #777;
+  font-size: 14px;
 }
 
 .preview-mask {

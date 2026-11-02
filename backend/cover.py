@@ -7,6 +7,7 @@
 import subprocess
 import threading
 from pathlib import Path
+from typing import Optional
 
 from .config import CACHE_PATH
 
@@ -146,3 +147,37 @@ def cleanup_orphan_thumbs(media_root: Path) -> int:
             except OSError:
                 pass
     return removed
+
+
+# 视频时长缓存（内存），由缓存任务填充；列表接口默认只读，避免阻塞
+_duration_cache: dict = {}
+_duration_lock = threading.Lock()
+
+
+def get_video_duration(video_path: str, fetch: bool = False) -> Optional[float]:
+    """获取视频时长（秒）。fetch=False 只读缓存，缺失返回 None，不阻塞。"""
+    with _duration_lock:
+        if video_path in _duration_cache:
+            return _duration_cache[video_path]
+    if not fetch:
+        return None
+    dur = _probe_video_duration(video_path)
+    if dur is not None:
+        with _duration_lock:
+            _duration_cache[video_path] = dur
+    return dur
+
+
+def _probe_video_duration(video_path: str) -> Optional[float]:
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0", video_path,
+        ]
+        out = subprocess.run(cmd, capture_output=True, timeout=10).stdout.decode().strip()
+        if out:
+            return float(out)
+    except Exception:
+        pass
+    return None

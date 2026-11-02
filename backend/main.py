@@ -20,6 +20,7 @@ from .cover import (
     get_thumb_cache_path,
     is_cache_fresh,
     cleanup_orphan_thumbs,
+    get_video_duration,
 )
 from .config import load_settings, save_settings
 
@@ -243,6 +244,9 @@ class CacheTask:
                 self._set(message="已取消", percent=int(processed * 100 / total))
                 return
             ensure_thumb(full, rel)
+            # 视频顺便探测并缓存时长，供列表接口直接读取
+            if full.suffix.lower() in VIDEO_EXT:
+                get_video_duration(str(full), fetch=True)
             processed += 1
             self._set(processed=processed, percent=int(processed * 100 / total), current=rel)
         self._set(percent=100, message="全部完成")
@@ -443,28 +447,32 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
     if cached is not None and cached[0] == mtime:
         return {"list": cached[1], "breadcrumb": breadcrumb}
 
-    def get_folder_cover(folder_abs: Path):
-        # 用 scandir 代替 listdir+isfile，减少 stat 系统调用
+    def get_folder_info(folder_abs: Path):
+        # 用 scandir 统计媒体文件数 + 找封面，减少 stat 系统调用
         cover_candidate = None
         first_img = None
+        count = 0
         try:
             with os.scandir(folder_abs) as it:
                 for entry in it:
                     if not entry.is_file():
                         continue
+                    lower_name = entry.name.lower()
+                    ext = os.path.splitext(lower_name)[1]
+                    if ext not in IMAGE_EXT and ext not in VIDEO_EXT:
+                        continue
+                    count += 1
                     if is_cover_file(entry.name):
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
                         cover_candidate = "/" + rel
-                        break
-                    lower_name = entry.name.lower()
-                    ext = os.path.splitext(lower_name)[1]
-                    if ext in IMAGE_EXT and first_img is None:
+                    elif ext in IMAGE_EXT and first_img is None:
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
                         first_img = "/" + rel
-            return cover_candidate if cover_candidate is not None else first_img
+            cover = cover_candidate if cover_candidate is not None else first_img
+            return cover, count
         except Exception:
             pass
-        return None
+        return None, 0
 
     items = []
     entries = sorted(work_path.iterdir(), key=lambda x: x.name.lower())
@@ -476,21 +484,37 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
             rel_str = str(rel).replace(os.sep, "/")
         except Exception:
             continue
+        try:
+            st = entry.stat()
+            size = st.st_size
+            mtime = st.st_mtime
+        except OSError:
+            size = None
+            mtime = None
         if entry.is_dir():
-            cover = get_folder_cover(entry)
+            cover, count = get_folder_info(entry)
             items.append({
                 "id": rel_str,
                 "name": entry.name,
                 "type": "folder",
                 "path": rel_str,
-                "cover_path": cover
+                "cover_path": cover,
+                "count": count,
+                "mtime": mtime,
             })
         else:
             suf = entry.suffix.lower()
             if suf in IMAGE_EXT:
-                items.append({"id": rel_str, "name": entry.name, "type": "image", "path": rel_str})
+                items.append({
+                    "id": rel_str, "name": entry.name, "type": "image",
+                    "path": rel_str, "size": size, "mtime": mtime,
+                })
             elif suf in VIDEO_EXT:
-                items.append({"id": rel_str, "name": entry.name, "type": "video", "path": rel_str})
+                duration = get_video_duration(str(entry), fetch=False)
+                items.append({
+                    "id": rel_str, "name": entry.name, "type": "video",
+                    "path": rel_str, "size": size, "mtime": mtime, "duration": duration,
+                })
 
     with _dir_cache_lock:
         if len(_dir_cache) >= _DIR_CACHE_MAX:
