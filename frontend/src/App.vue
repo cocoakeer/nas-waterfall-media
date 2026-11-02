@@ -595,11 +595,35 @@ function handleKeydown(e) {
   }
 }
 
-function openSlideSetting() {
+async function loadSlideSettings() {
+  try {
+    const res = await fetch(`${baseUrl}/api/settings`)
+    if (!res.ok) return
+    const j = await res.json()
+    if (j.code === 0 && j.settings) {
+      slideDelay.value = j.settings.slide_delay ?? 3
+      slideLoop.value = j.settings.slide_loop ?? true
+    }
+  } catch (e) {
+    console.error("加载幻灯片设置失败", e)
+  }
+}
+
+async function openSlideSetting() {
+  await loadSlideSettings()
   settingShow.value = true
 }
 
-function saveSetting() {
+async function saveSetting() {
+  try {
+    await fetch(`${baseUrl}/api/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slide_delay: slideDelay.value, slide_loop: slideLoop.value })
+    })
+  } catch (e) {
+    console.error("保存幻灯片设置失败", e)
+  }
   settingShow.value = false
 }
 
@@ -727,6 +751,7 @@ async function checkLoginStatus() {
       const urlDir = getDirFromUrl()
       const initDir = urlDir ?? ''
       await loadMedia(initDir, !!urlDir)
+      await loadSlideSettings()
       initCheckCacheTask()
     } else {
       isLogin.value = false

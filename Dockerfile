@@ -24,8 +24,8 @@ COPY --from=frontend-builder /app/dist /frontend/dist
 
 EXPOSE 8000
 ENV MEDIA_ROOT=/media
-ENV CACHE_DIR=/cache
-ENV CONFIG_DIR=/config
+ENV CACHE_PATH=/cache
+ENV CONFIG_PATH=/config
 
 # 修改：访问根路径，不走鉴权接口；镜像已经安装curl
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

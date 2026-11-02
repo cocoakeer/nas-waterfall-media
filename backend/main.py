@@ -9,23 +9,26 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
-from PIL import Image
+import threading
+from .cover import (
+    IMAGE_EXT,
+    VIDEO_EXT,
+    COVER_NAMES,
+    ensure_thumb,
+)
+from .config import load_settings, save_settings
 
 # ========== 配置读取 适配compose CONFIG_PATH / CACHE_PATH ==========
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
 CONFIG_DIR = Path(os.getenv("CONFIG_PATH", "/app/config"))
 CACHE_DIR = Path(os.getenv("CACHE_PATH", "/app/cache"))
 # 创建目录并设置权限，打印路径用于排错
-CONFIG_DIR.mkdir(exist_ok=True, mode=0o775)
-CACHE_DIR.mkdir(exist_ok=True, mode=0o775)
+CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o775)
+CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o775)
 USER_CONFIG_PATH = CONFIG_DIR / "users.json"
 print(f"[CONFIG] 用户配置文件路径: {USER_CONFIG_PATH}")
 
 SESSION_EXPIRE_SEC = 86400
-
-IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi"}
-COVER_NAMES = {"cover.jpg", "cover.png", "cover.webp"}
 
 # 数据模型 新增 is_admin 布尔标记，不再依靠用户名admin
 class LoginForm(BaseModel):
@@ -41,6 +44,10 @@ class UserItem(BaseModel):
 class ChangePwdForm(BaseModel):
     old_password: str
     new_password: str
+
+class SettingsForm(BaseModel):
+    slide_delay: int = 5
+    slide_loop: bool = True
 
 class AdminUserForm(BaseModel):
     username: str
@@ -144,9 +151,101 @@ def check_at_least_one_admin(user_list: List[UserItem]):
     if admin_count <= 0:
         raise HTTPException(status_code=400, detail="系统至少保留一名管理员账号，不允许全部取消管理员")
 
+# ========== 预生成缓存任务（后台线程） ==========
+class CacheTask:
+    def __init__(self, media_root: str):
+        self._media_root = media_root
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self.running = False
+        self.percent = 0
+        self.message = ""
+        self.processed = 0
+        self.total = 0
+        self.current = ""
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "running": self.running,
+                "percent": self.percent,
+                "message": self.message,
+                "processed": self.processed,
+                "total": self.total,
+                "current": self.current,
+            }
+
+    def _set(self, **kwargs):
+        with self._lock:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    def start(self) -> bool:
+        with self._lock:
+            if self.running:
+                return False
+            self.running = True
+            self.percent = 0
+            self.message = ""
+            self.processed = 0
+            self.total = 0
+            self.current = ""
+            self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        try:
+            self._build()
+        except Exception as exc:
+            self._set(message=f"任务异常：{exc}")
+        finally:
+            self._set(running=False)
+            self._stop.clear()
+
+    def _build(self):
+        base = Path(self._media_root).resolve()
+        # 1. 收集全部媒体文件
+        files = []
+        for root, _dirs, names in os.walk(base):
+            if self._stop.is_set():
+                break
+            for name in names:
+                if Path(name).suffix.lower() not in (IMAGE_EXT | VIDEO_EXT):
+                    continue
+                full = Path(root) / name
+                try:
+                    rel = full.relative_to(base)
+                except ValueError:
+                    continue
+                files.append((full, str(rel)))
+        total = len(files)
+        self._set(total=total)
+        if total == 0:
+            self._set(percent=100, message="未找到媒体文件")
+            return
+        # 2. 逐个生成缩略图/封面
+        processed = 0
+        for full, rel in files:
+            if self._stop.is_set():
+                self._set(message="已取消", percent=int(processed * 100 / total))
+                return
+            ensure_thumb(full, rel)
+            processed += 1
+            self._set(processed=processed, percent=int(processed * 100 / total), current=rel)
+        self._set(percent=100, message="全部完成")
+
+
 # ========== APP初始化 ==========
 app = FastAPI()
 app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="assets")
+
+cache_task = CacheTask(MEDIA_ROOT)
 
 # ========== 登录登出接口 ==========
 @app.post("/api/login")
@@ -353,30 +452,62 @@ async def api_src(path: str, user: UserItem = Depends(get_current_user)):
         raise HTTPException(404)
     return FileResponse(fp)
 
-# ========== 缩略图占位 ==========
+# ========== 缩略图接口（图片 Pillow / 视频 ffmpeg，结果落盘缓存） ==========
 @app.get("/api/thumb")
 async def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
     fp = check_path_allowed(user, path)
-    if not fp.exists():
+    if not fp.exists() or not fp.is_file():
         raise HTTPException(404)
+    suf = fp.suffix.lower()
+    if suf in IMAGE_EXT or suf in VIDEO_EXT:
+        base = Path(MEDIA_ROOT).resolve()
+        rel = str(fp.relative_to(base)).replace(os.sep, "/")
+        cache_path = ensure_thumb(fp, rel)
+        if cache_path is not None and cache_path.exists():
+            return FileResponse(cache_path)
+    # 生成失败或未知类型，回退原图
     return FileResponse(fp)
 
 # ========== 缓存任务接口 ==========
 @app.get("/api/cache-status")
 async def cache_status(user: UserItem = Depends(get_current_user)):
-    return {"running": False, "percent":0, "message":"", "processed":0, "total":0}
+    return cache_task.snapshot()
 
 @app.get("/api/cache-run")
 async def cache_run(user: UserItem = Depends(get_current_user)):
-    return {"code":0, "msg":"ok"}
+    if cache_task.start():
+        return {"code": 0, "msg": "任务已启动"}
+    return {"code": 1, "msg": "已有任务在运行"}
 
 @app.get("/api/cache-stop")
 async def cache_stop(user: UserItem = Depends(get_current_user)):
-    return {"code":0, "msg":"ok"}
+    cache_task.stop()
+    return {"code": 0, "msg": "停止指令已发送"}
+
+# ========== 设置持久化接口 ==========
+@app.get("/api/settings")
+async def api_get_settings(user: UserItem = Depends(get_current_user)):
+    s = load_settings()
+    return {
+        "code": 0,
+        "settings": {
+            "slide_delay": s.get("slide_delay", 5),
+            "slide_loop": s.get("slide_loop", True),
+        },
+    }
+
+@app.post("/api/settings")
+async def api_save_settings(form: SettingsForm, user: UserItem = Depends(get_current_user)):
+    s = load_settings()
+    s["slide_delay"] = form.slide_delay
+    s["slide_loop"] = form.slide_loop
+    save_settings(s)
+    return {"code": 0, "msg": "ok"}
 
 @app.get("/")
 async def index():
     return FileResponse("/frontend/dist/index.html")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    # 在项目根目录执行：python -m backend.main
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000)
