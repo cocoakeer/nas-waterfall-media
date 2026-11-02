@@ -5,6 +5,7 @@
 所有缓存写入 CACHE_PATH/thumbs/ 下，保持原目录结构，按源文件 mtime 判断是否过期。
 """
 import subprocess
+import threading
 from pathlib import Path
 
 from .config import CACHE_PATH
@@ -74,16 +75,35 @@ def generate_video_cover(video_full: Path, dest_full: Path) -> bool:
         return False
 
 
+# 缩略图生成的 per-file 锁，防止同一文件被并发请求重复生成
+_locks_guard = threading.Lock()
+_locks: dict = {}
+
+
+def _get_lock(key: str) -> threading.Lock:
+    with _locks_guard:
+        lock = _locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _locks[key] = lock
+        return lock
+
+
 def ensure_thumb(src_full: Path, rel_path: str):
     """按文件类型生成缩略图/封面，返回缓存路径；生成失败返回 None。"""
     suf = src_full.suffix.lower()
     dest = get_thumb_cache_path(rel_path)
     if is_cache_fresh(src_full, dest):
         return dest
-    if suf in IMAGE_EXT:
-        ok = generate_image_thumb(src_full, dest)
-    elif suf in VIDEO_EXT:
-        ok = generate_video_cover(src_full, dest)
-    else:
-        return None
+    # double-checked locking：同一文件并发请求时串行化，避免重复生成
+    lock = _get_lock(str(dest))
+    with lock:
+        if is_cache_fresh(src_full, dest):
+            return dest
+        if suf in IMAGE_EXT:
+            ok = generate_image_thumb(src_full, dest)
+        elif suf in VIDEO_EXT:
+            ok = generate_video_cover(src_full, dest)
+        else:
+            return None
     return dest if ok else None

@@ -20,6 +20,7 @@ from .config import load_settings, save_settings
 
 # ========== 配置读取 适配compose CONFIG_PATH / CACHE_PATH ==========
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
+REAL_BASE = Path(MEDIA_ROOT).resolve()  # 预计算，避免每个请求重复 resolve
 CONFIG_DIR = Path(os.getenv("CONFIG_PATH", "/app/config"))
 CACHE_DIR = Path(os.getenv("CACHE_PATH", "/app/cache"))
 # 创建目录并设置权限，打印路径用于排错
@@ -113,13 +114,12 @@ async def require_admin(user: UserItem = Depends(get_current_user)):
 # 路径安全校验：防止越权、路径穿越
 def check_path_allowed(user: UserItem, target_dir: str) -> Path:
     target_dir = target_dir.strip()
-    real_base = Path(MEDIA_ROOT).resolve()
     user_allowed_real = []
     for ad in user.allow_dirs:
-        ap = (real_base / ad.lstrip("/")).resolve()
+        ap = (REAL_BASE / ad.lstrip("/")).resolve()
         user_allowed_real.append(ap)
 
-    req_path = (real_base / target_dir.lstrip("/")).resolve()
+    req_path = (REAL_BASE / target_dir.lstrip("/")).resolve()
     ok = False
     for allow_p in user_allowed_real:
         try:
@@ -134,12 +134,11 @@ def check_path_allowed(user: UserItem, target_dir: str) -> Path:
 
 # 获取media根下全部一级子目录（给前端下拉选择）
 def scan_media_root_dirs() -> List[str]:
-    base = Path(MEDIA_ROOT).resolve()
     dir_list = ["/"]
     try:
-        for entry in base.iterdir():
+        for entry in REAL_BASE.iterdir():
             if entry.is_dir():
-                rel = "/" + str(entry.relative_to(base)).replace(os.sep, "/")
+                rel = "/" + str(entry.relative_to(REAL_BASE)).replace(os.sep, "/")
                 dir_list.append(rel)
     except Exception:
         pass
@@ -381,54 +380,71 @@ async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin
     return {"code":0,"msg":"已删除"}
 
 # ========== 媒体列表接口 ==========
+# 目录列表缓存：key=解析后目录路径, value=(目录mtime, items)
+_dir_cache: Dict[str, tuple] = {}
+_dir_cache_lock = threading.Lock()
+_DIR_CACHE_MAX = 500
+
 @app.get("/api/list")
-async def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
+def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
     work_path = check_path_allowed(user, dir)
     if not work_path.exists() or not work_path.is_dir():
         return {"list": [], "breadcrumb": []}
 
-    def get_folder_cover(folder_abs: Path, base_abs: Path):
-        cover_candidate = None
-        first_img = None
-        try:
-            for name in os.listdir(folder_abs):
-                full = folder_abs / name
-                if not os.path.isfile(full):
-                    continue
-                lower_name = name.lower()
-                if lower_name in COVER_NAMES:
-                    rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
-                    cover_candidate = "/" + rel
-                    break
-                ext = os.path.splitext(lower_name)[1]
-                if ext in IMAGE_EXT and first_img is None:
-                    rel = os.path.relpath(full, base_abs).replace(os.sep, "/")
-                    first_img = "/" + rel
-            return cover_candidate if cover_candidate is not None else first_img
-        except Exception:
-            pass
-        return None
-
-    items = []
+    # 面包屑直接计算（开销小，不缓存）
     breadcrumb = []
     parts = Path(dir).parts
     for i in range(len(parts)):
         p = "/".join(parts[:i+1])
         breadcrumb.append({"name": parts[i], "path": p})
 
-    entries = sorted(work_path.iterdir(), key=lambda x:x.name.lower())
-    base_abs = Path(MEDIA_ROOT).resolve()
+    # 目录缓存：目录 mtime 未变则复用上次结果，避免重复遍历
+    try:
+        mtime = work_path.stat().st_mtime
+    except OSError:
+        mtime = 0
+    key = str(work_path)
+    with _dir_cache_lock:
+        cached = _dir_cache.get(key)
+    if cached is not None and cached[0] == mtime:
+        return {"list": cached[1], "breadcrumb": breadcrumb}
+
+    def get_folder_cover(folder_abs: Path):
+        # 用 scandir 代替 listdir+isfile，减少 stat 系统调用
+        cover_candidate = None
+        first_img = None
+        try:
+            with os.scandir(folder_abs) as it:
+                for entry in it:
+                    if not entry.is_file():
+                        continue
+                    lower_name = entry.name.lower()
+                    if lower_name in COVER_NAMES:
+                        rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
+                        cover_candidate = "/" + rel
+                        break
+                    ext = os.path.splitext(lower_name)[1]
+                    if ext in IMAGE_EXT and first_img is None:
+                        rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
+                        first_img = "/" + rel
+            return cover_candidate if cover_candidate is not None else first_img
+        except Exception:
+            pass
+        return None
+
+    items = []
+    entries = sorted(work_path.iterdir(), key=lambda x: x.name.lower())
     for entry in entries:
         entry_name_low = entry.name.lower()
         if entry_name_low in COVER_NAMES:
             continue
         try:
-            rel = entry.relative_to(base_abs)
+            rel = entry.relative_to(REAL_BASE)
             rel_str = str(rel).replace(os.sep, "/")
         except Exception:
             continue
         if entry.is_dir():
-            cover = get_folder_cover(entry, base_abs)
+            cover = get_folder_cover(entry)
             items.append({
                 "id": rel_str,
                 "name": entry.name,
@@ -439,14 +455,19 @@ async def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
         else:
             suf = entry.suffix.lower()
             if suf in IMAGE_EXT:
-                items.append({"id":rel_str,"name":entry.name,"type":"image","path":rel_str})
+                items.append({"id": rel_str, "name": entry.name, "type": "image", "path": rel_str})
             elif suf in VIDEO_EXT:
-                items.append({"id":rel_str,"name":entry.name,"type":"video","path":rel_str})
+                items.append({"id": rel_str, "name": entry.name, "type": "video", "path": rel_str})
+
+    with _dir_cache_lock:
+        if len(_dir_cache) >= _DIR_CACHE_MAX:
+            _dir_cache.clear()
+        _dir_cache[key] = (mtime, items)
     return {"list": items, "breadcrumb": breadcrumb}
 
 # ========== 原图接口 ==========
 @app.get("/api/src")
-async def api_src(path: str, user: UserItem = Depends(get_current_user)):
+def api_src(path: str, user: UserItem = Depends(get_current_user)):
     fp = check_path_allowed(user, path)
     if not fp.exists():
         raise HTTPException(404)
@@ -454,14 +475,13 @@ async def api_src(path: str, user: UserItem = Depends(get_current_user)):
 
 # ========== 缩略图接口（图片 Pillow / 视频 ffmpeg，结果落盘缓存） ==========
 @app.get("/api/thumb")
-async def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
+def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
     fp = check_path_allowed(user, path)
     if not fp.exists() or not fp.is_file():
         raise HTTPException(404)
     suf = fp.suffix.lower()
     if suf in IMAGE_EXT or suf in VIDEO_EXT:
-        base = Path(MEDIA_ROOT).resolve()
-        rel = str(fp.relative_to(base)).replace(os.sep, "/")
+        rel = str(fp.relative_to(REAL_BASE)).replace(os.sep, "/")
         cache_path = ensure_thumb(fp, rel)
         if cache_path is not None and cache_path.exists():
             return FileResponse(cache_path)

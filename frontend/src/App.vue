@@ -73,6 +73,7 @@
               :src="getThumbUrl(item.cover_path)"
               alt=""
               loading="lazy"
+              decoding="async"
               @load="onImageLoaded"
             />
             <svg v-else width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
@@ -84,6 +85,7 @@
             :src="getThumbUrl(item.path)"
             alt=""
             loading="lazy"
+            decoding="async"
             @load="onImageLoaded"
           />
           <div v-else-if="item.type === 'video'" class="video-wrap">
@@ -91,6 +93,7 @@
               :src="getThumbUrl(item.path)"
               alt=""
               loading="lazy"
+              decoding="async"
               @load="onImageLoaded"
             />
             <div class="play-icon">▶</div>
