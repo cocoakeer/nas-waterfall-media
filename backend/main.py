@@ -10,11 +10,16 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import threading
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.background import BackgroundScheduler
 from .cover import (
     IMAGE_EXT,
     VIDEO_EXT,
     is_cover_file,
     ensure_thumb,
+    get_thumb_cache_path,
+    is_cache_fresh,
+    cleanup_orphan_thumbs,
 )
 from .config import load_settings, save_settings
 
@@ -209,7 +214,7 @@ class CacheTask:
 
     def _build(self):
         base = Path(self._media_root).resolve()
-        # 1. 收集全部媒体文件
+        # 1. 收集需要处理的媒体文件（增量：跳过缓存已是最新的文件）
         files = []
         for root, _dirs, names in os.walk(base):
             if self._stop.is_set():
@@ -222,11 +227,14 @@ class CacheTask:
                     rel = full.relative_to(base)
                 except ValueError:
                     continue
+                # 增量判断：缓存存在且不旧于源文件则跳过
+                if is_cache_fresh(full, get_thumb_cache_path(str(rel))):
+                    continue
                 files.append((full, str(rel)))
         total = len(files)
         self._set(total=total)
         if total == 0:
-            self._set(percent=100, message="未找到媒体文件")
+            self._set(percent=100, message="缓存已是最新，无增量文件")
             return
         # 2. 逐个生成缩略图/封面
         processed = 0
@@ -240,11 +248,37 @@ class CacheTask:
         self._set(percent=100, message="全部完成")
 
 
-# ========== APP初始化 ==========
-app = FastAPI()
-app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="assets")
-
+# ========== 缓存任务实例 ==========
 cache_task = CacheTask(MEDIA_ROOT)
+
+
+# ========== 每日缓存任务 ==========
+def daily_cache_job():
+    """每天凌晨 3 点：清理孤儿缓存 + 增量生成缓存。"""
+    try:
+        cleaned = cleanup_orphan_thumbs(REAL_BASE)
+        print(f"[CACHE-JOB] 清理孤儿缓存 {cleaned} 个")
+    except Exception as exc:
+        print(f"[CACHE-JOB] 清理孤儿缓存失败：{exc}")
+    if cache_task.start():
+        print("[CACHE-JOB] 增量生成已启动")
+    else:
+        print("[CACHE-JOB] 已有任务在运行，跳过本次增量")
+
+
+# ========== APP初始化 ==========
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+    scheduler.add_job(daily_cache_job, "cron", hour=3, minute=0, id="daily_cache")
+    scheduler.start()
+    print("[SCHEDULER] 缓存增量任务已调度：每天 03:00（Asia/Shanghai）")
+    yield
+    scheduler.shutdown(wait=False)
+
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="assets")
 
 # ========== 登录登出接口 ==========
 @app.post("/api/login")

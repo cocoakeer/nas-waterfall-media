@@ -115,3 +115,34 @@ def ensure_thumb(src_full: Path, rel_path: str):
         else:
             return None
     return dest if ok else None
+
+
+def _original_exists(stem_path: Path) -> bool:
+    """判断 stem 对应的原文件（任意图片/视频扩展名）是否存在。"""
+    parent = stem_path.parent
+    stem = stem_path.name
+    for ext in IMAGE_EXT | VIDEO_EXT:
+        if (parent / (stem + ext)).exists():
+            return True
+    return False
+
+
+def cleanup_orphan_thumbs(media_root: Path) -> int:
+    """删除原图已不存在的孤儿缩略图缓存，返回删除数量。
+
+    缓存文件名为「原文件名 stem + .jpg」，反推原图时需检查任意图片/视频扩展名。
+    """
+    thumbs_root = CACHE_PATH / "thumbs"
+    if not thumbs_root.exists():
+        return 0
+    removed = 0
+    for cache_file in thumbs_root.rglob("*.jpg"):
+        rel = cache_file.relative_to(thumbs_root)  # 例如 photos/a.jpg
+        stem_path = media_root / rel.with_suffix("")  # 原图 stem：photos/a
+        if not _original_exists(stem_path):
+            try:
+                cache_file.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
