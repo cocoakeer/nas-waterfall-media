@@ -13,7 +13,7 @@ import threading
 from .cover import (
     IMAGE_EXT,
     VIDEO_EXT,
-    COVER_NAMES,
+    is_cover_file,
     ensure_thumb,
 )
 from .config import load_settings, save_settings
@@ -418,11 +418,11 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
                 for entry in it:
                     if not entry.is_file():
                         continue
-                    lower_name = entry.name.lower()
-                    if lower_name in COVER_NAMES:
+                    if is_cover_file(entry.name):
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
                         cover_candidate = "/" + rel
                         break
+                    lower_name = entry.name.lower()
                     ext = os.path.splitext(lower_name)[1]
                     if ext in IMAGE_EXT and first_img is None:
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
@@ -435,8 +435,7 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
     items = []
     entries = sorted(work_path.iterdir(), key=lambda x: x.name.lower())
     for entry in entries:
-        entry_name_low = entry.name.lower()
-        if entry_name_low in COVER_NAMES:
+        if is_cover_file(entry.name):
             continue
         try:
             rel = entry.relative_to(REAL_BASE)

@@ -19,7 +19,15 @@ THUMB_MAX_HEIGHT = 4000
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi"}
-COVER_NAMES = {"cover.jpg", "cover.png", "cover.webp"}
+
+
+def is_cover_file(name: str) -> bool:
+    """判断文件名是否为文件夹封面（cover），文件名大小写、图片扩展名均不敏感。
+
+    cover.jpg / Cover.JPG / cover.jpeg / COVER.webp 均视为封面，不会作为独立图片展示。
+    """
+    p = Path(name)
+    return p.stem.lower() == "cover" and p.suffix.lower() in IMAGE_EXT
 
 
 def get_thumb_cache_path(rel_path: str) -> Path:
