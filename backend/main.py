@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import threading
+import time
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 from .cover import (
@@ -418,10 +419,11 @@ async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin
     return {"code":0,"msg":"已删除"}
 
 # ========== 媒体列表接口 ==========
-# 目录列表缓存：key=解析后目录路径, value=(目录mtime, items)
+# 目录列表缓存：key=解析后目录路径, value=(目录mtime, 缓存时间戳, items)
 _dir_cache: Dict[str, tuple] = {}
 _dir_cache_lock = threading.Lock()
 _DIR_CACHE_MAX = 500
+_DIR_CACHE_TTL = 30  # 缓存有效期（秒），兼顾递归计数对深层变化的感知
 
 @app.get("/api/list")
 def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
@@ -444,14 +446,13 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
     key = str(work_path)
     with _dir_cache_lock:
         cached = _dir_cache.get(key)
-    if cached is not None and cached[0] == mtime:
-        return {"list": cached[1], "breadcrumb": breadcrumb}
+    if cached is not None and cached[0] == mtime and (time.time() - cached[1]) < _DIR_CACHE_TTL:
+        return {"list": cached[2], "breadcrumb": breadcrumb}
 
     def get_folder_info(folder_abs: Path):
-        # 用 scandir 统计媒体文件数 + 找封面，减少 stat 系统调用
+        # 找封面（直接子项）+ 递归统计图片/视频总数
         cover_candidate = None
         first_img = None
-        count = 0
         try:
             with os.scandir(folder_abs) as it:
                 for entry in it:
@@ -461,7 +462,6 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
                     ext = os.path.splitext(lower_name)[1]
                     if ext not in IMAGE_EXT and ext not in VIDEO_EXT:
                         continue
-                    count += 1
                     if is_cover_file(entry.name):
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
                         cover_candidate = "/" + rel
@@ -469,6 +469,13 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
                         first_img = "/" + rel
             cover = cover_candidate if cover_candidate is not None else first_img
+            # 递归统计该文件夹下（含所有子文件夹）的图片+视频总数
+            count = 0
+            for _root, _dirs, names in os.walk(folder_abs):
+                for name in names:
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext in IMAGE_EXT or ext in VIDEO_EXT:
+                        count += 1
             return cover, count
         except Exception:
             pass
@@ -519,7 +526,7 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
     with _dir_cache_lock:
         if len(_dir_cache) >= _DIR_CACHE_MAX:
             _dir_cache.clear()
-        _dir_cache[key] = (mtime, items)
+        _dir_cache[key] = (mtime, time.time(), items)
     return {"list": items, "breadcrumb": breadcrumb}
 
 # ========== 原图接口 ==========
