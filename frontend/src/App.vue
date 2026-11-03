@@ -28,36 +28,54 @@
         <h1>NAS 媒体瀑布流</h1>
         <div class="user-dropdown-wrap">
           <div class="avatar-btn" @click="toggleUserDrop">
-            <span class="avatar-icon">👤</span>
+            <span class="avatar-circle">{{ avatarInitial }}</span>
             <span class="avatar-name">{{userInfo.username}}</span>
           </div>
-          <div v-if="showUserDrop" class="user-dropdown">
-            <div v-if="cacheRunning" class="drop-item cache-status-item">缓存处理中 {{cachePercent}}%</div>
-            <div v-else class="drop-item cache-run-item" @click="runCacheTask">
-              <span>预生成缓存</span>
-              <span class="cache-sub">未缓存 {{ cacheStats.uncached }}/{{ cacheStats.total }}</span>
+          <transition name="drop">
+            <div v-if="showUserDrop" class="user-dropdown">
+              <div class="drop-section">
+                <div v-if="cacheRunning" class="drop-item cache-status-item">缓存处理中 {{cachePercent}}%</div>
+                <div v-else class="drop-item cache-run-item" @click="runCacheTask">
+                  <span>预生成缓存</span>
+                  <span class="cache-sub">未缓存 {{ cacheStats.uncached }}/{{ cacheStats.total }}</span>
+                </div>
+                <div v-if="cacheStats.last_finish_time" class="drop-item cache-meta">上次完成 {{ formatDateTime(cacheStats.last_finish_time) }}<template v-if="cacheStats.failed > 0"> · 失败 {{ cacheStats.failed }} 个</template></div>
+                <div v-if="cacheRunning" class="drop-item" @click="stopCacheTask">取消缓存任务</div>
+              </div>
+              <div class="drop-section">
+                <div class="drop-item drop-with-icon" @click="openChangePwdModal">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                  <span>修改密码</span>
+                </div>
+                <div v-if="userInfo.is_admin" class="drop-item drop-with-icon" @click="openUserManageModal">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+                  <span>用户管理</span>
+                </div>
+              </div>
+              <div class="drop-section">
+                <div class="drop-item drop-with-icon drop-logout" @click="doLogout">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                  <span>退出登录</span>
+                </div>
+              </div>
             </div>
-            <div v-if="cacheStats.last_finish_time" class="drop-item cache-finish-time">上次完成 {{ formatDateTime(cacheStats.last_finish_time) }}</div>
-            <div v-if="cacheStats.last_finish_time && cacheStats.failed > 0" class="drop-item cache-finish-time">失败 {{ cacheStats.failed }} 个</div>
-            <div v-if="cacheRunning" class="drop-item" @click="stopCacheTask">取消缓存任务</div>
-            <div class="drop-item drop-divider"></div>
-            <div class="drop-item" @click="openChangePwdModal">修改密码</div>
-            <div v-if="userInfo.is_admin" class="drop-item" @click="openUserManageModal">用户管理</div>
-            <div class="drop-item drop-divider"></div>
-            <div class="drop-item" @click="doLogout">退出登录</div>
-          </div>
+          </transition>
         </div>
       </div>
       <div class="header-actions">
         <div class="search-box">
+          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
           <input v-model="searchQuery" type="text" placeholder="搜索文件名" />
           <span v-if="searchQuery" class="search-clear" @click="searchQuery=''">×</span>
         </div>
-        <select v-model="sortBy" class="sort-select">
-          <option value="name">按名称</option>
-          <option value="time">按时间</option>
-          <option value="size">按大小</option>
-        </select>
+        <div class="sort-select-wrap">
+          <select v-model="sortBy" class="sort-select">
+            <option value="name">按名称</option>
+            <option value="time">按时间</option>
+            <option value="size">按大小</option>
+          </select>
+          <svg class="sort-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
         <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
       </div>
@@ -308,6 +326,11 @@ const baseUrl = ''
 const initLoading = ref(true)
 const isLogin = ref(false)
 const userInfo = ref({})
+// 头像首字母（用户名首字符大写）
+const avatarInitial = computed(() => {
+  const n = userInfo.value.username || '?'
+  return n.charAt(0).toUpperCase()
+})
 const loginForm = ref({username:'', password:''})
 const loginErr = ref('')
 
@@ -1181,38 +1204,82 @@ onUnmounted(() => {
 .avatar-btn {
   display:flex;
   align-items:center;
-  gap:6px;
-  padding:6px 10px;
+  gap:8px;
+  padding:4px 10px 4px 4px;
   background:#2a2a2a;
-  border-radius:6px;
+  border:1px solid #3a3a3a;
+  border-radius:18px;
   cursor:pointer;
   color:#fff;
+  transition: background 0.15s ease;
 }
-.avatar-icon {
-  font-size:18px;
+.avatar-btn:hover {
+  background:#3a3a3a;
+}
+.avatar-circle {
+  width:26px;
+  height:26px;
+  border-radius:50%;
+  background:#2563eb;
+  color:#fff;
+  font-size:13px;
+  font-weight:500;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  flex-shrink:0;
 }
 .user-dropdown {
   position:absolute;
   top:calc(100% + 6px);
   right:0;
-  min-width:160px;
-  background:#222;
-  border-radius:8px;
+  min-width:220px;
+  background:#1e1e1e;
+  border:1px solid #333;
+  border-radius:10px;
   z-index:200;
   overflow:hidden;
 }
+.drop-section {
+  padding:6px 0;
+}
+.drop-section + .drop-section {
+  border-top:1px solid #2a2a2a;
+}
 .drop-item {
-  padding:9px 14px;
+  padding:8px 14px;
   color:#eee;
   cursor:pointer;
+  font-size:13px;
 }
 .drop-item:hover {
-  background:#333;
+  background:#2a2a2a;
 }
-.drop-divider {
-  height:1px;
-  background:#444;
-  padding:0;
+.drop-with-icon {
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+.drop-with-icon svg {
+  width:15px;
+  height:15px;
+  color:#999;
+  flex-shrink:0;
+}
+.drop-logout {
+  color:#f09595;
+}
+.drop-logout svg {
+  color:#e24b4a;
+}
+.drop-enter-active,
+.drop-leave-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.drop-enter-from,
+.drop-leave-to {
+  opacity:0;
+  transform: translateY(-6px);
 }
 .cache-status-item {
   color: #ffd044;
@@ -1231,12 +1298,12 @@ onUnmounted(() => {
   font-size: 12px;
   color: #888;
 }
-.cache-finish-time {
+.cache-meta {
   font-size: 12px;
   color: #777;
   cursor: default;
 }
-.cache-finish-time:hover {
+.cache-meta:hover {
   background: transparent;
 }
 
@@ -1278,9 +1345,17 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
 }
+.search-icon {
+  position: absolute;
+  left: 9px;
+  width: 14px;
+  height: 14px;
+  color: #888;
+  pointer-events: none;
+}
 .search-box input {
   width: 180px;
-  padding: 7px 26px 7px 10px;
+  padding: 7px 26px 7px 30px;
   background: #2a2a2a;
   border: 1px solid #3a3a3a;
   border-radius: 6px;
@@ -1299,8 +1374,15 @@ onUnmounted(() => {
   font-size: 16px;
   line-height: 1;
 }
+.sort-select-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
 .sort-select {
-  padding: 7px 8px;
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 7px 28px 7px 10px;
   background: #2a2a2a;
   border: 1px solid #3a3a3a;
   border-radius: 6px;
@@ -1308,6 +1390,17 @@ onUnmounted(() => {
   font-size: 13px;
   outline: none;
   cursor: pointer;
+}
+.sort-select:hover {
+  background: #333;
+}
+.sort-arrow {
+  position: absolute;
+  right: 8px;
+  width: 14px;
+  height: 14px;
+  color: #888;
+  pointer-events: none;
 }
 
 .btn {
@@ -1317,6 +1410,14 @@ onUnmounted(() => {
   background: #2a2a2a;
   color: #fff;
   cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+.btn:hover {
+  background: #3a3a3a;
+}
+.btn:active {
+  background: #222;
+  transform: translateY(1px);
 }
 .btn-sm{
   padding:4px 8px;
@@ -1329,8 +1430,17 @@ onUnmounted(() => {
 .btn.primary {
   background: #2563eb;
 }
+.btn.primary:hover {
+  background: #3b82f6;
+}
+.btn.primary:active {
+  background: #1d4ed8;
+}
 .btn-danger {
   background: #dc2626;
+}
+.btn-danger:hover {
+  background: #ef4444;
 }
 
 .breadcrumb {
