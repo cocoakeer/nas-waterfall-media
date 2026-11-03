@@ -401,12 +401,26 @@ let statusPollTimer = null
 
 const STORAGE_KEY = "waterfall_last_dir"
 
-// ========= JS瀑布流配置【MacBook优选：卡片270px｜横向优先行优先排序】 =========
-const waterfallConfig = {
-  cardWidth: 270,
-  gap: 14
-}
+// ========= JS瀑布流【响应式：手机2列 / 平板3-4列 / 桌面270px】 =========
 let resizeTimer = null
+
+// 根据容器宽度决定列数与卡片宽度（均分填满整行，无留白、无边界跳变）
+function getCardLayout(boxWidth) {
+  const gap = 12
+  let colCount
+  if (boxWidth < 480) {
+    colCount = 2
+  } else if (boxWidth < 768) {
+    colCount = 3
+  } else if (boxWidth < 1100) {
+    colCount = 4
+  } else {
+    // 桌面：以约 270px 为目标列宽，取整列数，均分填满
+    colCount = Math.max(4, Math.round((boxWidth + gap) / (270 + gap)))
+  }
+  const cardWidth = (boxWidth - gap * (colCount - 1)) / colCount
+  return { cardWidth, gap, colCount }
+}
 
 /**
  * 横向优先（行优先）瀑布流计算
@@ -416,7 +430,11 @@ function layoutWaterfall(){
   const list = displayList.value
   if(!waterfallBoxRef.value || !list.length) return
   const boxWidth = waterfallBoxRef.value.clientWidth
-  const colCount = Math.max(1, Math.floor((boxWidth + waterfallConfig.gap) / (waterfallConfig.cardWidth + waterfallConfig.gap)))
+  const { cardWidth, gap, colCount } = getCardLayout(boxWidth)
+
+  // 通过 CSS 变量联动卡片宽度与间距
+  waterfallBoxRef.value.style.setProperty('--card-width', cardWidth + 'px')
+  waterfallBoxRef.value.style.setProperty('--card-gap', gap + 'px')
 
   // 每列高度记录
   const colHeights = new Array(colCount).fill(0)
@@ -424,14 +442,14 @@ function layoutWaterfall(){
   list.forEach((item, idx)=>{
     // 行优先逻辑：索引 % 列数，实现一行一行横向排布
     const colIndex = idx % colCount
-    const left = colIndex * (waterfallConfig.cardWidth + waterfallConfig.gap)
+    const left = colIndex * (cardWidth + gap)
 
     const dom = waterfallBoxRef.value.children[idx]
     let cardH = 280
     if(dom) cardH = dom.offsetHeight || 280
 
     const top = colHeights[colIndex]
-    colHeights[colIndex] = top + cardH + waterfallConfig.gap
+    colHeights[colIndex] = top + cardH + gap
 
     item._left = left
     item._top = top
@@ -1084,7 +1102,8 @@ onUnmounted(() => {
   background:#1e1e1e;
   padding:32px;
   border-radius:12px;
-  width:340px;
+  width:min(340px, 90vw);
+  box-sizing:border-box;
 }
 .login-box h2 {
   color:#fff;
@@ -1271,7 +1290,7 @@ onUnmounted(() => {
 }
 
 .media-card {
-  width: 270px;
+  width: var(--card-width, 270px);
   position: absolute;
   background: #1e1e1e;
   border-radius: 10px;
@@ -1501,14 +1520,15 @@ onUnmounted(() => {
   background: #181818;
   border-radius: 12px;
   padding:24px;
-  width:380px;
+  width:min(380px, 92vw);
+  box-sizing:border-box;
 }
 
 /* =========新版用户管理弹窗样式 ========= */
 .user-manage-box{
   background:#181818;
   border-radius:12px;
-  width:720px;
+  width:min(720px, 95vw);
   max-height:85vh;
   display:flex;
   flex-direction:column;
@@ -1706,4 +1726,55 @@ onUnmounted(() => {
 }
 .slide-prev-btn { left: 20px; }
 .slide-next-btn { right: 20px; }
+
+/* ========= 手机 / 平板响应式 ========= */
+@media (max-width: 768px) {
+  .app-container {
+    padding: 10px;
+  }
+  .header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .header-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .search-box {
+    flex: 1;
+    min-width: 140px;
+  }
+  .search-box input {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .media-card:hover {
+    transform: none;
+    box-shadow: none;
+  }
+  .um-table-head,
+  .um-table-row {
+    grid-template-columns: 90px 70px 1fr 110px;
+    font-size: 12px;
+    padding: 8px;
+  }
+  .preview-image-area {
+    padding: 12px 12px 8px;
+  }
+}
+
+@media (max-width: 480px) {
+  .header h1 {
+    font-size: 18px;
+  }
+  .sort-select {
+    flex: 1;
+  }
+  .img-action-bar button {
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  .slide-prev-btn { left: 8px; width: 44px; height: 44px; }
+  .slide-next-btn { right: 8px; width: 44px; height: 44px; }
+}
 </style>
