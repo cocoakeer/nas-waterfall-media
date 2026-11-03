@@ -157,6 +157,47 @@ def check_at_least_one_admin(user_list: List[UserItem]):
     if admin_count <= 0:
         raise HTTPException(status_code=400, detail="系统至少保留一名管理员账号，不允许全部取消管理员")
 
+# ========== 缓存统计（缓存任务执行后记录快照，持久化到磁盘） ==========
+_CACHE_STATS_FILE = CONFIG_DIR / "cache_stats.json"
+_cache_stats = {
+    "total": 0,
+    "cached": 0,
+    "uncached": 0,
+    "last_finish_time": None,  # 上次缓存任务完成时间（epoch 秒）
+}
+_cache_stats_lock = threading.Lock()
+
+
+def load_cache_stats():
+    """启动时从磁盘加载上次的统计快照。"""
+    try:
+        if _CACHE_STATS_FILE.exists():
+            data = json.loads(_CACHE_STATS_FILE.read_text(encoding="utf-8"))
+            with _cache_stats_lock:
+                _cache_stats.update(data)
+    except Exception:
+        pass
+
+
+def record_cache_stats(total: int, cached: int):
+    """缓存任务完成后记录统计快照（内存 + 磁盘持久化）。"""
+    snapshot = {
+        "total": total,
+        "cached": cached,
+        "uncached": total - cached,
+        "last_finish_time": time.time(),
+    }
+    with _cache_stats_lock:
+        _cache_stats.update(snapshot)
+    try:
+        _CACHE_STATS_FILE.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+load_cache_stats()  # 启动时加载上次快照
+
+
 # ========== 预生成缓存任务（后台线程） ==========
 class CacheTask:
     def __init__(self, media_root: str):
@@ -216,7 +257,9 @@ class CacheTask:
 
     def _build(self):
         base = Path(self._media_root).resolve()
-        # 1. 收集需要处理的媒体文件（增量：跳过缓存已是最新的文件）
+        # 1. 遍历收集：统计全部媒体文件 + 需要处理的（增量跳过新鲜的）
+        all_total = 0
+        cached_count = 0
         files = []
         for root, _dirs, names in os.walk(base):
             if self._stop.is_set():
@@ -229,28 +272,36 @@ class CacheTask:
                     rel = full.relative_to(base)
                 except ValueError:
                     continue
+                all_total += 1
                 # 增量判断：缓存存在且不旧于源文件则跳过
                 if is_cache_fresh(full, get_thumb_cache_path(str(rel))):
+                    cached_count += 1
                     continue
                 files.append((full, str(rel)))
         total = len(files)
         self._set(total=total)
         if total == 0:
             self._set(percent=100, message="缓存已是最新，无增量文件")
+            record_cache_stats(all_total, cached_count)
             return
         # 2. 逐个生成缩略图/封面
         processed = 0
+        failed = 0
         for full, rel in files:
             if self._stop.is_set():
                 self._set(message="已取消", percent=int(processed * 100 / total))
+                record_cache_stats(all_total, cached_count + (processed - failed))
                 return
-            ensure_thumb(full, rel)
+            result = ensure_thumb(full, rel)
+            if result is None:
+                failed += 1
             # 视频顺便探测并缓存时长，供列表接口直接读取
             if full.suffix.lower() in VIDEO_EXT:
                 get_video_duration(str(full), fetch=True)
             processed += 1
             self._set(processed=processed, percent=int(processed * 100 / total), current=rel)
         self._set(percent=100, message="全部完成")
+        record_cache_stats(all_total, cached_count + (processed - failed))
 
 
 # ========== 缓存任务实例 ==========
@@ -551,6 +602,20 @@ def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
             return FileResponse(cache_path)
     # 生成失败或未知类型，回退原图
     return FileResponse(fp)
+
+# ========== 缓存统计接口 ==========
+@app.get("/api/cache-stats")
+def cache_stats(user: UserItem = Depends(get_current_user)):
+    with _cache_stats_lock:
+        stats = dict(_cache_stats)
+    return {
+        "code": 0,
+        "total": stats["total"],
+        "cached": stats["cached"],
+        "uncached": stats["uncached"],
+        "last_finish_time": stats["last_finish_time"],
+    }
+
 
 # ========== 缓存任务接口 ==========
 @app.get("/api/cache-status")

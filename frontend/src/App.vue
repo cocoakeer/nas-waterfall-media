@@ -33,7 +33,11 @@
           </div>
           <div v-if="showUserDrop" class="user-dropdown">
             <div v-if="cacheRunning" class="drop-item cache-status-item">缓存处理中 {{cachePercent}}%</div>
-            <div v-else class="drop-item" @click="runCacheTask">预生成缓存</div>
+            <div v-else class="drop-item cache-run-item" @click="runCacheTask">
+              <span>预生成缓存</span>
+              <span class="cache-sub">未缓存 {{ cacheStats.uncached }}/{{ cacheStats.total }}</span>
+            </div>
+            <div v-if="cacheStats.last_finish_time" class="drop-item cache-finish-time">上次完成 {{ formatDateTime(cacheStats.last_finish_time) }}</div>
             <div v-if="cacheRunning" class="drop-item" @click="stopCacheTask">取消缓存任务</div>
             <div class="drop-item drop-divider"></div>
             <div class="drop-item" @click="openChangePwdModal">修改密码</div>
@@ -354,6 +358,12 @@ function formatDate(ts) {
   const p = (n) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
+function formatDateTime(ts) {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
 function formatDuration(sec) {
   if (sec == null) return ''
   const s = Math.round(sec)
@@ -400,6 +410,8 @@ const currentSlide = ref({})
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
 let statusPollTimer = null
+// 缓存统计：total 全部 / cached 已缓存 / uncached 未缓存 / last_finish_time 上次完成时间
+const cacheStats = ref({ total: 0, cached: 0, uncached: 0, last_finish_time: null })
 
 const STORAGE_KEY = "waterfall_last_dir"
 
@@ -521,6 +533,7 @@ async function pollCacheStatus() {
       clearInterval(statusPollTimer)
       statusPollTimer = null
       cacheRunning.value = false
+      loadCacheStats()
       alert(`✅缓存任务结束！\n${st.message}\n处理文件:${st.processed}/${st.total}`)
     }
   } catch (err) {
@@ -861,8 +874,28 @@ async function checkLoginStatus() {
 }
 
 // ========= 用户头像下拉 =========
+async function loadCacheStats() {
+  try {
+    const res = await fetch(`${baseUrl}/api/cache-stats`)
+    if (!res.ok) return
+    const j = await res.json()
+    if (j.code === 0) {
+      cacheStats.value = {
+        total: j.total,
+        cached: j.cached,
+        uncached: j.uncached,
+        last_finish_time: j.last_finish_time
+      }
+    }
+  } catch (e) {
+    console.error("加载缓存统计失败", e)
+  }
+}
 function toggleUserDrop(){
   showUserDrop.value = !showUserDrop.value
+  if (showUserDrop.value) {
+    loadCacheStats()
+  }
 }
 function openChangePwdModal(){
   showUserDrop.value = false
@@ -1184,6 +1217,24 @@ onUnmounted(() => {
   cursor: default;
 }
 .cache-status-item:hover {
+  background: transparent;
+}
+.cache-run-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.cache-sub {
+  font-size: 12px;
+  color: #888;
+}
+.cache-finish-time {
+  font-size: 12px;
+  color: #777;
+  cursor: default;
+}
+.cache-finish-time:hover {
   background: transparent;
 }
 
