@@ -47,6 +47,10 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
                   <span>修改密码</span>
                 </div>
+                <div v-if="userInfo.is_admin" class="drop-item drop-with-icon" @click="openLogModal">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                  <span>执行日志</span>
+                </div>
                 <div v-if="userInfo.is_admin" class="drop-item drop-with-icon" @click="openUserManageModal">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
                   <span>用户管理</span>
@@ -304,6 +308,25 @@
         </div>
       </div>
     </div>
+    <!-- 执行日志弹窗 -->
+    <div v-if="logModal" class="preview-mask" @click.self="logModal=false">
+      <div class="log-box">
+        <div class="um-header">
+          <h3>执行日志</h3>
+          <button class="um-close-btn" @click="logModal=false">×</button>
+        </div>
+        <div class="log-list">
+          <div v-for="log in logList" :key="log.id" class="log-item">
+            <div class="log-time">{{ formatDateTime(log.time) }}</div>
+            <div class="log-main">
+              <span class="log-operator">{{ log.operator }}</span>
+              <span class="log-detail">{{ log.detail }}</span>
+            </div>
+          </div>
+          <div v-if="!logList.length" class="empty-state">暂无日志</div>
+        </div>
+      </div>
+    </div>
     <!-- 幻灯片全屏渲染层 -->
     <div v-if="slideShow" class="slide-root">
       <div class="slide-content">
@@ -436,6 +459,9 @@ const cachePercent = ref(0)
 let statusPollTimer = null
 // 缓存统计：total 全部 / cached 已缓存 / uncached 未缓存 / failed 失败 / last_finish_time 上次完成时间
 const cacheStats = ref({ total: 0, cached: 0, uncached: 0, failed: 0, last_finish_time: null })
+// 执行日志
+const logModal = ref(false)
+const logList = ref([])
 
 const STORAGE_KEY = "waterfall_last_dir"
 
@@ -927,6 +953,24 @@ function openChangePwdModal(){
   changePwdModal.value = true
   pwdForm.value = {old:"",new:"",confirm:""}
   pwdMsg.value = ""
+}
+// ========= 执行日志 =========
+async function openLogModal(){
+  showUserDrop.value = false
+  logModal.value = true
+  await loadLogs()
+}
+async function loadLogs(){
+  try {
+    const res = await fetch(`${baseUrl}/api/logs?limit=200`)
+    if (!res.ok) return
+    const j = await res.json()
+    if (j.code === 0) {
+      logList.value = j.logs || []
+    }
+  } catch (e) {
+    console.error("加载日志失败", e)
+  }
 }
 async function submitChangePwd(){
   pwdMsg.value = ""
@@ -1705,6 +1749,52 @@ onUnmounted(() => {
   display:flex;
   flex-direction:column;
   overflow:hidden;
+}
+.log-box{
+  background:#181818;
+  border-radius:12px;
+  width:min(560px, 95vw);
+  max-height:80vh;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+}
+.log-list{
+  flex:1;
+  overflow-y:auto;
+  padding:8px 0;
+}
+.log-item{
+  display:flex;
+  align-items:baseline;
+  gap:12px;
+  padding:8px 18px;
+  border-bottom:1px solid #222;
+  font-size:13px;
+}
+.log-item:last-child{
+  border-bottom:none;
+}
+.log-time{
+  flex-shrink:0;
+  color:#777;
+  font-size:12px;
+  min-width:130px;
+}
+.log-main{
+  display:flex;
+  align-items:baseline;
+  gap:8px;
+  min-width:0;
+}
+.log-operator{
+  flex-shrink:0;
+  color:#60a5fa;
+  font-weight:500;
+}
+.log-detail{
+  color:#ddd;
+  word-break:break-all;
 }
 .um-header{
   display:flex;

@@ -120,25 +120,31 @@ async def require_admin(user: UserItem = Depends(get_current_user)):
     return user
 
 # 路径安全校验：防止越权、路径穿越
+# 解析后的允许目录缓存（相同 allow_dirs 配置共享，避免每个请求重复 resolve）
+_allow_dirs_cache: Dict[tuple, tuple] = {}
+
+
+def _resolved_allow_dirs(allow_dirs: List[str]):
+    key = tuple(sorted(allow_dirs))
+    cached = _allow_dirs_cache.get(key)
+    if cached is not None:
+        return cached
+    resolved = tuple((REAL_BASE / ad.lstrip("/")).resolve() for ad in allow_dirs)
+    if len(_allow_dirs_cache) < 100:
+        _allow_dirs_cache[key] = resolved
+    return resolved
+
+
 def check_path_allowed(user: UserItem, target_dir: str) -> Path:
     target_dir = target_dir.strip()
-    user_allowed_real = []
-    for ad in user.allow_dirs:
-        ap = (REAL_BASE / ad.lstrip("/")).resolve()
-        user_allowed_real.append(ap)
-
     req_path = (REAL_BASE / target_dir.lstrip("/")).resolve()
-    ok = False
-    for allow_p in user_allowed_real:
+    for allow_p in _resolved_allow_dirs(user.allow_dirs):
         try:
             req_path.relative_to(allow_p)
-            ok = True
-            break
+            return req_path
         except ValueError:
             continue
-    if not ok:
-        raise HTTPException(status_code=403, detail="无权访问该目录")
-    return req_path
+    raise HTTPException(status_code=403, detail="无权访问该目录")
 
 # 获取media根下全部一级子目录（给前端下拉选择）
 def scan_media_root_dirs() -> List[str]:
@@ -201,6 +207,57 @@ def record_cache_stats(total: int, cached: int, failed: int = 0):
 load_cache_stats()  # 启动时加载上次快照
 
 
+# ========== 执行日志（JSONL 追加存储） ==========
+_LOG_FILE = CONFIG_DIR / "logs.jsonl"
+_log_lock = threading.Lock()
+_LOG_MAX_LINES = 2000  # 最多保留的日志条数
+
+
+def add_log(operator: str, action: str, detail: str = ""):
+    """追加一条执行日志：操作员 / 事件 / 时间 / 详情。"""
+    entry = {
+        "id": uuid.uuid4().hex[:8],
+        "time": time.time(),
+        "operator": operator,
+        "action": action,
+        "detail": detail,
+    }
+    with _log_lock:
+        try:
+            with open(_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    # 裁剪：超过上限时截断保留最近 N 条
+    try:
+        with open(_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) > _LOG_MAX_LINES:
+            with open(_LOG_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines[-_LOG_MAX_LINES:])
+    except Exception:
+        pass
+
+
+def read_logs(limit: int = 200) -> List[dict]:
+    """读取最近 limit 条日志（最新在前）。"""
+    if not _LOG_FILE.exists():
+        return []
+    try:
+        lines = _LOG_FILE.read_text(encoding="utf-8").strip().splitlines()
+        entries = []
+        for line in lines[-limit:]:
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+        entries.reverse()
+        return entries
+    except Exception:
+        return []
+
+
+
 # ========== 预生成缓存任务（后台线程） ==========
 class CacheTask:
     def __init__(self, media_root: str):
@@ -216,6 +273,7 @@ class CacheTask:
         self.failed = 0  # 本次生成失败的数量
         self.total = 0
         self.current = ""
+        self.operator = "system"  # 触发者（system=定时任务，否则为用户名）
 
     def snapshot(self):
         with self._lock:
@@ -235,14 +293,17 @@ class CacheTask:
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
-    def start(self) -> bool:
+    def start(self, operator: str = "system") -> bool:
         with self._lock:
             if self.running:
                 return False
             self.running = True
+            self.operator = operator
             self.percent = 0
             self.message = ""
             self.processed = 0
+            self.succeeded = 0
+            self.failed = 0
             self.total = 0
             self.current = ""
             self._stop.clear()
@@ -290,6 +351,7 @@ class CacheTask:
         if total == 0:
             self._set(percent=100, message="缓存已是最新，无增量文件", failed=0)
             record_cache_stats(all_total, cached_count, failed=0)
+            add_log(self.operator, "cache_result", "缓存已是最新，无增量文件")
             return
         # 2. 逐个生成缩略图/封面
         processed = 0
@@ -297,11 +359,11 @@ class CacheTask:
         for full, rel in files:
             if self._stop.is_set():
                 succeeded = processed - failed
-                msg = f"已取消，本次实际缓存 {succeeded} 个文件"
-                if failed:
-                    msg += f"，失败 {failed} 个"
+                uncached = all_total - cached_count - succeeded
+                msg = f"已取消，本次实际缓存 {succeeded} 个，失败 {failed} 个，剩余未缓存 {uncached} 个"
                 self._set(message=msg, percent=int(processed * 100 / total), succeeded=succeeded, failed=failed)
                 record_cache_stats(all_total, cached_count + succeeded, failed=failed)
+                add_log(self.operator, "cache_result", msg)
                 return
             result = ensure_thumb(full, rel)
             if result is None:
@@ -312,11 +374,11 @@ class CacheTask:
             processed += 1
             self._set(processed=processed, percent=int(processed * 100 / total), current=rel)
         succeeded = processed - failed
-        msg = f"本次实际缓存 {succeeded} 个文件"
-        if failed:
-            msg += f"，失败 {failed} 个"
+        uncached = all_total - cached_count - succeeded
+        msg = f"本次实际缓存 {succeeded} 个，失败 {failed} 个，剩余未缓存 {uncached} 个"
         self._set(percent=100, message=msg, succeeded=succeeded, failed=failed)
         record_cache_stats(all_total, cached_count + succeeded, failed=failed)
+        add_log(self.operator, "cache_result", msg)
 
 
 # ========== 缓存任务实例 ==========
@@ -326,12 +388,14 @@ cache_task = CacheTask(MEDIA_ROOT)
 # ========== 每日缓存任务 ==========
 def daily_cache_job():
     """每天凌晨 3 点：清理孤儿缓存 + 增量生成缓存。"""
+    cleaned = 0
     try:
         cleaned = cleanup_orphan_thumbs(REAL_BASE)
         print(f"[CACHE-JOB] 清理孤儿缓存 {cleaned} 个")
     except Exception as exc:
         print(f"[CACHE-JOB] 清理孤儿缓存失败：{exc}")
-    if cache_task.start():
+    add_log("system", "cache_daily", f"定时任务执行：清理孤儿缓存 {cleaned} 个")
+    if cache_task.start(operator="system"):
         print("[CACHE-JOB] 增量生成已启动")
     else:
         print("[CACHE-JOB] 已有任务在运行，跳过本次增量")
@@ -363,6 +427,7 @@ async def login(form: LoginForm, resp: Response):
     sid = str(uuid.uuid4())
     sessions[sid] = user.username
     resp.set_cookie(key="session_id", value=sid, max_age=SESSION_EXPIRE_SEC, httponly=True)
+    add_log(user.username, "login", "登录系统")
     return {"code": 0, "msg": "ok"}
 
 @app.post("/api/logout")
@@ -371,6 +436,7 @@ async def logout(resp: Response, user: UserItem = Depends(get_current_user)):
     for k in to_del:
         del sessions[k]
     resp.delete_cookie("session_id")
+    add_log(user.username, "logout", "退出登录")
     return {"code":0}
 
 @app.get("/api/whoami")
@@ -395,6 +461,7 @@ async def api_change_my_pwd(form: ChangePwdForm, user: UserItem = Depends(get_cu
     new_hash = bcrypt.hashpw(form.new_password.encode(), bcrypt.gensalt()).decode()
     u.password_hash = new_hash
     save_users(users)
+    add_log(user.username, "change_password", "修改本人密码")
     return {"code":0, "msg":"密码修改成功"}
 
 ## 管理员获取全部用户
@@ -437,6 +504,7 @@ async def admin_rename_user(form: UserRenameForm, _admin: UserItem = Depends(req
             sessions[sid] = new
     u_target.username = new
     save_users(users)
+    add_log(_admin.username, "user_rename", f"重命名用户 {old} → {new}")
     return {"code":0, "msg":"用户名修改成功"}
 
 ## 管理员新增/编辑用户（支持设置is_admin管理员标记）
@@ -464,6 +532,7 @@ async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(requir
     # 校验：至少保留一个管理员账号
     check_at_least_one_admin(users)
     save_users(users)
+    add_log(_admin.username, "user_save", f"{'编辑' if exist is not None else '新增'}用户 {form.username}")
     return {"code":0,"msg":"保存成功"}
 
 ## 管理员删除用户【修复：global放到函数第一行】
@@ -482,6 +551,7 @@ async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin
     for k in to_del:
         del sessions[k]
     save_users(users)
+    add_log(_admin.username, "user_delete", f"删除用户 {username}")
     return {"code":0,"msg":"已删除"}
 
 # ========== 媒体列表接口 ==========
@@ -632,6 +702,13 @@ def cache_stats(user: UserItem = Depends(get_current_user)):
     }
 
 
+# ========== 执行日志接口 ==========
+@app.get("/api/logs")
+def api_logs(limit: int = 200, _admin: UserItem = Depends(require_admin)):
+    limit = max(1, min(limit, 1000))
+    return {"code": 0, "logs": read_logs(limit)}
+
+
 # ========== 缓存任务接口 ==========
 @app.get("/api/cache-status")
 async def cache_status(user: UserItem = Depends(get_current_user)):
@@ -639,13 +716,15 @@ async def cache_status(user: UserItem = Depends(get_current_user)):
 
 @app.get("/api/cache-run")
 async def cache_run(user: UserItem = Depends(get_current_user)):
-    if cache_task.start():
+    if cache_task.start(operator=user.username):
+        add_log(user.username, "cache_run", "手动触发预生成缓存")
         return {"code": 0, "msg": "任务已启动"}
     return {"code": 1, "msg": "已有任务在运行"}
 
 @app.get("/api/cache-stop")
 async def cache_stop(user: UserItem = Depends(get_current_user)):
     cache_task.stop()
+    add_log(user.username, "cache_stop", "取消缓存任务")
     return {"code": 0, "msg": "停止指令已发送"}
 
 # ========== 设置持久化接口 ==========
