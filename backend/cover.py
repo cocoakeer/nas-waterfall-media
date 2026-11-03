@@ -20,6 +20,7 @@ THUMB_MAX_HEIGHT = 4000
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi"}
+MEDIA_EXTS = IMAGE_EXT | VIDEO_EXT  # 预计算并集，避免循环内重复构造
 
 
 def is_cover_file(name: str) -> bool:
@@ -64,8 +65,6 @@ def generate_image_thumb(src_full: Path, dest_full: Path) -> bool:
 
 def generate_video_cover(video_full: Path, dest_full: Path) -> bool:
     """ffmpeg 抽取首帧作为视频封面，成功返回 True。"""
-    if dest_full.exists():
-        return True
     dest_full.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg",
@@ -122,7 +121,7 @@ def _original_exists(stem_path: Path) -> bool:
     """判断 stem 对应的原文件（任意图片/视频扩展名）是否存在。"""
     parent = stem_path.parent
     stem = stem_path.name
-    for ext in IMAGE_EXT | VIDEO_EXT:
+    for ext in MEDIA_EXTS:
         if (parent / (stem + ext)).exists():
             return True
     return False

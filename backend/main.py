@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import threading
@@ -16,6 +16,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from .cover import (
     IMAGE_EXT,
     VIDEO_EXT,
+    MEDIA_EXTS,
     is_cover_file,
     ensure_thumb,
     get_thumb_cache_path,
@@ -163,6 +164,7 @@ _cache_stats = {
     "total": 0,
     "cached": 0,
     "uncached": 0,
+    "failed": 0,
     "last_finish_time": None,  # 上次缓存任务完成时间（epoch 秒）
 }
 _cache_stats_lock = threading.Lock()
@@ -179,12 +181,13 @@ def load_cache_stats():
         pass
 
 
-def record_cache_stats(total: int, cached: int):
+def record_cache_stats(total: int, cached: int, failed: int = 0):
     """缓存任务完成后记录统计快照（内存 + 磁盘持久化）。"""
     snapshot = {
         "total": total,
         "cached": cached,
         "uncached": total - cached,
+        "failed": failed,
         "last_finish_time": time.time(),
     }
     with _cache_stats_lock:
@@ -209,6 +212,8 @@ class CacheTask:
         self.percent = 0
         self.message = ""
         self.processed = 0
+        self.succeeded = 0  # 本次实际成功生成的缓存数
+        self.failed = 0  # 本次生成失败的数量
         self.total = 0
         self.current = ""
 
@@ -219,6 +224,8 @@ class CacheTask:
                 "percent": self.percent,
                 "message": self.message,
                 "processed": self.processed,
+                "succeeded": self.succeeded,
+                "failed": self.failed,
                 "total": self.total,
                 "current": self.current,
             }
@@ -265,7 +272,7 @@ class CacheTask:
             if self._stop.is_set():
                 break
             for name in names:
-                if Path(name).suffix.lower() not in (IMAGE_EXT | VIDEO_EXT):
+                if Path(name).suffix.lower() not in MEDIA_EXTS:
                     continue
                 full = Path(root) / name
                 try:
@@ -281,16 +288,20 @@ class CacheTask:
         total = len(files)
         self._set(total=total)
         if total == 0:
-            self._set(percent=100, message="缓存已是最新，无增量文件")
-            record_cache_stats(all_total, cached_count)
+            self._set(percent=100, message="缓存已是最新，无增量文件", failed=0)
+            record_cache_stats(all_total, cached_count, failed=0)
             return
         # 2. 逐个生成缩略图/封面
         processed = 0
         failed = 0
         for full, rel in files:
             if self._stop.is_set():
-                self._set(message="已取消", percent=int(processed * 100 / total))
-                record_cache_stats(all_total, cached_count + (processed - failed))
+                succeeded = processed - failed
+                msg = f"已取消，本次实际缓存 {succeeded} 个文件"
+                if failed:
+                    msg += f"，失败 {failed} 个"
+                self._set(message=msg, percent=int(processed * 100 / total), succeeded=succeeded, failed=failed)
+                record_cache_stats(all_total, cached_count + succeeded, failed=failed)
                 return
             result = ensure_thumb(full, rel)
             if result is None:
@@ -300,8 +311,12 @@ class CacheTask:
                 get_video_duration(str(full), fetch=True)
             processed += 1
             self._set(processed=processed, percent=int(processed * 100 / total), current=rel)
-        self._set(percent=100, message="全部完成")
-        record_cache_stats(all_total, cached_count + (processed - failed))
+        succeeded = processed - failed
+        msg = f"本次实际缓存 {succeeded} 个文件"
+        if failed:
+            msg += f"，失败 {failed} 个"
+        self._set(percent=100, message=msg, succeeded=succeeded, failed=failed)
+        record_cache_stats(all_total, cached_count + succeeded, failed=failed)
 
 
 # ========== 缓存任务实例 ==========
@@ -511,7 +526,7 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
                         continue
                     lower_name = entry.name.lower()
                     ext = os.path.splitext(lower_name)[1]
-                    if ext not in IMAGE_EXT and ext not in VIDEO_EXT:
+                    if ext not in MEDIA_EXTS:
                         continue
                     if is_cover_file(entry.name):
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
@@ -524,8 +539,7 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
             count = 0
             for _root, _dirs, names in os.walk(folder_abs):
                 for name in names:
-                    ext = os.path.splitext(name)[1].lower()
-                    if ext in IMAGE_EXT or ext in VIDEO_EXT:
+                    if os.path.splitext(name)[1].lower() in MEDIA_EXTS:
                         count += 1
             return cover, count
         except Exception:
@@ -595,7 +609,7 @@ def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
     if not fp.exists() or not fp.is_file():
         raise HTTPException(404)
     suf = fp.suffix.lower()
-    if suf in IMAGE_EXT or suf in VIDEO_EXT:
+    if suf in MEDIA_EXTS:
         rel = str(fp.relative_to(REAL_BASE)).replace(os.sep, "/")
         cache_path = ensure_thumb(fp, rel)
         if cache_path is not None and cache_path.exists():
@@ -613,6 +627,7 @@ def cache_stats(user: UserItem = Depends(get_current_user)):
         "total": stats["total"],
         "cached": stats["cached"],
         "uncached": stats["uncached"],
+        "failed": stats.get("failed", 0),
         "last_finish_time": stats["last_finish_time"],
     }
 

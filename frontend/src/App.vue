@@ -38,6 +38,7 @@
               <span class="cache-sub">未缓存 {{ cacheStats.uncached }}/{{ cacheStats.total }}</span>
             </div>
             <div v-if="cacheStats.last_finish_time" class="drop-item cache-finish-time">上次完成 {{ formatDateTime(cacheStats.last_finish_time) }}</div>
+            <div v-if="cacheStats.last_finish_time && cacheStats.failed > 0" class="drop-item cache-finish-time">失败 {{ cacheStats.failed }} 个</div>
             <div v-if="cacheRunning" class="drop-item" @click="stopCacheTask">取消缓存任务</div>
             <div class="drop-item drop-divider"></div>
             <div class="drop-item" @click="openChangePwdModal">修改密码</div>
@@ -410,8 +411,8 @@ const currentSlide = ref({})
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
 let statusPollTimer = null
-// 缓存统计：total 全部 / cached 已缓存 / uncached 未缓存 / last_finish_time 上次完成时间
-const cacheStats = ref({ total: 0, cached: 0, uncached: 0, last_finish_time: null })
+// 缓存统计：total 全部 / cached 已缓存 / uncached 未缓存 / failed 失败 / last_finish_time 上次完成时间
+const cacheStats = ref({ total: 0, cached: 0, uncached: 0, failed: 0, last_finish_time: null })
 
 const STORAGE_KEY = "waterfall_last_dir"
 
@@ -534,7 +535,7 @@ async function pollCacheStatus() {
       statusPollTimer = null
       cacheRunning.value = false
       loadCacheStats()
-      alert(`✅缓存任务结束！\n${st.message}\n处理文件:${st.processed}/${st.total}`)
+      alert(`✅缓存任务结束！\n${st.message}`)
     }
   } catch (err) {
     console.error("查询任务状态失败", err)
@@ -614,7 +615,7 @@ function checkAuthResp(r) {
   }
 }
 
-let isLoading = ref(false)
+const isLoading = ref(false)
 async function loadMedia(dir = '', pushHistory = false) {
   if(isLoading.value) return
   isLoading.value = true
@@ -884,6 +885,7 @@ async function loadCacheStats() {
         total: j.total,
         cached: j.cached,
         uncached: j.uncached,
+        failed: j.failed || 0,
         last_finish_time: j.last_finish_time
       }
     }
