@@ -67,7 +67,8 @@
 
     <!-- JS横向优先瀑布流容器 MacBook优选270px -->
     <div ref="waterfallBoxRef" class="waterfall-wrap">
-      <div v-if="!displayList.length" class="empty-state">
+      <div v-if="isLoading" class="empty-state">加载中...</div>
+      <div v-else-if="!displayList.length" class="empty-state">
         <template v-if="searchQuery">没有匹配「{{ searchQuery }}」的文件</template>
         <template v-else>当前目录为空</template>
       </div>
