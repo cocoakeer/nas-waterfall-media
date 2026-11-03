@@ -164,7 +164,9 @@
         <button class="close-btn" @click="closePreview">×</button>
         <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
         <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
-        <div class="preview-image-area">
+        <div class="preview-image-area"
+             @touchstart="onTouchStart"
+             @touchend="onTouchEnd">
           <img
             v-if="previewItem.type === 'image'"
             :src="getSrcUrl(previewItem.path)"
@@ -329,7 +331,9 @@
     </div>
     <!-- 幻灯片全屏渲染层 -->
     <div v-if="slideShow" class="slide-root">
-      <div class="slide-content">
+      <div class="slide-content"
+           @touchstart="onTouchStart"
+           @touchend="onTouchEnd">
         <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
         <video v-else controls :src="getSrcUrl(currentSlide.path)"></video>
         <div class="slide-name">{{ currentSlide.name }}</div>
@@ -721,6 +725,34 @@ function nextMedia() {
     previewItem.value = previewMediaList[previewCurrentIndex]
     imgRotateDeg.value = 0
     imgRotateStyle.value.transform = 'rotate(0deg)'
+  }
+}
+
+// ========= 移动端滑动切换图片 =========
+let touchStartX = 0
+let touchStartY = 0
+
+function onTouchStart(e) {
+  if (e.touches.length === 1) {
+    touchStartX = e.touches[0].clientX
+    touchStartY = e.touches[0].clientY
+  }
+}
+function onTouchEnd(e) {
+  if (e.changedTouches.length !== 1) return
+  const dx = e.changedTouches[0].clientX - touchStartX
+  const dy = e.changedTouches[0].clientY - touchStartY
+  // 水平滑动为主，且位移超过阈值
+  if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
+    if (slideShow.value) {
+      // 幻灯片：仅图片滑动，视频保留进度条拖动
+      if (currentSlide.value.type === 'image') {
+        dx < 0 ? slideNext() : slidePrev()
+      }
+    } else if (previewItem.value && previewItem.value.type === 'image') {
+      // 预览弹窗：仅图片滑动
+      dx < 0 ? nextMedia() : prevMedia()
+    }
   }
 }
 
@@ -1177,6 +1209,7 @@ onUnmounted(() => {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
 }
 /* 初始化加载遮罩，修复刷新闪现登录页 */
 .init-loading-mask{
@@ -2023,6 +2056,20 @@ onUnmounted(() => {
   .preview-image-area {
     padding: 12px 12px 8px;
   }
+  .arrow-btn {
+    width: 38px;
+    height: 38px;
+    font-size: 20px;
+  }
+  .arrow-left { left: 6px; }
+  .arrow-right { right: 6px; }
+  .img-action-bar {
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .preview-name {
+    font-size: 13px;
+  }
 }
 
 @media (max-width: 480px) {
@@ -2038,5 +2085,21 @@ onUnmounted(() => {
   }
   .slide-prev-btn { left: 8px; width: 44px; height: 44px; }
   .slide-next-btn { right: 8px; width: 44px; height: 44px; }
+  .preview-mask {
+    padding: 0;
+  }
+  .preview-box {
+    width: 100vw;
+    height: 100vh;
+    max-width: 100vw;
+    max-height: 100vh;
+  }
+  .close-btn {
+    top: 8px;
+    right: 8px;
+    width: 30px;
+    height: 30px;
+    font-size: 18px;
+  }
 }
 </style>
