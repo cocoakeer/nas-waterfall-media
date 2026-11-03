@@ -24,20 +24,8 @@
   </div>
   <div v-else class="app-container">
     <header class="header">
-      <h1>NAS 媒体瀑布流</h1>
-      <div class="header-actions">
-        <div class="search-box">
-          <input v-model="searchQuery" type="text" placeholder="搜索文件名" />
-          <span v-if="searchQuery" class="search-clear" @click="searchQuery=''">×</span>
-        </div>
-        <select v-model="sortBy" class="sort-select">
-          <option value="name">按名称</option>
-          <option value="time">按时间</option>
-          <option value="size">按大小</option>
-        </select>
-        <button @click="openSlideSetting" class="btn">幻灯片设置</button>
-        <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
-        <!-- 用户头像下拉菜单 -->
+      <div class="header-left">
+        <h1>NAS 媒体瀑布流</h1>
         <div class="user-dropdown-wrap">
           <div class="avatar-btn" @click="toggleUserDrop">
             <span class="avatar-icon">👤</span>
@@ -54,6 +42,19 @@
             <div class="drop-item" @click="doLogout">退出登录</div>
           </div>
         </div>
+      </div>
+      <div class="header-actions">
+        <div class="search-box">
+          <input v-model="searchQuery" type="text" placeholder="搜索文件名" />
+          <span v-if="searchQuery" class="search-clear" @click="searchQuery=''">×</span>
+        </div>
+        <select v-model="sortBy" class="sort-select">
+          <option value="name">按名称</option>
+          <option value="time">按时间</option>
+          <option value="size">按大小</option>
+        </select>
+        <button @click="openSlideSetting" class="btn">幻灯片设置</button>
+        <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
       </div>
     </header>
     <div class="breadcrumb">
@@ -1199,6 +1200,13 @@ onUnmounted(() => {
   margin-bottom: 16px;
   flex-wrap: wrap;
   gap: 12px;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
 }
 
 .header h1 {
