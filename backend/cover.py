@@ -4,6 +4,7 @@
 视频：ffmpeg 截取首帧，等比缩放，存为 JPEG。
 所有缓存写入 CACHE_PATH/thumbs/ 下，保持原目录结构，按源文件 mtime 判断是否过期。
 """
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -118,12 +119,23 @@ def ensure_thumb(src_full: Path, rel_path: str):
 
 
 def _original_exists(stem_path: Path) -> bool:
-    """判断 stem 对应的原文件（任意图片/视频扩展名）是否存在。"""
+    """判断 stem 对应的原文件是否存在（文件名与扩展名大小写均不敏感）。
+
+    用 scandir 列出目录后按 stem 匹配，避免 Linux 大小写敏感文件系统下
+    大写扩展名（如 .JPG）的原图被误判为「已删除」。
+    """
     parent = stem_path.parent
-    stem = stem_path.name
-    for ext in MEDIA_EXTS:
-        if (parent / (stem + ext)).exists():
-            return True
+    stem_lower = stem_path.name.lower()
+    try:
+        with os.scandir(parent) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if Path(name).stem.lower() == stem_lower and Path(name).suffix.lower() in MEDIA_EXTS:
+                    return True
+    except OSError:
+        pass
     return False
 
 

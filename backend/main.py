@@ -335,6 +335,8 @@ class CacheTask:
             for name in names:
                 if Path(name).suffix.lower() not in MEDIA_EXTS:
                     continue
+                if is_cover_file(name):
+                    continue  # cover 文件不预生成缓存、不参与统计与失败计数
                 full = Path(root) / name
                 try:
                     rel = full.relative_to(base)
@@ -605,11 +607,11 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
                         first_img = "/" + rel
             cover = cover_candidate if cover_candidate is not None else first_img
-            # 递归统计该文件夹下（含所有子文件夹）的图片+视频总数
+            # 递归统计该文件夹下（含所有子文件夹）的图片+视频总数（不含 cover）
             count = 0
             for _root, _dirs, names in os.walk(folder_abs):
                 for name in names:
-                    if os.path.splitext(name)[1].lower() in MEDIA_EXTS:
+                    if os.path.splitext(name)[1].lower() in MEDIA_EXTS and not is_cover_file(name):
                         count += 1
             return cover, count
         except Exception:
