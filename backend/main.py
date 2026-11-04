@@ -327,6 +327,12 @@ class CacheTask:
 
     def _build(self):
         base = Path(self._media_root).resolve()
+        # 0. 清理孤儿缓存（原图已删除的缩略图），手动/定时任务都会执行
+        cleaned = 0
+        try:
+            cleaned = cleanup_orphan_thumbs(base)
+        except Exception:
+            pass
         # 1. 遍历收集：统计全部媒体文件 + 需要处理的（增量跳过新鲜的）
         all_total = 0
         cached_count = 0
@@ -353,9 +359,12 @@ class CacheTask:
         total = len(files)
         self._set(total=total)
         if total == 0:
-            self._set(percent=100, message="缓存已是最新，无增量文件", failed=0)
+            m = "缓存已是最新，无增量文件"
+            if cleaned:
+                m += f"，清理孤儿缓存 {cleaned} 个"
+            self._set(percent=100, message=m, failed=0)
             record_cache_stats(all_total, cached_count, failed=0)
-            add_log(self.operator, "cache_result", "缓存已是最新，无增量文件")
+            add_log(self.operator, "cache_result", m)
             return
         # 2. 逐个生成缩略图/封面
         processed = 0
@@ -366,6 +375,8 @@ class CacheTask:
                 succeeded = processed - failed
                 uncached = all_total - cached_count - succeeded
                 msg = f"已取消，本次实际缓存 {succeeded} 个，失败 {failed} 个，剩余未缓存 {uncached} 个"
+                if cleaned:
+                    msg += f"，清理孤儿缓存 {cleaned} 个"
                 self._set(message=msg, percent=int(processed * 100 / total), succeeded=succeeded, failed=failed)
                 record_cache_stats(all_total, cached_count + succeeded, failed=failed, failed_files=failed_files)
                 add_log(self.operator, "cache_result", msg)
@@ -383,6 +394,8 @@ class CacheTask:
         succeeded = processed - failed
         uncached = all_total - cached_count - succeeded
         msg = f"本次实际缓存 {succeeded} 个，失败 {failed} 个，剩余未缓存 {uncached} 个"
+        if cleaned:
+            msg += f"，清理孤儿缓存 {cleaned} 个"
         self._set(percent=100, message=msg, succeeded=succeeded, failed=failed)
         record_cache_stats(all_total, cached_count + succeeded, failed=failed, failed_files=failed_files)
         add_log(self.operator, "cache_result", msg)
@@ -394,18 +407,12 @@ cache_task = CacheTask(MEDIA_ROOT)
 
 # ========== 每日缓存任务 ==========
 def daily_cache_job():
-    """每天凌晨 3 点：清理孤儿缓存 + 增量生成缓存。"""
-    cleaned = 0
-    try:
-        cleaned = cleanup_orphan_thumbs(REAL_BASE)
-        print(f"[CACHE-JOB] 清理孤儿缓存 {cleaned} 个")
-    except Exception as exc:
-        print(f"[CACHE-JOB] 清理孤儿缓存失败：{exc}")
-    add_log("system", "cache_daily", f"定时任务执行：清理孤儿缓存 {cleaned} 个")
+    """每天凌晨 3 点：触发缓存任务（内部会清理孤儿缓存 + 增量生成）。"""
     if cache_task.start(operator="system"):
-        print("[CACHE-JOB] 增量生成已启动")
+        add_log("system", "cache_daily", "定时任务触发缓存任务")
+        print("[CACHE-JOB] 缓存任务已启动")
     else:
-        print("[CACHE-JOB] 已有任务在运行，跳过本次增量")
+        print("[CACHE-JOB] 已有任务在运行，跳过")
 
 
 # ========== APP初始化 ==========
