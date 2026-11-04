@@ -29,8 +29,8 @@ from .config import load_settings, save_settings
 # ========== 配置读取 适配compose CONFIG_PATH / CACHE_PATH ==========
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
 REAL_BASE = Path(MEDIA_ROOT).resolve()  # 预计算，避免每个请求重复 resolve
-CONFIG_DIR = Path(os.getenv("CONFIG_PATH", "/app/config"))
-CACHE_DIR = Path(os.getenv("CACHE_PATH", "/app/cache"))
+CONFIG_DIR = Path(os.getenv("CONFIG_PATH", "/config"))
+CACHE_DIR = Path(os.getenv("CACHE_PATH", "/cache"))
 # 创建目录并设置权限，打印路径用于排错
 CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o775)
 CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o775)
@@ -578,13 +578,13 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
 
     # 目录缓存：目录 mtime 未变则复用上次结果，避免重复遍历
     try:
-        mtime = work_path.stat().st_mtime
+        dir_mtime = work_path.stat().st_mtime
     except OSError:
-        mtime = 0
+        dir_mtime = 0
     key = str(work_path)
     with _dir_cache_lock:
         cached = _dir_cache.get(key)
-    if cached is not None and cached[0] == mtime and (time.time() - cached[1]) < _DIR_CACHE_TTL:
+    if cached is not None and cached[0] == dir_mtime and (time.time() - cached[1]) < _DIR_CACHE_TTL:
         return {"list": cached[2], "breadcrumb": breadcrumb}
 
     def get_folder_info(folder_abs: Path):
@@ -631,10 +631,10 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
         try:
             st = entry.stat()
             size = st.st_size
-            mtime = st.st_mtime
+            entry_mtime = st.st_mtime
         except OSError:
             size = None
-            mtime = None
+            entry_mtime = None
         if entry.is_dir():
             cover, count = get_folder_info(entry)
             items.append({
@@ -644,7 +644,7 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
                 "path": rel_str,
                 "cover_path": cover,
                 "count": count,
-                "mtime": mtime,
+                "mtime": entry_mtime,
             })
         else:
             suf = entry.suffix.lower()
@@ -663,14 +663,14 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
     with _dir_cache_lock:
         if len(_dir_cache) >= _DIR_CACHE_MAX:
             _dir_cache.clear()
-        _dir_cache[key] = (mtime, time.time(), items)
+        _dir_cache[key] = (dir_mtime, time.time(), items)
     return {"list": items, "breadcrumb": breadcrumb}
 
 # ========== 原图接口 ==========
 @app.get("/api/src")
 def api_src(path: str, user: UserItem = Depends(get_current_user)):
     fp = check_path_allowed(user, path)
-    if not fp.exists():
+    if not fp.exists() or not fp.is_file():
         raise HTTPException(404)
     return FileResponse(fp)
 

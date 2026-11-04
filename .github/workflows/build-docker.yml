@@ -28,4 +28,4 @@ jobs:
         with:
           name: nas-waterfall-media-image
           path: /tmp/nas-waterfall-media.tar
-          retention-days: 7
+          retention-days: 1

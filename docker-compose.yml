@@ -1,12 +1,24 @@
-version: '3.8'
 services:
-  media-waterfall:
-    build: .
+  nas-waterfall-media:
+    image: nas-waterfall-media:latest
     container_name: nas-waterfall-media
-    ports:
-      - "8000:8000"
+    restart: always
+    network_mode: host
+    #ports:
+      # 宿主机8000访问，容器内部8000
+      #- "8000:8000"
+    environment:
+      MEDIA_ROOT: /media
+      CONFIG_PATH: /config
+      CACHE_PATH: /cache
+      SLIDE_DEFAULT_DELAY: 3
     volumes:
-      - /Volumes/你的NAS共享目录:/media
-      - ./cache:/app/cache
-      - ./config:/app/config
-    restart: unless-stopped
+      # ========= 修改这里为你NAS真实媒体目录路径 =========
+      - ./media:/media:ro
+      # 配置持久化，和compose.yml同级生成config文件夹
+      - ./config:/config
+      # 缩略图缓存持久化，体积会变大，可随时清空
+      - ./cache:/cache
+
+    # Mac下uid 1000容易权限报错，有读写报错再启用，正常就注释掉
+    # user: "1000:1000"
