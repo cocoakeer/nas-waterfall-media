@@ -52,7 +52,10 @@ def is_cache_fresh(src_full: Path, cache_full: Path) -> bool:
 def generate_image_thumb(src_full: Path, dest_full: Path) -> tuple:
     """Pillow 生成图片缩略图，返回 (成功与否, 错误信息)。"""
     try:
-        from PIL import Image
+        from PIL import Image, ImageFile
+
+        # 容错：允许加载「截断」的图片（文件尾部缺失），尽量生成缩略图
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
 
         with Image.open(src_full) as img:
             img = img.convert("RGB")  # 统一处理 PNG 透明 / GIF 等
@@ -81,9 +84,9 @@ def generate_video_cover(video_full: Path, dest_full: Path) -> tuple:
         result = subprocess.run(cmd, capture_output=True, timeout=15)
         if dest_full.exists():
             return True, ""
-        # 抽帧失败：取 ffmpeg stderr 前 200 字符作为错误信息
+        # 抽帧失败：错误信息在 stderr 末尾（头部是版本/版权声明），取末尾 300 字符
         err = result.stderr.decode("utf-8", errors="ignore").strip()
-        return False, f"ffmpeg: {err[:200]}"
+        return False, f"ffmpeg: {err[-300:]}"
     except Exception as exc:
         return False, f"ffmpeg: {exc}"
 
