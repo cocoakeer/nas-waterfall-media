@@ -315,7 +315,10 @@
       <div class="log-box">
         <div class="um-header">
           <h3>执行日志</h3>
-          <button class="um-close-btn" @click="logModal=false">×</button>
+          <div class="log-header-actions">
+            <button class="log-clear-btn" @click="clearLogs">清除</button>
+            <button class="um-close-btn" @click="logModal=false">×</button>
+          </div>
         </div>
         <div class="log-list">
           <div v-for="log in logList" :key="log.id" class="log-item">
@@ -1027,6 +1030,22 @@ async function loadLogs(){
     }
   } catch (e) {
     console.error("加载日志失败", e)
+  }
+}
+async function clearLogs(){
+  if (!confirm("确认清除全部执行日志？此操作不可恢复。")) return
+  try {
+    const res = await fetch(`${baseUrl}/api/logs`, { method: 'DELETE' })
+    if (!res.ok) { checkAuthResp(res); return }
+    const ret = await res.json()
+    if (ret.code === 0) {
+      await loadLogs()
+    } else {
+      alert("❌" + (ret.msg || "清除失败"))
+    }
+  } catch (e) {
+    console.error("清除日志失败", e)
+    alert("❌清除失败")
   }
 }
 async function submitChangePwd(){
@@ -1824,6 +1843,24 @@ onUnmounted(() => {
   display:flex;
   flex-direction:column;
   overflow:hidden;
+}
+.log-header-actions{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+.log-clear-btn{
+  background:transparent;
+  border:1px solid #e24b4a;
+  color:#f09595;
+  border-radius:6px;
+  padding:4px 12px;
+  font-size:12px;
+  cursor:pointer;
+  transition:background 0.15s ease;
+}
+.log-clear-btn:hover{
+  background:rgba(226,75,74,0.15);
 }
 .log-list{
   flex:1;

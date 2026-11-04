@@ -14,8 +14,6 @@ from .config import CACHE_PATH
 
 # 缩略图宽度（卡片 270px 的 2 倍，retina 屏足够清晰）
 THUMB_WIDTH = 540
-# 视频抽帧时间点
-VIDEO_FRAME_TIME = "00:00:01"
 # 缩略图最大高度，避免超长图把卡片拉得过高
 THUMB_MAX_HEIGHT = 4000
 
@@ -72,7 +70,6 @@ def generate_video_cover(video_full: Path, dest_full: Path) -> tuple:
     dest_full.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg",
-        "-ss", VIDEO_FRAME_TIME,
         "-i", str(video_full),
         "-vframes", "1",
         "-vf", f"scale={THUMB_WIDTH}:-1",

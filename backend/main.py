@@ -717,6 +717,20 @@ def api_logs(limit: int = 200, _admin: UserItem = Depends(require_admin)):
     return {"code": 0, "logs": read_logs(limit)}
 
 
+@app.delete("/api/logs")
+def api_clear_logs(_admin: UserItem = Depends(require_admin)):
+    """清空全部执行日志（保留一条清空操作记录，便于审计）。"""
+    try:
+        with _log_lock:
+            if _LOG_FILE.exists():
+                _LOG_FILE.write_text("", encoding="utf-8")
+    except Exception:
+        raise HTTPException(500, detail="清除日志失败")
+    # 清空后记录一条操作日志（add_log 内部自加锁，不可在 _log_lock 内调用）
+    add_log(_admin.username, "logs_clear", "清空执行日志")
+    return {"code": 0, "msg": "已清空"}
+
+
 # ========== 缓存任务接口 ==========
 @app.get("/api/cache-status")
 async def cache_status(user: UserItem = Depends(get_current_user)):
