@@ -39,7 +39,7 @@
                   <span>预生成缓存</span>
                   <span class="cache-sub">未缓存 {{ cacheStats.uncached }}/{{ cacheStats.total }}</span>
                 </div>
-                <div v-if="cacheStats.last_finish_time" class="drop-item cache-meta">上次完成 {{ formatDateTime(cacheStats.last_finish_time) }}<template v-if="cacheStats.failed > 0"> · 失败 {{ cacheStats.failed }} 个</template></div>
+                <div v-if="cacheStats.last_finish_time" class="drop-item cache-meta">上次完成 {{ formatDateTime(cacheStats.last_finish_time) }}<template v-if="cacheStats.failed > 0"> · <span class="cache-failed-link" @click="openFailedFilesModal">失败 {{ cacheStats.failed }} 个</span></template></div>
                 <div v-if="cacheRunning" class="drop-item" @click="stopCacheTask">取消缓存任务</div>
               </div>
               <div class="drop-section">
@@ -329,6 +329,21 @@
         </div>
       </div>
     </div>
+    <!-- 缓存失败文件弹窗 -->
+    <div v-if="failedFilesModal" class="preview-mask" @click.self="failedFilesModal=false">
+      <div class="log-box">
+        <div class="um-header">
+          <h3>缓存失败文件（{{ cacheStats.failed_files.length }}）</h3>
+          <button class="um-close-btn" @click="failedFilesModal=false">×</button>
+        </div>
+        <div class="log-list">
+          <div v-for="(f, idx) in cacheStats.failed_files" :key="idx" class="log-item">
+            <span class="log-detail">{{ f }}</span>
+          </div>
+          <div v-if="!cacheStats.failed_files.length" class="empty-state">无失败文件</div>
+        </div>
+      </div>
+    </div>
     <!-- 幻灯片全屏渲染层 -->
     <div v-if="slideShow" class="slide-root">
       <div class="slide-content"
@@ -461,11 +476,13 @@ const currentSlide = ref({})
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
 let statusPollTimer = null
-// 缓存统计：total 全部 / cached 已缓存 / uncached 未缓存 / failed 失败 / last_finish_time 上次完成时间
-const cacheStats = ref({ total: 0, cached: 0, uncached: 0, failed: 0, last_finish_time: null })
+// 缓存统计：total 全部 / cached 已缓存 / uncached 未缓存 / failed 失败 / failed_files 失败文件 / last_finish_time 上次完成时间
+const cacheStats = ref({ total: 0, cached: 0, uncached: 0, failed: 0, failed_files: [], last_finish_time: null })
 // 执行日志
 const logModal = ref(false)
 const logList = ref([])
+// 缓存失败文件弹窗
+const failedFilesModal = ref(false)
 
 const STORAGE_KEY = "waterfall_last_dir"
 
@@ -967,6 +984,7 @@ async function loadCacheStats() {
         cached: j.cached,
         uncached: j.uncached,
         failed: j.failed || 0,
+        failed_files: j.failed_files || [],
         last_finish_time: j.last_finish_time
       }
     }
@@ -991,6 +1009,10 @@ async function openLogModal(){
   showUserDrop.value = false
   logModal.value = true
   await loadLogs()
+}
+function openFailedFilesModal(){
+  showUserDrop.value = false
+  failedFilesModal.value = true
 }
 async function loadLogs(){
   try {
@@ -1382,6 +1404,14 @@ onUnmounted(() => {
 }
 .cache-meta:hover {
   background: transparent;
+}
+.cache-failed-link {
+  color: #f09595;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.cache-failed-link:hover {
+  color: #ffb3b3;
 }
 
 .app-container {

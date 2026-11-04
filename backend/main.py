@@ -171,6 +171,7 @@ _cache_stats = {
     "cached": 0,
     "uncached": 0,
     "failed": 0,
+    "failed_files": [],  # 缓存失败的文件相对路径列表
     "last_finish_time": None,  # 上次缓存任务完成时间（epoch 秒）
 }
 _cache_stats_lock = threading.Lock()
@@ -187,13 +188,14 @@ def load_cache_stats():
         pass
 
 
-def record_cache_stats(total: int, cached: int, failed: int = 0):
+def record_cache_stats(total: int, cached: int, failed: int = 0, failed_files: list = None):
     """缓存任务完成后记录统计快照（内存 + 磁盘持久化）。"""
     snapshot = {
         "total": total,
         "cached": cached,
         "uncached": total - cached,
         "failed": failed,
+        "failed_files": failed_files or [],
         "last_finish_time": time.time(),
     }
     with _cache_stats_lock:
@@ -358,18 +360,20 @@ class CacheTask:
         # 2. 逐个生成缩略图/封面
         processed = 0
         failed = 0
+        failed_files = []  # 记录缓存失败的文件路径
         for full, rel in files:
             if self._stop.is_set():
                 succeeded = processed - failed
                 uncached = all_total - cached_count - succeeded
                 msg = f"已取消，本次实际缓存 {succeeded} 个，失败 {failed} 个，剩余未缓存 {uncached} 个"
                 self._set(message=msg, percent=int(processed * 100 / total), succeeded=succeeded, failed=failed)
-                record_cache_stats(all_total, cached_count + succeeded, failed=failed)
+                record_cache_stats(all_total, cached_count + succeeded, failed=failed, failed_files=failed_files)
                 add_log(self.operator, "cache_result", msg)
                 return
             result = ensure_thumb(full, rel)
             if result is None:
                 failed += 1
+                failed_files.append(str(rel))
             # 视频顺便探测并缓存时长，供列表接口直接读取
             if full.suffix.lower() in VIDEO_EXT:
                 get_video_duration(str(full), fetch=True)
@@ -379,7 +383,7 @@ class CacheTask:
         uncached = all_total - cached_count - succeeded
         msg = f"本次实际缓存 {succeeded} 个，失败 {failed} 个，剩余未缓存 {uncached} 个"
         self._set(percent=100, message=msg, succeeded=succeeded, failed=failed)
-        record_cache_stats(all_total, cached_count + succeeded, failed=failed)
+        record_cache_stats(all_total, cached_count + succeeded, failed=failed, failed_files=failed_files)
         add_log(self.operator, "cache_result", msg)
 
 
@@ -651,13 +655,13 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
             if suf in IMAGE_EXT:
                 items.append({
                     "id": rel_str, "name": entry.name, "type": "image",
-                    "path": rel_str, "size": size, "mtime": mtime,
+                    "path": rel_str, "size": size, "mtime": entry_mtime,
                 })
             elif suf in VIDEO_EXT:
                 duration = get_video_duration(str(entry), fetch=False)
                 items.append({
                     "id": rel_str, "name": entry.name, "type": "video",
-                    "path": rel_str, "size": size, "mtime": mtime, "duration": duration,
+                    "path": rel_str, "size": size, "mtime": entry_mtime, "duration": duration,
                 })
 
     with _dir_cache_lock:
@@ -700,6 +704,7 @@ def cache_stats(user: UserItem = Depends(get_current_user)):
         "cached": stats["cached"],
         "uncached": stats["uncached"],
         "failed": stats.get("failed", 0),
+        "failed_files": stats.get("failed_files", []),
         "last_finish_time": stats["last_finish_time"],
     }
 
