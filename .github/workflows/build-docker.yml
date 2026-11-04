@@ -6,16 +6,16 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # 固定版本，避免 ubuntu-latest 未来迁移到 Ubuntu 26 的不确定性
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build linux/amd64 and export tar
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -24,7 +24,7 @@ jobs:
           outputs: type=docker,dest=/tmp/nas-waterfall-media.tar
 
       - name: Upload tar artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: nas-waterfall-media-image
           path: /tmp/nas-waterfall-media.tar
