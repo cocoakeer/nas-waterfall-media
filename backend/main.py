@@ -370,10 +370,11 @@ class CacheTask:
                 record_cache_stats(all_total, cached_count + succeeded, failed=failed, failed_files=failed_files)
                 add_log(self.operator, "cache_result", msg)
                 return
-            result = ensure_thumb(full, rel)
+            err_out = {}
+            result = ensure_thumb(full, rel, err_out)
             if result is None:
                 failed += 1
-                failed_files.append(str(rel))
+                failed_files.append({"path": str(rel), "error": err_out.get("error", "未知错误")})
             # 视频顺便探测并缓存时长，供列表接口直接读取
             if full.suffix.lower() in VIDEO_EXT:
                 get_video_duration(str(full), fetch=True)

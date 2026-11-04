@@ -338,7 +338,10 @@
         </div>
         <div class="log-list">
           <div v-for="(f, idx) in cacheStats.failed_files" :key="idx" class="log-item">
-            <span class="log-detail">{{ f }}</span>
+            <div class="failed-item">
+              <div class="log-detail">{{ typeof f === 'string' ? f : f.path }}</div>
+              <div v-if="typeof f === 'object' && f.error" class="log-error">{{ f.error }}</div>
+            </div>
           </div>
           <div v-if="!cacheStats.failed_files.length" class="empty-state">无失败文件</div>
         </div>
@@ -1857,6 +1860,18 @@ onUnmounted(() => {
 }
 .log-detail{
   color:#ddd;
+  word-break:break-all;
+}
+.failed-item{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  min-width:0;
+  width:100%;
+}
+.log-error{
+  color:#f09595;
+  font-size:12px;
   word-break:break-all;
 }
 .um-header{

@@ -49,8 +49,8 @@ def is_cache_fresh(src_full: Path, cache_full: Path) -> bool:
         return False
 
 
-def generate_image_thumb(src_full: Path, dest_full: Path) -> bool:
-    """Pillow 生成图片缩略图，成功返回 True。"""
+def generate_image_thumb(src_full: Path, dest_full: Path) -> tuple:
+    """Pillow 生成图片缩略图，返回 (成功与否, 错误信息)。"""
     try:
         from PIL import Image
 
@@ -59,13 +59,13 @@ def generate_image_thumb(src_full: Path, dest_full: Path) -> bool:
             img.thumbnail((THUMB_WIDTH, THUMB_MAX_HEIGHT), Image.LANCZOS)
             dest_full.parent.mkdir(parents=True, exist_ok=True)
             img.save(dest_full, "JPEG", quality=80)
-        return True
-    except Exception:
-        return False
+        return True, ""
+    except Exception as exc:
+        return False, f"Pillow: {exc}"
 
 
-def generate_video_cover(video_full: Path, dest_full: Path) -> bool:
-    """ffmpeg 抽取首帧作为视频封面，成功返回 True。"""
+def generate_video_cover(video_full: Path, dest_full: Path) -> tuple:
+    """ffmpeg 抽取首帧作为视频封面，返回 (成功与否, 错误信息)。"""
     dest_full.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg",
@@ -78,10 +78,14 @@ def generate_video_cover(video_full: Path, dest_full: Path) -> bool:
         str(dest_full),
     ]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=15)
-        return dest_full.exists()
-    except Exception:
-        return False
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        if dest_full.exists():
+            return True, ""
+        # 抽帧失败：取 ffmpeg stderr 前 200 字符作为错误信息
+        err = result.stderr.decode("utf-8", errors="ignore").strip()
+        return False, f"ffmpeg: {err[:200]}"
+    except Exception as exc:
+        return False, f"ffmpeg: {exc}"
 
 
 # 缩略图生成的 per-file 锁，防止同一文件被并发请求重复生成
@@ -98,8 +102,11 @@ def _get_lock(key: str) -> threading.Lock:
         return lock
 
 
-def ensure_thumb(src_full: Path, rel_path: str):
-    """按文件类型生成缩略图/封面，返回缓存路径；生成失败返回 None。"""
+def ensure_thumb(src_full: Path, rel_path: str, err_out: dict = None):
+    """按文件类型生成缩略图/封面，返回缓存路径；生成失败返回 None。
+
+    err_out 可选：传入 dict，失败时写入 {"error": 错误信息}，供调用方记录失败原因。
+    """
     suf = src_full.suffix.lower()
     dest = get_thumb_cache_path(rel_path)
     if is_cache_fresh(src_full, dest):
@@ -110,11 +117,13 @@ def ensure_thumb(src_full: Path, rel_path: str):
         if is_cache_fresh(src_full, dest):
             return dest
         if suf in IMAGE_EXT:
-            ok = generate_image_thumb(src_full, dest)
+            ok, err = generate_image_thumb(src_full, dest)
         elif suf in VIDEO_EXT:
-            ok = generate_video_cover(src_full, dest)
+            ok, err = generate_video_cover(src_full, dest)
         else:
             return None
+    if not ok and err_out is not None:
+        err_out["error"] = err
     return dest if ok else None
 
 
