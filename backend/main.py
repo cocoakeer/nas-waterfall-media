@@ -25,6 +25,7 @@ from .cover import (
     is_cache_fresh,
     cleanup_orphan_thumbs,
     get_video_duration,
+    thumb_source,
     load_duration_cache,
     save_duration_cache,
 )
@@ -394,8 +395,8 @@ class CacheTask:
                     break
                 if Path(name).suffix.lower() not in MEDIA_EXTS:
                     continue
-                if is_cover_file(name):
-                    continue  # cover 文件不预生成缓存、不参与统计与失败计数
+                if is_cover_file(name, Path(root)):
+                    continue  # 封面/元数据图不预生成缓存、不参与统计与失败计数
                 full = Path(root) / name
                 try:
                     rel = full.relative_to(base)
@@ -405,8 +406,9 @@ class CacheTask:
                 # 视频时长缓存补齐：仅在缓存缺失时才 ffprobe，任务结束统一落盘
                 if full.suffix.lower() in VIDEO_EXT:
                     get_video_duration(str(full), fetch=True)
-                # 增量判断：缓存存在且不旧于源文件则跳过
-                if is_cache_fresh(full, get_thumb_cache_path(str(rel))):
+                # 视频以本地 Emby 封面为准判断新鲜度，海报更新后缓存任务会重新生成
+                freshness_src = thumb_source(full) if full.suffix.lower() in VIDEO_EXT else full
+                if is_cache_fresh(freshness_src, get_thumb_cache_path(str(rel))):
                     cached_count += 1
                     continue
                 files.append((full, str(rel)))
@@ -657,7 +659,7 @@ def _collect_all_images(allow_dirs: tuple) -> List[str]:
             root_path = Path(root)
             dirs[:] = [d for d in dirs if _walk_needed(root_path / d, allow_dirs)]
         for name in names:
-            if Path(name).suffix.lower() not in IMAGE_EXT or is_cover_file(name):
+            if Path(name).suffix.lower() not in IMAGE_EXT or is_cover_file(name, Path(root)):
                 continue
             full = Path(root) / name
             if not any(_is_under(full, allow_p) for allow_p in allow_dirs):
@@ -741,7 +743,7 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
                     ext = os.path.splitext(lower_name)[1]
                     if ext not in MEDIA_EXTS:
                         continue
-                    if is_cover_file(entry.name):
+                    if is_cover_file(entry.name, folder_abs):
                         rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
                         cover_candidate = "/" + rel
                     elif ext in IMAGE_EXT and first_img is None:
@@ -752,7 +754,7 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
             count = 0
             for _root, _dirs, names in os.walk(folder_abs):
                 for name in names:
-                    if os.path.splitext(name)[1].lower() in MEDIA_EXTS and not is_cover_file(name):
+                    if os.path.splitext(name)[1].lower() in MEDIA_EXTS and not is_cover_file(name, Path(_root)):
                         count += 1
             return cover, count
         except Exception:
@@ -764,7 +766,7 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
     with os.scandir(work_path) as it:
         entries = sorted(it, key=lambda e: e.name.lower())
         for entry in entries:
-            if is_cover_file(entry.name):
+            if is_cover_file(entry.name, work_path):
                 continue
             try:
                 rel_str = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")

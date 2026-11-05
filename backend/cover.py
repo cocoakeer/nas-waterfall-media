@@ -23,15 +23,44 @@ THUMB_MAX_HEIGHT = 4000
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi"}
 MEDIA_EXTS = IMAGE_EXT | VIDEO_EXT  # 预计算并集，避免循环内重复构造
+# Emby 本地图片可用的扩展名（.tbn 是 JPEG 数据，但不加入 IMAGE_EXT，避免作为普通照片展示）
+ARTWORK_IMAGE_EXTS = IMAGE_EXT | {".tbn"}
+
+# Emby 刮削生成的目录级图片名
+ARTWORK_DIR_NAMES = {
+    "poster", "folder", "cover", "default", "movie", "thumb", "landscape",
+    "backdrop", "fanart", "background", "art", "banner", "logo", "clearlogo",
+    "clearart", "disc", "cdart", "show", "season",
+}
+# {name}-poster / {name}-thumb 这类按视频名派生的图片
+ARTWORK_SUFFIXES = (
+    "-poster", "-cover", "-default", "-movie", "-thumb", "-landscape",
+    "-banner", "-logo", "-clearlogo", "-clearart", "-disc", "-cdart",
+    "-fanart", "-backdrop", "-background", "-art",
+)
 
 
-def is_cover_file(name: str) -> bool:
-    """判断文件名是否为文件夹封面（cover），文件名大小写、图片扩展名均不敏感。
+def is_cover_file(name: str, parent: Path = None) -> bool:
+    """判断是否为封面/剧照类元数据图片（含 Emby 命名），不参与列表展示与计数。
 
-    cover.jpg / Cover.JPG / cover.jpeg / COVER.webp 均视为封面，不会作为独立图片展示。
+    兼容原有 cover.*，并扩展 poster.* / folder.* / xxx-poster.* / xxx-thumb.* 等。
+    传入 parent（所在目录）时，若同目录存在同名视频，这张图片也视为视频缩图：
+    用户库里这类同名图基本都是本地视频封面。不传 parent 时保持旧行为。
     """
     p = Path(name)
-    return p.stem.lower() == "cover" and p.suffix.lower() in IMAGE_EXT
+    if p.suffix.lower() not in ARTWORK_IMAGE_EXTS:
+        return False
+    stem = p.stem.lower()
+    if stem in ARTWORK_DIR_NAMES:
+        return True
+    if any(stem.endswith(sfx) for sfx in ARTWORK_SUFFIXES):
+        return True
+    # backdrop1 / fanart-2 / art_3 等编号背景图
+    if re.match(r"^(?:backdrop|fanart|background|art)[-_]?\d+$", stem) is not None:
+        return True
+    if parent is not None and stem in _video_stems_in(Path(parent)):
+        return True
+    return False
 
 
 def get_thumb_cache_path(rel_path: str) -> Path:
@@ -68,9 +97,142 @@ def generate_image_thumb(src_full: Path, dest_full: Path) -> tuple:
         return False, f"Pillow: {exc}"
 
 
+# Emby 本地封面的目录索引与查找结果缓存（避免每个视频都重复 scandir / 读图片头）
+_artwork_index_cache: dict = {}
+_artwork_result_cache: dict = {}
+_video_stems_cache: dict = {}
+_artwork_lock = threading.Lock()
+
+
+def _video_stems_in(parent: Path) -> set:
+    """按 (目录, 目录 mtime) 缓存同目录所有视频的 stem 集合，大小其一不敏感。"""
+    try:
+        dir_mtime = parent.stat().st_mtime
+    except OSError:
+        return set()
+    key = (str(parent), dir_mtime)
+    with _artwork_lock:
+        cached = _video_stems_cache.get(key)
+    if cached is not None:
+        return cached
+    stems = set()
+    try:
+        with os.scandir(parent) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                if Path(entry.name).suffix.lower() in VIDEO_EXT:
+                    stems.add(Path(entry.name).stem.lower())
+    except OSError:
+        return set()
+    with _artwork_lock:
+        if len(_video_stems_cache) >= 512:
+            _video_stems_cache.clear()
+        _video_stems_cache[key] = stems
+    return stems
+
+
+def _index_local_images(parent: Path) -> dict:
+    """按 (目录, 目录 mtime) 缓存同目录所有图片：{stem.lower(): 绝对路径}。"""
+    try:
+        dir_mtime = parent.stat().st_mtime
+    except OSError:
+        return {}
+    key = (str(parent), dir_mtime)
+    with _artwork_lock:
+        cached = _artwork_index_cache.get(key)
+    if cached is not None:
+        return cached
+    index = {}
+    try:
+        with os.scandir(parent) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                p = Path(entry.name)
+                if p.suffix.lower() in ARTWORK_IMAGE_EXTS:
+                    index.setdefault(p.stem.lower(), parent / entry.name)
+    except OSError:
+        return {}
+    with _artwork_lock:
+        if len(_artwork_index_cache) >= 512:
+            _artwork_index_cache.clear()
+        _artwork_index_cache[key] = index
+    return index
+
+
+def find_local_artwork(video_full: Path):
+    """按 Emby 规则找视频的本地封面：优先竖版海报，没有竖版则取横版。
+
+    候选按 Emby Primary 顺序排列，先扫一遍读图片头判断宽高比；
+    找到第一张竖版（高 > 宽 × 1.05）就用它，否则用优先级最高的横版。
+    """
+    parent = video_full.parent
+    index = _index_local_images(parent)
+    if not index:
+        return None
+    try:
+        dir_mtime = parent.stat().st_mtime
+    except OSError:
+        dir_mtime = 0
+    cache_key = (str(video_full), dir_mtime)
+    with _artwork_lock:
+        if cache_key in _artwork_result_cache:
+            return _artwork_result_cache[cache_key]
+
+    stem = video_full.stem
+    poster_names = [
+        f"{stem}-poster", f"{stem}-cover", f"{stem}-default", f"{stem}-movie",
+        stem,
+        "poster", "folder", "cover", "default", "movie",
+    ]
+    thumb_names = [f"{stem}-thumb", f"{stem}-landscape", "thumb", "landscape"]
+    from PIL import Image
+    measured = []
+    for name, group in ([(n, "poster") for n in poster_names] +
+                        [(n, "thumb") for n in thumb_names]):
+        path = index.get(name.lower())
+        if path is None:
+            continue
+        try:
+            with Image.open(path) as im:
+                measured.append((path, im.width, im.height, group))
+        except Exception:
+            continue
+    chosen = None
+    # 1) 所有候选里第一张竖版（海报优先）
+    for path, width, height, group in measured:
+        if height > width * 1.05:
+            chosen = path
+            break
+    # 2) 没有竖版：优先 Thumb 类横图，再退到其它横版
+    if chosen is None:
+        for path, width, height, group in measured:
+            if group == "thumb":
+                chosen = path
+                break
+        if chosen is None and measured:
+            chosen = measured[0][0]
+
+    with _artwork_lock:
+        if len(_artwork_result_cache) >= 20000:
+            _artwork_result_cache.clear()
+        _artwork_result_cache[cache_key] = chosen
+    return chosen
+
+
+def thumb_source(video_full: Path) -> Path:
+    """视频缩略图的新鲜度依据：有本地封面就跟着封面 mtime，否则跟着视频 mtime。"""
+    return find_local_artwork(video_full) or video_full
+
+
 def generate_video_cover(video_full: Path, dest_full: Path) -> tuple:
-    """ffmpeg 抽取首帧作为视频封面，返回 (成功与否, 错误信息)。"""
+    """优先用同目录 Emby 本地封面生成缩略图，没有才回退 ffmpeg 抽首帧。"""
     dest_full.parent.mkdir(parents=True, exist_ok=True)
+    artwork = find_local_artwork(video_full)
+    if artwork is not None:
+        ok, err = generate_image_thumb(artwork, dest_full)
+        return ok, (f"Pillow(artwork): {err}" if not ok else "")
     cmd = [
         "ffmpeg",
         "-i", str(video_full),
@@ -110,12 +272,14 @@ def ensure_thumb(src_full: Path, rel_path: str, err_out: dict = None):
     """
     suf = src_full.suffix.lower()
     dest = get_thumb_cache_path(rel_path)
-    if is_cache_fresh(src_full, dest):
+    # 视频缩略图可能来自本地 Emby 封面，新鲜度以封面图为准（换海报能自动重建）
+    freshness_src = thumb_source(src_full) if suf in VIDEO_EXT else src_full
+    if is_cache_fresh(freshness_src, dest):
         return dest
     # double-checked locking：同一文件并发请求时串行化，避免重复生成
     lock = _get_lock(str(dest))
     with lock:
-        if is_cache_fresh(src_full, dest):
+        if is_cache_fresh(freshness_src, dest):
             return dest
         with _gen_semaphore:
             if suf in IMAGE_EXT:
