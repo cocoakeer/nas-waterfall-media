@@ -42,6 +42,9 @@ USER_CONFIG_PATH = CONFIG_DIR / "users.json"
 print(f"[CONFIG] 用户配置文件路径: {USER_CONFIG_PATH}")
 
 SESSION_EXPIRE_SEC = 86400
+# 各接口的 limit 上限分开命名：逻辑相同但语义不同，避免改一处误伤另一处
+LOG_LIMIT_MAX = 1000           # /api/logs 单次最多返回日志条数
+RANDOM_IMAGES_LIMIT_MAX = 2000  # /api/random-images 单次最多返回图片数
 
 # 数据模型 新增 is_admin 布尔标记，不再依靠用户名admin
 class LoginForm(BaseModel):
@@ -669,7 +672,7 @@ def get_all_images(user: UserItem) -> List[str]:
 @app.get("/api/random-images")
 def api_random_images(limit: int = 1000, user: UserItem = Depends(get_current_user)):
     """从整个媒体库随机抽取图片（按用户允许目录过滤），供首页随机幻灯片使用。"""
-    limit = max(1, min(limit, 2000))
+    limit = max(1, min(limit, RANDOM_IMAGES_LIMIT_MAX))
     images = get_all_images(user)
     picked = random.sample(images, min(limit, len(images))) if images else []
     items = [
@@ -832,7 +835,7 @@ def cache_stats(user: UserItem = Depends(get_current_user)):
 # ========== 执行日志接口 ==========
 @app.get("/api/logs")
 def api_logs(limit: int = 200, _admin: UserItem = Depends(require_admin)):
-    limit = max(1, min(limit, 1000))
+    limit = max(1, min(limit, LOG_LIMIT_MAX))
     return {"code": 0, "logs": read_logs(limit)}
 
 
