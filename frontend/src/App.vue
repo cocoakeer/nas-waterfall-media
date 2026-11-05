@@ -180,7 +180,7 @@
 
     <!-- 预览弹窗 -->
     <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
-      <div class="preview-box" ref="previewBoxRef">
+      <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick">
         <button class="close-btn" ref="closeBtnRef" :style="closeBtnStyle" @click="closePreview">×</button>
         <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
         <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
@@ -1140,6 +1140,17 @@ function slidePrev() {
     else slideIndex.value = 0
   }
   runSlide()
+}
+
+// 预览：除媒体本身和交互控件外，点击任意空白区域都退出
+function onPreviewBoxClick(e) {
+  const t = e.target
+  if (!t) return
+  // 点图片/视频本体（含视频原生控制条）不退出
+  if (t.tagName === 'IMG' || t.tagName === 'VIDEO') return
+  // 箭头、旋转、关闭等按钮各走自己的逻辑，不额外退出
+  if (typeof t.closest === 'function' && t.closest('button')) return
+  closePreview()
 }
 
 function closePreview() {
