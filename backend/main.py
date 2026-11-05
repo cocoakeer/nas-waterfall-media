@@ -2,6 +2,7 @@ import os
 import json
 import bcrypt
 import uuid
+import random
 from pathlib import Path
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
@@ -364,6 +365,9 @@ class CacheTask:
                 save_duration_cache()
             except Exception:
                 pass
+            # 缓存任务可能新增/删除图片，让随机幻灯片索引失效，下次请求重建
+            with _all_images_lock:
+                _all_images_cache.clear()
             self._set(running=False)
             self._stop.clear()
 
@@ -617,6 +621,63 @@ async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin
     save_users(users)
     add_log(_admin.username, "user_delete", f"删除用户 {username}")
     return {"code":0,"msg":"已删除"}
+
+# ========== 随机幻灯片：全库图片索引（按用户允许目录过滤） ==========
+_ALL_IMAGES_TTL = 300  # 索引缓存有效期（秒）
+_all_images_cache: Dict[tuple, tuple] = {}  # allow_dirs -> (构建时间, 相对路径列表)
+_all_images_lock = threading.Lock()
+
+
+def _is_under(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _collect_all_images(allow_dirs: tuple) -> List[str]:
+    """递归收集允许目录内全部图片的相对路径；跳过 cover，不做 stat 以保证速度。"""
+    images = []
+    for root, _dirs, names in os.walk(REAL_BASE):
+        for name in names:
+            if Path(name).suffix.lower() not in IMAGE_EXT or is_cover_file(name):
+                continue
+            full = Path(root) / name
+            if not any(_is_under(full, allow_p) for allow_p in allow_dirs):
+                continue
+            try:
+                images.append(str(full.relative_to(REAL_BASE)).replace(os.sep, "/"))
+            except ValueError:
+                continue
+    return images
+
+
+def get_all_images(user: UserItem) -> List[str]:
+    """按用户允许目录缓存全库图片索引，避免每次随机播放都遍历整个媒体库。"""
+    key = tuple(sorted(user.allow_dirs))
+    now = time.time()
+    with _all_images_lock:
+        cached = _all_images_cache.get(key)
+        if cached is not None and now - cached[0] < _ALL_IMAGES_TTL:
+            return cached[1]
+        images = _collect_all_images(_resolved_allow_dirs(user.allow_dirs))
+        _all_images_cache[key] = (time.time(), images)
+        return images
+
+
+@app.get("/api/random-images")
+def api_random_images(limit: int = 1000, user: UserItem = Depends(get_current_user)):
+    """从整个媒体库随机抽取图片（按用户允许目录过滤），供首页随机幻灯片使用。"""
+    limit = max(1, min(limit, 2000))
+    images = get_all_images(user)
+    picked = random.sample(images, min(limit, len(images))) if images else []
+    items = [
+        {"id": p, "name": Path(p).name, "type": "image", "path": p}
+        for p in picked
+    ]
+    return {"code": 0, "list": items, "total": len(images)}
+
 
 # ========== 媒体列表接口 ==========
 # 目录列表缓存：key=解析后目录路径, value=(目录mtime, 缓存时间戳, items)

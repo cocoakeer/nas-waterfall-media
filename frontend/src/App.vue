@@ -85,7 +85,7 @@
           <svg class="sort-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
         </div>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
-        <button @click="startSlideFromDir" class="btn primary">开始幻灯片</button>
+        <button @click="startRandomSlide" class="btn primary" :disabled="randomSlideLoading">{{ randomSlideLoading ? '加载中…' : '随机幻灯片' }}</button>
       </div>
     </header>
     <div class="breadcrumb">
@@ -537,6 +537,11 @@ const slideIndex = ref(0)
 const slideTimer = ref(null)
 const slideList = ref([])
 const currentSlide = ref({})
+// 首页随机幻灯片：全库随机抽取；预览里的「从此处开始幻灯片」仍是顺序播放
+const randomSlideLoading = ref(false)
+const randomSlideMode = ref(false)
+const randomBatchLoading = ref(false)
+const RANDOM_BATCH_SIZE = 1000
 
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
@@ -919,17 +924,70 @@ async function saveSetting() {
   settingShow.value = false
 }
 
-function startSlideFromDir() {
-  slideList.value = displayList.value.filter(i => i.type === 'image')
-  if (slideList.value.length === 0) return alert('当前目录没有图片，无法幻灯片')
-  slideIndex.value = 0
-  openRootFullscreen()
-  slideShow.value = true
-  runSlide()
+// 从整个媒体库随机取一批图片
+async function fetchRandomImages() {
+  const res = await fetch(`${baseUrl}/api/random-images?limit=${RANDOM_BATCH_SIZE}`)
+  if (!res.ok) { checkAuthResp(res); return null }
+  const j = await res.json()
+  if (j.code !== 0) return null
+  return j.list || []
+}
+
+// 首页随机幻灯片：点击后播放第一批（不影响预览里的顺序播放）
+async function startRandomSlide() {
+  if (randomSlideLoading.value) return
+  randomSlideLoading.value = true
+  try {
+    const list = await fetchRandomImages()
+    if (list === null) return alert('❌ 随机幻灯片加载失败')
+    if (!list.length) return alert('媒体库里没有可用于幻灯片的图片')
+    slideList.value = list
+    randomSlideMode.value = true
+    slideIndex.value = 0
+    openRootFullscreen()
+    slideShow.value = true
+    runSlide()
+  } catch (e) {
+    console.error('加载随机图片失败', e)
+    alert('❌ 加载图片失败，请稍后重试')
+  } finally {
+    randomSlideLoading.value = false
+  }
+}
+
+// 每轮播完重新从全库抽一批，避免一直循环同一批图片
+async function reloadRandomBatch() {
+  if (randomBatchLoading.value) return false
+  randomBatchLoading.value = true
+  try {
+    const list = await fetchRandomImages()
+    if (list && list.length) {
+      slideList.value = list
+      return true
+    }
+  } catch (e) {
+    console.error('重新抽取随机图片失败', e)
+  } finally {
+    randomBatchLoading.value = false
+  }
+  return false
+}
+
+// 换批失败时的兜底：洗牌当前批次，保证播放不中断
+function shuffleSlideList() {
+  const arr = slideList.value.slice()
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    const tmp = arr[i]
+    arr[i] = arr[j]
+    arr[j] = tmp
+  }
+  slideList.value = arr
 }
 
 function startSlideFromCurrent() {
   slideList.value = previewMediaList.filter(i => i.type === 'image')
+  randomSlideMode.value = false
   if (slideList.value.length === 0) return alert('没有图片可以幻灯片')
   const idx = slideList.value.findIndex(x => x.path === previewItem.value.path)
   slideIndex.value = Math.max(idx, 0)
@@ -957,6 +1015,7 @@ async function openRootFullscreen() {
 function exitSlide() {
   clearTimeout(slideTimer.value)
   slideShow.value = false
+  randomSlideMode.value = false
   if (document.exitFullscreen) {
     document.exitFullscreen()
   } else if (document.webkitExitFullscreen) {
@@ -974,14 +1033,19 @@ function runSlide() {
   }, clampSlideDelay(slideDelay.value) * 1000)
 }
 
-function slideNext() {
+async function slideNext() {
   slideIndex.value++
   if (slideIndex.value >= slideList.value.length) {
-    if (slideLoop.value) slideIndex.value = 0
-    else {
+    if (!slideLoop.value) {
       exitSlide()
       return
     }
+    if (randomSlideMode.value) {
+      const ok = await reloadRandomBatch()
+      if (!slideShow.value) return
+      if (!ok) shuffleSlideList()
+    }
+    slideIndex.value = 0
   }
   runSlide()
 }
