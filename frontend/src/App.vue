@@ -439,6 +439,7 @@ const umDelConfirm = ref({
 
 const mediaList = ref([])
 const breadcrumbList = ref([])
+const currentDir = ref('')
 const waterfallBoxRef = ref(null)
 
 // 搜索与排序
@@ -559,6 +560,7 @@ const STORAGE_KEY = "waterfall_last_dir"
 
 // ========= JS瀑布流【响应式：手机2列 / 平板3-4列 / 桌面270px】 =========
 let resizeTimer = null
+let imageLoadTimer = null
 // 卡片高度缓存：图片逐张加载时不再全量读 offsetHeight，避免 O(n^2) 的强制重排
 const cardHeightCache = new Map()
 // 上一次的列宽：卡片高度依赖宽度，列宽一变缓存就整体失效
@@ -633,8 +635,10 @@ function layoutWaterfall(){
 function onImageLoaded(item){
   item._loaded = true
   cardHeightCache.delete(item.id)
-  clearTimeout(resizeTimer)
-  resizeTimer = setTimeout(()=>{
+  // 与窗口 resize 各用一条定时器：原来共用 resizeTimer，
+  // 图片 load 会把刚排队的 resize 布局（含叉号重定位）直接取消掉
+  clearTimeout(imageLoadTimer)
+  imageLoadTimer = setTimeout(()=>{
     layoutWaterfall()
   },120)
 }
@@ -747,21 +751,39 @@ function openOriginal() {
   window.open(getSrcUrl(previewItem.value.path), '_blank')
 }
 
+// 用「一次请求完成后再排下一次」代替 setInterval：NAS 响应慢于 800ms 时
+// 不会把请求一层层堆起来；重复启动也只会有一条链。
+function stopStatusPoll() {
+  if (statusPollTimer) clearTimeout(statusPollTimer)
+  statusPollTimer = null
+}
+function startStatusPoll() {
+  stopStatusPoll()
+  statusPollTimer = setTimeout(pollCacheStatus, 800)
+}
 async function pollCacheStatus() {
+  statusPollTimer = null
   try {
     const res = await fetch(`${baseUrl}/api/cache-status`)
-    if (!res.ok) { checkAuthResp(res); return }
+    if (!res.ok) {
+      checkAuthResp(res)
+      stopStatusPoll()
+      cacheRunning.value = false
+      return
+    }
     const st = await res.json()
     cachePercent.value = st.percent
     if (!st.running) {
-      clearInterval(statusPollTimer)
-      statusPollTimer = null
+      stopStatusPoll()
       cacheRunning.value = false
       loadCacheStats()
       alert(`✅缓存任务结束！\n${st.message}`)
+      return
     }
+    startStatusPoll()
   } catch (err) {
     console.error("查询任务状态失败", err)
+    startStatusPoll()  // 网络抖动继续重试，不中断进度显示
   }
 }
 
@@ -773,7 +795,7 @@ async function initCheckCacheTask() {
     if (st.running) {
       cacheRunning.value = true
       cachePercent.value = st.percent
-      statusPollTimer = setInterval(pollCacheStatus, 800)
+      startStatusPoll()
     }
   } catch (err) {
     console.error("初始化检查缓存任务失败", err)
@@ -793,7 +815,7 @@ async function runCacheTask() {
       cacheRunning.value = false
       return
     }
-    statusPollTimer = setInterval(pollCacheStatus, 800)
+    startStatusPoll()
   } catch (err) {
     console.error(err)
     alert("❌请求失败，提交任务出错！")
@@ -856,9 +878,47 @@ function checkAuthResp(r) {
 }
 
 const isLoading = ref(false)
+const LIST_REFRESH_MS = 15000  // 静默刷新间隔，与后端目录校验周期配套
+let listRefreshTimer = null
+
+// 只比较业务字段：瀑布流会把 _left/_top/_loaded 挂到 item 上，
+// 直接 JSON.stringify 会永远不相等，导致每次轮询都重排闪烁
+function listSignature(list) {
+  return JSON.stringify(list.map(x => [x.id, x.name, x.type, x.count,
+    x.size, x.mtime, x.cover_path, x.duration]))
+}
+
+async function silentRefreshList() {
+  if (!isLogin.value || document.visibilityState !== 'visible') return
+  if (isLoading.value || previewShow.value || slideShow.value ||
+      userManageModal.value || logModal.value || changePwdModal.value ||
+      settingShow.value || failedFilesModal.value) return
+  const dirAtStart = currentDir.value
+  try {
+    const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dirAtStart)}`)
+    if (!res.ok) { checkAuthResp(res); return }
+    const data = await res.json()
+    // 请求期间用户可能已切换目录（或新的加载正在进行）。
+    // NAS 上旧请求可能更慢，不能让它把旧目录的数据盖回当前页面。
+    if (currentDir.value !== dirAtStart || isLoading.value) return
+    const next = data.list || []
+    if (listSignature(next) !== listSignature(mediaList.value)) {
+      mediaList.value = next
+      breadcrumbList.value = data.breadcrumb || []
+    }
+  } catch (e) {
+    // 静默失败，不打扰正在浏览的用户
+  }
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState === 'visible') silentRefreshList()
+}
+
 async function loadMedia(dir = '', pushHistory = false) {
   if(isLoading.value) return
   isLoading.value = true
+  currentDir.value = dir
   mediaList.value = []
   breadcrumbList.value = []
   try {
@@ -1489,6 +1549,8 @@ onMounted(() => {
   document.addEventListener("click", onClickOutsideDrop)
 
   document.addEventListener('fullscreenchange', onFullscreenChange)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  listRefreshTimer = setInterval(silentRefreshList, LIST_REFRESH_MS)
 })
 
 onUnmounted(() => {
@@ -1497,9 +1559,13 @@ onUnmounted(() => {
   window.removeEventListener('popstate', onPopState)
   document.removeEventListener("click", onClickOutsideDrop)
   document.removeEventListener('fullscreenchange', onFullscreenChange)
-  if (statusPollTimer) clearInterval(statusPollTimer)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  clearInterval(listRefreshTimer)
+  stopStatusPoll()
   clearTimeout(slideTimer.value)
   clearTimeout(resizeTimer)
+  clearTimeout(imageLoadTimer)
+  clearTimeout(closeBtnPosTimer)
 })
 </script>
 

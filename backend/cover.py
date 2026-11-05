@@ -10,6 +10,7 @@ import errno
 import re
 import subprocess
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -40,12 +41,13 @@ ARTWORK_SUFFIXES = (
 )
 
 
-def is_cover_file(name: str, parent: Path = None) -> bool:
+def is_cover_file(name: str, parent: Path = None, video_stems: set = None) -> bool:
     """判断是否为封面/剧照类元数据图片（含 Emby 命名），不参与列表展示与计数。
 
     兼容原有 cover.*，并扩展 poster.* / folder.* / xxx-poster.* / xxx-thumb.* 等。
     传入 parent（所在目录）时，若同目录存在同名视频，这张图片也视为视频缩图：
     用户库里这类同名图基本都是本地视频封面。不传 parent 时保持旧行为。
+    video_stems 可由调用方预先算好传入，避免一次批量扫描里重复 scandir。
     """
     p = Path(name)
     if p.suffix.lower() not in ARTWORK_IMAGE_EXTS:
@@ -58,9 +60,31 @@ def is_cover_file(name: str, parent: Path = None) -> bool:
     # backdrop1 / fanart-2 / art_3 等编号背景图
     if re.match(r"^(?:backdrop|fanart|background|art)[-_]?\d+$", stem) is not None:
         return True
-    if parent is not None and stem in _video_stems_in(Path(parent)):
-        return True
+    if parent is not None:
+        stems = video_stems if video_stems is not None else _video_stems_in(Path(parent))
+        if stem in stems:
+            return True
     return False
+
+
+def artwork_rank(name: str, video_stems: set = None) -> int:
+    """文件夹封面选择优先级：数字越小越优先。
+
+    原来是 scandir 顺序里最后一个 cover 文件胜出，结果随文件系统顺序漂移；
+    这里固定为「目录级 poster/folder > 影片海报 > 通用 cover > 横版剧照 > 背景图」。
+    """
+    stem = Path(name).stem.lower()
+    if stem in ("folder", "poster"):
+        return 0
+    if stem.endswith(("-poster", "-cover", "-default", "-movie")):
+        return 1
+    if video_stems is not None and stem in video_stems:
+        return 2  # 与视频同名的本地缩图
+    if stem in ("cover", "default", "movie"):
+        return 3
+    if stem.endswith(("-thumb", "-landscape")) or stem in ("thumb", "landscape"):
+        return 4
+    return 5
 
 
 def get_thumb_cache_path(rel_path: str) -> Path:
@@ -98,10 +122,25 @@ def generate_image_thumb(src_full: Path, dest_full: Path) -> tuple:
 
 
 # Emby 本地封面的目录索引与查找结果缓存（避免每个视频都重复 scandir / 读图片头）
-_artwork_index_cache: dict = {}
-_artwork_result_cache: dict = {}
-_video_stems_cache: dict = {}
+_artwork_index_cache: OrderedDict = OrderedDict()
+_artwork_result_cache: OrderedDict = OrderedDict()
+_video_stems_cache: OrderedDict = OrderedDict()
 _artwork_lock = threading.Lock()
+# 超限时只淘汰最旧的四分之一；原来整体 clear 会让大媒体库的缓存任务反复重扫同一批目录
+_INDEX_CACHE_MAX = 4096
+_RESULT_CACHE_MAX = 20000
+
+
+def _cache_put(cache: OrderedDict, key, value, max_size: int):
+    """LRU 写入：命中移到末尾，超限淘汰最旧的一批（而非全清）。"""
+    with _artwork_lock:
+        if key in cache:
+            cache.move_to_end(key)
+        cache[key] = value
+        if len(cache) > max_size:
+            for _ in range(max(1, max_size // 4)):
+                cache.popitem(last=False)
+    return value
 
 
 def _video_stems_in(parent: Path) -> set:
@@ -125,11 +164,7 @@ def _video_stems_in(parent: Path) -> set:
                     stems.add(Path(entry.name).stem.lower())
     except OSError:
         return set()
-    with _artwork_lock:
-        if len(_video_stems_cache) >= 512:
-            _video_stems_cache.clear()
-        _video_stems_cache[key] = stems
-    return stems
+    return _cache_put(_video_stems_cache, key, stems, _INDEX_CACHE_MAX)
 
 
 def _index_local_images(parent: Path) -> dict:
@@ -154,11 +189,7 @@ def _index_local_images(parent: Path) -> dict:
                     index.setdefault(p.stem.lower(), parent / entry.name)
     except OSError:
         return {}
-    with _artwork_lock:
-        if len(_artwork_index_cache) >= 512:
-            _artwork_index_cache.clear()
-        _artwork_index_cache[key] = index
-    return index
+    return _cache_put(_artwork_index_cache, key, index, _INDEX_CACHE_MAX)
 
 
 def find_local_artwork(video_full: Path):
@@ -214,11 +245,7 @@ def find_local_artwork(video_full: Path):
         if chosen is None and measured:
             chosen = measured[0][0]
 
-    with _artwork_lock:
-        if len(_artwork_result_cache) >= 20000:
-            _artwork_result_cache.clear()
-        _artwork_result_cache[cache_key] = chosen
-    return chosen
+    return _cache_put(_artwork_result_cache, cache_key, chosen, _RESULT_CACHE_MAX)
 
 
 def thumb_source(video_full: Path) -> Path:

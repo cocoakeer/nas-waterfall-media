@@ -1,4 +1,5 @@
 import os
+import errno
 import json
 import bcrypt
 import uuid
@@ -20,10 +21,12 @@ from .cover import (
     VIDEO_EXT,
     MEDIA_EXTS,
     is_cover_file,
+    artwork_rank,
     ensure_thumb,
     get_thumb_cache_path,
     is_cache_fresh,
     cleanup_orphan_thumbs,
+    _media_mount_ready,
     get_video_duration,
     thumb_source,
     load_duration_cache,
@@ -89,26 +92,38 @@ def _purge_expired_sessions():
             if expire_ts <= now:
                 sessions.pop(sid, None)
 
+_last_good_users: List[UserItem] = []
+
+
+def _default_users() -> List[UserItem]:
+    default_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode()
+    return [UserItem(username="admin", password_hash=default_hash,
+                     allow_dirs=["/"], is_admin=True)]
+
+
 def load_users() -> List[UserItem]:
-    if not USER_CONFIG_PATH.exists():
-        default_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode()
-        init_data = [
-            {
-                "username": "admin",
-                "password_hash": default_hash,
-                "allow_dirs": ["/"],
-                "is_admin": True
-            }
-        ]
-        USER_CONFIG_PATH.write_text(json.dumps(init_data, ensure_ascii=False, indent=2), encoding="utf-8")
-    raw_list = json.loads(USER_CONFIG_PATH.read_text(encoding="utf-8"))
-    out = []
-    # 兼容旧配置文件，旧数据缺少is_admin字段自动补为False，原admin用户名自动升级为管理员
-    for item in raw_list:
-        if "is_admin" not in item:
-            item["is_admin"] = (item.get("username") == "admin")
-        out.append(UserItem(**item))
-    return out
+    """读取用户配置；文件损坏时沿用上次成功加载的结果，避免服务崩溃或密码被重置。"""
+    global _last_good_users
+    try:
+        if not USER_CONFIG_PATH.exists():
+            out = _default_users()
+            USER_CONFIG_PATH.write_text(
+                json.dumps([u.model_dump() for u in out], ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        else:
+            raw_list = json.loads(USER_CONFIG_PATH.read_text(encoding="utf-8"))
+            out = []
+            # 兼容旧配置文件，旧数据缺少is_admin字段自动补为False，原admin用户名自动升级为管理员
+            for item in raw_list:
+                if "is_admin" not in item:
+                    item["is_admin"] = (item.get("username") == "admin")
+                out.append(UserItem(**item))
+        _last_good_users = list(out)
+        return out
+    except Exception as exc:
+        # 不覆盖损坏文件，保留现场供人工排查；也不重新生成默认密码
+        print(f"[CONFIG] users.json 读取失败（{exc}），沿用上次成功加载的用户配置")
+        return list(_last_good_users) if _last_good_users else _default_users()
 
 def save_users(user_list: List[UserItem]):
     data = [u.model_dump() for u in user_list]
@@ -164,6 +179,11 @@ def _resolved_allow_dirs(allow_dirs: List[str]):
 def check_path_allowed(user: UserItem, target_dir: str) -> Path:
     target_dir = target_dir.strip()
     req_path = (REAL_BASE / target_dir.lstrip("/")).resolve()
+    # 文件接口同样守住媒体根边界，防止符号链接 / 路径穿越读到容器其它目录
+    try:
+        req_path.relative_to(REAL_BASE)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="路径超出媒体库范围")
     for allow_p in _resolved_allow_dirs(user.allow_dirs):
         try:
             req_path.relative_to(allow_p)
@@ -171,6 +191,34 @@ def check_path_allowed(user: UserItem, target_dir: str) -> Path:
         except ValueError:
             continue
     raise HTTPException(status_code=403, detail="无权访问该目录")
+
+
+def check_dir_allowed(user: UserItem, target_dir: str) -> Path:
+    """目录导航校验：允许访问允许目录内部，也允许访问它的祖先路径。
+
+    只用于 /api/list，让受限用户能从媒体根逐级点进自己的目录；
+    具体条目还会由 _entry_visible 再过滤一遍。
+    文件访问（/api/src、/api/thumb）必须用严格的 check_path_allowed。
+    """
+    req_path = (REAL_BASE / target_dir.strip().lstrip("/")).resolve()
+    # 祖先放宽不能越出媒体根：否则 dir=../../.. 会把容器根目录也放行
+    try:
+        req_path.relative_to(REAL_BASE)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="路径超出媒体库范围")
+    for allow_p in _resolved_allow_dirs(user.allow_dirs):
+        try:
+            req_path.relative_to(allow_p)   # 目录在允许范围内
+            return req_path
+        except ValueError:
+            pass
+        try:
+            allow_p.relative_to(req_path)   # 目录是允许目录的祖先
+            return req_path
+        except ValueError:
+            continue
+    raise HTTPException(status_code=403, detail="无权访问该目录")
+
 
 # 获取media根下全部一级子目录（给前端下拉选择）
 def scan_media_root_dirs() -> List[str]:
@@ -372,6 +420,7 @@ class CacheTask:
             # 缓存任务可能新增/删除图片，让随机幻灯片索引失效，下次请求重建
             with _all_images_lock:
                 _all_images_cache.clear()
+            invalidate_folder_stats()
             self._set(running=False)
             self._stop.clear()
 
@@ -476,7 +525,11 @@ async def lifespan(_app: FastAPI):
     scheduler.add_job(daily_cache_job, "cron", hour=3, minute=0, id="daily_cache")
     scheduler.start()
     print("[SCHEDULER] 缓存增量任务已调度：每天 03:00（Asia/Shanghai）")
+    _folder_watcher_stop.clear()
+    threading.Thread(target=_folder_watcher_loop, daemon=True, name="folder-watcher").start()
+    print(f"[FOLDER] 目录变化后台校验已启动：每 {_FOLDER_STATS_CHECK_SEC} 秒")
     yield
+    _folder_watcher_stop.set()
     scheduler.shutdown(wait=False)
 
 
@@ -601,8 +654,12 @@ def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(require_admi
             is_admin=form.is_admin
         )
         users.append(new_u)
-    # 校验：至少保留一个管理员账号
-    check_at_least_one_admin(users)
+    # 校验：至少保留一个管理员账号；失败时从磁盘回滚，避免内存留下半写入状态
+    try:
+        check_at_least_one_admin(users)
+    except HTTPException:
+        reload_users()
+        raise
     save_users(users)
     add_log(_admin.username, "user_save", f"{'编辑' if exist is not None else '新增'}用户 {form.username}")
     return {"code":0,"msg":"保存成功"}
@@ -616,8 +673,12 @@ async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin
     if not target_user:
         raise HTTPException(404, "用户不存在")
     users = [u for u in users if u.username != username]
-    # 删除之后校验至少还有一个管理员
-    check_at_least_one_admin(users)
+    # 删除之后校验至少还有一个管理员；失败时回滚内存
+    try:
+        check_at_least_one_admin(users)
+    except HTTPException:
+        reload_users()
+        raise
     # 清理该用户全部session
     with _session_lock:
         to_del = [k for k, (uname, _exp) in list(sessions.items()) if uname == username]
@@ -639,6 +700,47 @@ def _is_under(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _normalized_allow_dirs(allow_dirs) -> tuple:
+    """去掉被其它允许目录包含的冗余项，避免同一子树被重复计数。"""
+    result = []
+    for p in sorted(allow_dirs, key=lambda x: len(str(x))):
+        if not any(_is_under(p, q) for q in result):
+            result.append(p)
+    return tuple(result)
+
+
+def _visible_count(folder_abs: Path, allowed: tuple, stats: dict) -> int:
+    """按用户允许目录裁剪文件夹的递归媒体数。
+
+    folder 落在某个允许目录内 → 整棵子树可见，直接读快照计数；
+    folder 是允许目录的祖先 → 只累加落在允许范围内的那些子树；
+    都不满足 → 0（无权看到任何文件数）。
+    """
+    counts = stats["counts"]
+    for allow_p in allowed:
+        if _is_under(folder_abs, allow_p):
+            return counts.get(str(folder_abs), 0)
+    total = 0
+    for allow_p in allowed:
+        if _is_under(allow_p, folder_abs):
+            total += counts.get(str(allow_p), 0)
+    return total
+
+
+def _entry_visible(path: Path, allowed: tuple, is_dir: bool) -> bool:
+    """列表条目是否对当前用户可见。
+
+    文件必须落在允许目录内；文件夹还允许「是允许目录的祖先」，
+    这样受限用户能从根逐级导航到自己的目录，但看不到无关分支。
+    """
+    for allow_p in allowed:
+        if _is_under(path, allow_p):
+            return True
+        if is_dir and _is_under(allow_p, path):
+            return True
+    return False
 
 
 def _walk_needed(path: Path, allow_dirs: tuple) -> bool:
@@ -704,11 +806,331 @@ def api_random_images(limit: int = 1000, user: UserItem = Depends(get_current_us
 _dir_cache: Dict[str, tuple] = {}
 _dir_cache_lock = threading.Lock()
 _DIR_CACHE_MAX = 500
-_DIR_CACHE_TTL = 30  # 缓存有效期（秒），兼顾递归计数对深层变化的感知
+_DIR_CACHE_TTL = 10  # 条目缓存窗口；快照靠 mtime 增量更新，缩短此值让角标更快跟上变化
+
+# 目录统计快照：一次全库自底向上遍历，算出每个目录的递归媒体数与最佳封面。
+# 快照长期有效，目录 mtime 变化时才增量重扫那一支并把差值传播到所有祖先；
+# TTL 只是兜底全量重建周期，覆盖「深层变了但用户始终没打开到那一层」的情况。
+_FOLDER_STATS_TTL = 1800
+_FOLDER_STATS_CHECK_SEC = 15  # 后台比对全库目录 mtime 的间隔（秒）
+_FOLDER_STATS_IDLE_SEC = 90   # 超过这段时间无人访问就暂停后台校验
+_folder_stats_lock = threading.Lock()
+_folder_stats_refresh_lock = threading.Lock()  # 串行化增量刷新，避免锁内做文件 IO
+_folder_stats: dict = {}
+_folder_stats_building = False
+_last_list_activity = time.time()
+_folder_watcher_stop = threading.Event()
+
+
+def invalidate_folder_stats():
+    """媒体内容变化后让快照失效（替换引用，不动正在被读取的旧快照）。"""
+    global _folder_stats
+    with _folder_stats_lock:
+        _folder_stats = {}
+
+
+def _summarize_dir(root_p: Path, dirs, names, child_counts: dict) -> tuple:
+    """统计单个目录：返回 (递归媒体数, 最佳封面相对路径, 首图相对路径)。
+
+    child_counts 里应已包含所有子目录的递归数（调用方需自底向上遍历）。
+    """
+    video_stems = {
+        Path(n).stem.lower()
+        for n in names if Path(n).suffix.lower() in VIDEO_EXT
+    }
+    own = 0
+    best_rank, best_cover = 99, None
+    first_img = None
+    for name in names:
+        suf = Path(name).suffix.lower()
+        if suf not in MEDIA_EXTS:
+            continue
+        rel = str((root_p / name).relative_to(REAL_BASE)).replace(os.sep, "/")
+        if is_cover_file(name, root_p, video_stems):
+            rank = artwork_rank(name, video_stems)
+            if rank < best_rank:
+                best_rank, best_cover = rank, rel
+        else:
+            own += 1
+            if suf in IMAGE_EXT and first_img is None:
+                first_img = rel
+    total = own + sum(child_counts.get(str(root_p / d), 0) for d in dirs)
+    return total, best_cover, first_img
+
+
+def _get_folder_stats() -> dict:
+    """返回完整快照引用；构建期间其它请求复用旧快照，避免并发全库遍历。"""
+    global _folder_stats, _folder_stats_building
+    now = time.time()
+    with _folder_stats_lock:
+        stale = _folder_stats
+        if stale and now - stale["ts"] < _FOLDER_STATS_TTL:
+            return stale
+        if _folder_stats_building:
+            return stale
+        _folder_stats_building = True
+    data = {}
+    try:
+        # 构建放锁外（大库可能耗时数秒），避免其它请求排队等锁
+        counts, covers, first_imgs, mtimes, children = {}, {}, {}, {}, {}
+        for root, dirs, names in os.walk(REAL_BASE, topdown=False):
+            root_p = Path(root)
+            key = str(root_p)
+            # 自底向上：子目录此时已算完，直接累加即可，不需要重复遍历子树
+            total, cover, first = _summarize_dir(root_p, dirs, names, counts)
+            counts[key] = total
+            covers[key] = cover
+            first_imgs[key] = first
+            children[key] = [str(root_p / d) for d in dirs]
+            try:
+                mtimes[key] = os.stat(root).st_mtime
+            except OSError:
+                mtimes[key] = 0.0  # 基线未知，下一轮校验会补上真实 mtime
+        data = {"ts": time.time(), "counts": counts, "covers": covers,
+                "first_imgs": first_imgs, "mtimes": mtimes, "children": children}
+    except Exception as exc:
+        print(f"[FOLDER] 目录统计快照构建失败：{exc}")
+    finally:
+        with _folder_stats_lock:
+            _folder_stats_building = False
+            if data:
+                # 替换引用而非原地 clear/update：持有旧快照的请求不会被清空一半
+                _folder_stats = data
+    # 构建失败（如媒体根暂时不可读）时沿用旧快照，比逐目录重新扫描更安全
+    return data or stale
+
+
+def _refresh_folder_subtrees(changed, removed=(), current_dir: Path = None,
+                              current_mtime=None) -> dict:
+    """只重扫变化目录的子树，把差值传播到所有祖先。
+
+    copy-on-write：先复制索引再修改并整体替换引用，持有旧快照的请求不受影响。
+    changed 是目录 Path 列表，removed 是已删除目录的绝对路径字符串列表。
+    """
+    global _folder_stats
+    # 只在此锁内做纯内存的引用读取；下面的 scandir/os.walk 放到锁外，
+    # 否则新增目录触发全库重扫时会阻塞所有 api_list 请求数秒
+    with _folder_stats_refresh_lock:
+        with _folder_stats_lock:
+            old = _folder_stats
+        if not old:
+            return old
+        new = {
+            "ts": old["ts"],  # 局部刷新不重置兜底全量重建的计时
+            "counts": dict(old["counts"]),
+            "covers": dict(old["covers"]),
+            "first_imgs": dict(old["first_imgs"]),
+            "mtimes": dict(old.get("mtimes", {})),
+            "children": {k: list(v) for k, v in old.get("children", {}).items()},
+        }
+        fields = ("counts", "covers", "first_imgs", "mtimes", "children")
+        for folder, rescan in ([(Path(f), True) for f in changed] +
+                               [(Path(k), False) for k in removed]):
+            prefix = str(folder)
+            old_count = new["counts"].get(prefix, 0)
+            # 先看子目录清单是否变化：没变就只重算本目录（1 次 scandir），
+            # 避免后台校验发现「加了几张图」时把整棵子树重扫一遍
+            light = False
+            sub_dirs, file_names, actual_children = [], [], []
+            if rescan:
+                try:
+                    with os.scandir(folder) as it:
+                        dir_entries = list(it)
+                    sub_dirs = [e.name for e in dir_entries if e.is_dir()]
+                    file_names = [e.name for e in dir_entries if not e.is_dir()]
+                    actual_children = [str(folder / d) for d in sub_dirs]
+                    light = set(actual_children) == set(new["children"].get(prefix, []))
+                except OSError:
+                    light = False
+            if light:
+                total, cover, first = _summarize_dir(folder, sub_dirs, file_names, new["counts"])
+                new["counts"][prefix] = total
+                new["covers"][prefix] = cover
+                new["first_imgs"][prefix] = first
+                new["children"][prefix] = actual_children
+                try:
+                    new["mtimes"][prefix] = os.stat(folder).st_mtime
+                except OSError:
+                    new["mtimes"][prefix] = 0.0
+                new_count = total
+            else:
+                # 清掉这一支的旧条目（含已从磁盘消失的目录）
+                for k in [k for k in new["counts"] if k == prefix or k.startswith(prefix + os.sep)]:
+                    for d in fields:
+                        new[d].pop(k, None)
+                new_count = 0
+                if rescan:
+                    local = {}
+                    for root, dirs, names in os.walk(folder, topdown=False):
+                        root_p = Path(root)
+                        key = str(root_p)
+                        total, cover, first = _summarize_dir(root_p, dirs, names, local)
+                        local[key] = total
+                        new["counts"][key] = total
+                        new["covers"][key] = cover
+                        new["first_imgs"][key] = first
+                        new["children"][key] = [str(root_p / d) for d in dirs]
+                        try:
+                            new["mtimes"][key] = os.stat(root).st_mtime
+                        except OSError:
+                            new["mtimes"][key] = 0.0
+                    new_count = local.get(prefix, 0)
+            # 同步父目录的子目录清单（新增 / 删除目录）
+            parent_key = str(folder.parent)
+            if parent_key in new["children"]:
+                sibs = [c for c in new["children"][parent_key] if c != prefix]
+                if rescan and prefix not in sibs:
+                    sibs.append(prefix)
+                new["children"][parent_key] = sibs
+            # 任一子树的增减量，对它的所有祖先都是同一个 delta
+            delta = new_count - old_count
+            if delta:
+                anc = folder.parent
+                while True:
+                    akey = str(anc)
+                    if akey in new["counts"]:
+                        new["counts"][akey] += delta
+                    if anc == REAL_BASE or anc == anc.parent:
+                        break
+                    anc = anc.parent
+        if current_dir is not None:
+            new["mtimes"][str(current_dir)] = current_mtime
+        with _folder_stats_lock:
+            _folder_stats = new
+        # 角标变了，其它目录已缓存的 items 也带着旧数字，一并失效
+        with _dir_cache_lock:
+            _dir_cache.clear()
+        return new
+
+
+def _topmost_paths(paths):
+    """只保留最顶层目录：父目录要重扫时，子目录不必重复处理。"""
+    result = []
+    for p in sorted(set(paths), key=lambda x: (len(x), x)):
+        if not any(p == q or p.startswith(q + os.sep) for q in result):
+            result.append(p)
+    return result
+
+
+def _media_root_ready(mountinfo_path: str = "/proc/self/mountinfo") -> bool:
+    """校验前先体检 /media：挂载是否生效、媒体根是否可访问。
+
+    Linux 容器里 /media 是 bind mount，挂载没生效时它只是镜像自带的空目录，
+    此时逐目录 stat 会把全库判成「已删除」。非 Linux（本地开发）无此概念，
+    mountinfo 不存在就跳过挂载检测，只确认媒体根可访问。
+    mountinfo_path 可注入，便于验证挂载判定的真实链路。
+    """
+    if Path(mountinfo_path).is_file() and not _media_mount_ready(REAL_BASE, mountinfo_path):
+        return False
+    try:
+        os.stat(REAL_BASE)
+        return True
+    except OSError:
+        return False
+
+
+def _verify_folder_stats(mountinfo_path: str = "/proc/self/mountinfo") -> int:
+    """后台比对全库目录 mtime，任意层级变化都增量刷新快照。
+
+    先确认 /media 挂载生效；之后只做 stat、不读目录内容，
+    目录增删会改变父目录 mtime，重扫父目录时自然纳入新增子目录。
+    返回处理的目录数。
+    """
+    if not _media_root_ready(mountinfo_path):
+        print("[FOLDER] /media 未挂载或不可读，跳过本次目录校验")
+        return 0
+    with _folder_stats_lock:
+        snap = _folder_stats
+    if not snap:
+        return 0
+    changed, removed = [], []
+    unreadable = 0
+    for key, old_mt in snap.get("mtimes", {}).items():
+        try:
+            mt = os.stat(key).st_mtime
+        except OSError as exc:
+            # 只有「目录确实不存在」才当删除；权限不足 / I/O 故障 / ESTALE
+            # 一律视为不可判定，不能据此清掉缓存（挂载异常时尤其危险）
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                removed.append(key)
+            else:
+                unreadable += 1
+            continue
+        if mt != old_mt:
+            changed.append(key)
+    # 第二层保护：挂载点正常、但中途掉线或大范围子目录读不到时仍然拦住
+    total_dirs = len(snap.get("mtimes", {}))
+    if unreadable > max(5, total_dirs // 5) or len(removed) > max(10, total_dirs // 2):
+        print("[FOLDER] 子目录读取异常或大量目录消失，跳过本次校验")
+        return 0
+    if not changed and not removed:
+        return 0
+    roots = _topmost_paths(changed)
+    removed_roots = [k for k in _topmost_paths(removed)
+                     if not any(k == r or k.startswith(r + os.sep) for r in roots)]
+    if not roots and not removed_roots:
+        return 0
+    _refresh_folder_subtrees([Path(k) for k in roots], removed_roots)
+    return len(roots) + len(removed_roots)
+
+
+def _folder_watcher_loop():
+    """空闲时自动暂停，有人访问才按周期校验，避免没人看也一直打扰 NAS。"""
+    while not _folder_watcher_stop.wait(_FOLDER_STATS_CHECK_SEC):
+        try:
+            if time.time() - _last_list_activity > _FOLDER_STATS_IDLE_SEC:
+                continue
+            n = _verify_folder_stats()
+            if n:
+                print(f"[FOLDER] 后台检测到 {n} 处目录变化，已增量刷新角标快照")
+        except Exception as exc:
+            print(f"[FOLDER] 后台目录校验异常：{exc}")
+
+
+def _folder_info_uncached(folder_abs: Path):
+    """快照不可用时的退化实现：只扫这一个目录及其子树。"""
+    cover_rel, first_img = None, None
+    best_rank = 99
+    try:
+        video_stems = set()
+        with os.scandir(folder_abs) as it:
+            entries = list(it)
+        for entry in entries:
+            if entry.is_file() and Path(entry.name).suffix.lower() in VIDEO_EXT:
+                video_stems.add(Path(entry.name).stem.lower())
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            suf = Path(entry.name).suffix.lower()
+            if suf not in MEDIA_EXTS:
+                continue
+            rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
+            if is_cover_file(entry.name, folder_abs, video_stems):
+                rank = artwork_rank(entry.name, video_stems)
+                if rank < best_rank:
+                    best_rank, cover_rel = rank, rel
+            elif suf in IMAGE_EXT and first_img is None:
+                first_img = rel
+        count = 0
+        for sub_root, _dirs, sub_names in os.walk(folder_abs):
+            stems = {
+                Path(n).stem.lower()
+                for n in sub_names if Path(n).suffix.lower() in VIDEO_EXT
+            }
+            for name in sub_names:
+                if (Path(name).suffix.lower() in MEDIA_EXTS
+                        and not is_cover_file(name, Path(sub_root), stems)):
+                    count += 1
+        chosen = cover_rel or first_img
+        return ("/" + chosen if chosen else None), count
+    except Exception:
+        return None, 0
 
 @app.get("/api/list")
 def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
-    work_path = check_path_allowed(user, dir)
+    global _last_list_activity
+    _last_list_activity = time.time()
+    work_path = check_dir_allowed(user, dir)
     if not work_path.exists() or not work_path.is_dir():
         return {"list": [], "breadcrumb": []}
 
@@ -724,90 +1146,112 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
         dir_mtime = work_path.stat().st_mtime
     except OSError:
         dir_mtime = 0
-    key = str(work_path)
+    # 缓存按「目录 + 用户允许目录」隔离：不同权限看到的角标可能不同
+    allowed = _normalized_allow_dirs(_resolved_allow_dirs(user.allow_dirs))
+    cache_key = (str(work_path), tuple(sorted(user.allow_dirs)))
     with _dir_cache_lock:
-        cached = _dir_cache.get(key)
+        cached = _dir_cache.get(cache_key)
     if cached is not None and cached[0] == dir_mtime and (time.time() - cached[1]) < _DIR_CACHE_TTL:
         return {"list": cached[2], "breadcrumb": breadcrumb}
 
-    def get_folder_info(folder_abs: Path):
-        # 找封面（直接子项）+ 递归统计图片/视频总数
-        cover_candidate = None
-        first_img = None
-        try:
-            with os.scandir(folder_abs) as it:
-                for entry in it:
-                    if not entry.is_file():
-                        continue
-                    lower_name = entry.name.lower()
-                    ext = os.path.splitext(lower_name)[1]
-                    if ext not in MEDIA_EXTS:
-                        continue
-                    if is_cover_file(entry.name, folder_abs):
-                        rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
-                        cover_candidate = "/" + rel
-                    elif ext in IMAGE_EXT and first_img is None:
-                        rel = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
-                        first_img = "/" + rel
-            cover = cover_candidate if cover_candidate is not None else first_img
-            # 递归统计该文件夹下（含所有子文件夹）的图片+视频总数（不含 cover）
-            count = 0
-            for _root, _dirs, names in os.walk(folder_abs):
-                for name in names:
-                    if os.path.splitext(name)[1].lower() in MEDIA_EXTS and not is_cover_file(name, Path(_root)):
-                        count += 1
-            return cover, count
-        except Exception:
-            pass
-        return None, 0
+    stats = _get_folder_stats()
+    # 首次构建中 / 构建失败时 counts 为空。此时若对每个文件夹调用
+    # _folder_info_uncached，一次列表会退化成整库 os.walk，比正常路径更慢。
+    stats_ready = bool(stats and stats.get("counts"))
 
     items = []
     # scandir 复用目录项缓存：is_dir()/stat() 不再重复发起系统调用（NAS 上收益明显）
     with os.scandir(work_path) as it:
         entries = sorted(it, key=lambda e: e.name.lower())
+    # 每个条目只 stat 一次，结果同时供「mtime 变化检测」和列表字段使用
+    stat_cache = {}
+    for entry in entries:
+        try:
+            stat_cache[entry.path] = entry.stat()
+        except OSError:
+            stat_cache[entry.path] = None
+    root_video_stems = {
+        Path(e.name).stem.lower()
+        for e in entries
+        if e.is_file() and Path(e.name).suffix.lower() in VIDEO_EXT
+    }
+    # 快照长期有效：只有目录 mtime 变化（或有目录增删）才重扫对应子树
+    if stats_ready:
+        mtimes = stats.get("mtimes", {})
+        changed = []
+        actual_dirs = set()
         for entry in entries:
-            if is_cover_file(entry.name, work_path):
+            if not entry.is_dir():
                 continue
-            try:
-                rel_str = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
-            except Exception:
-                continue
-            try:
-                st = entry.stat()
-                size = st.st_size
-                entry_mtime = st.st_mtime
-            except OSError:
-                size = None
-                entry_mtime = None
-            if entry.is_dir():
-                cover, count = get_folder_info(Path(entry.path))
+            key = str(Path(entry.path))
+            actual_dirs.add(key)
+            st = stat_cache.get(entry.path)
+            if key not in stats["counts"] or (st is not None and mtimes.get(key) != st.st_mtime):
+                changed.append(Path(entry.path))
+        expected_dirs = set(stats.get("children", {}).get(str(work_path), []))
+        removed = expected_dirs - actual_dirs
+        if changed or removed:
+            stats = _refresh_folder_subtrees(changed, removed, work_path, dir_mtime)
+
+    def get_folder_info(folder_abs: Path):
+        if not stats_ready:
+            # 快照未就绪：角标暂显 0，等构建完成后下一次请求即为准确值
+            return None, 0
+        # 文件夹只是「祖先可见」时，其直接子项（含封面）可能落在允许范围外，
+        # 不返回封面路径，避免前端请求到无权文件
+        fully_visible = any(_is_under(folder_abs, p) for p in allowed)
+        if stats:
+            key = str(folder_abs)
+            if key in stats["counts"]:
+                cover_rel = stats["covers"].get(key) or stats["first_imgs"].get(key)
+                cover = "/" + cover_rel if (cover_rel and fully_visible) else None
+                return cover, _visible_count(folder_abs, allowed, stats)
+        # 快照不可用时的退化路径：无法精确裁剪，仅完全可见目录返回统计
+        if not fully_visible:
+            return None, 0
+        return _folder_info_uncached(folder_abs)
+
+    for entry in entries:
+        if not _entry_visible(Path(entry.path), allowed, entry.is_dir()):
+            continue
+        if is_cover_file(entry.name, work_path, root_video_stems):
+            continue
+        try:
+            rel_str = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
+        except Exception:
+            continue
+        st = stat_cache.get(entry.path)
+        size = st.st_size if st is not None else None
+        entry_mtime = st.st_mtime if st is not None else None
+        if entry.is_dir():
+            cover, count = get_folder_info(Path(entry.path))
+            items.append({
+                "id": rel_str,
+                "name": entry.name,
+                "type": "folder",
+                "path": rel_str,
+                "cover_path": cover,
+                "count": count,
+                "mtime": entry_mtime,
+            })
+        else:
+            suf = Path(entry.name).suffix.lower()
+            if suf in IMAGE_EXT:
                 items.append({
-                    "id": rel_str,
-                    "name": entry.name,
-                    "type": "folder",
-                    "path": rel_str,
-                    "cover_path": cover,
-                    "count": count,
-                    "mtime": entry_mtime,
+                    "id": rel_str, "name": entry.name, "type": "image",
+                    "path": rel_str, "size": size, "mtime": entry_mtime,
                 })
-            else:
-                suf = Path(entry.name).suffix.lower()
-                if suf in IMAGE_EXT:
-                    items.append({
-                        "id": rel_str, "name": entry.name, "type": "image",
-                        "path": rel_str, "size": size, "mtime": entry_mtime,
-                    })
-                elif suf in VIDEO_EXT:
-                    duration = get_video_duration(str(Path(entry.path)), fetch=False)
-                    items.append({
-                        "id": rel_str, "name": entry.name, "type": "video",
-                        "path": rel_str, "size": size, "mtime": entry_mtime, "duration": duration,
-                    })
+            elif suf in VIDEO_EXT:
+                duration = get_video_duration(str(Path(entry.path)), fetch=False)
+                items.append({
+                    "id": rel_str, "name": entry.name, "type": "video",
+                    "path": rel_str, "size": size, "mtime": entry_mtime, "duration": duration,
+                })
 
     with _dir_cache_lock:
         if len(_dir_cache) >= _DIR_CACHE_MAX:
             _dir_cache.clear()
-        _dir_cache[key] = (dir_mtime, time.time(), items)
+        _dir_cache[cache_key] = (dir_mtime, time.time(), items)
     return {"list": items, "breadcrumb": breadcrumb}
 
 # ========== 原图接口 ==========
