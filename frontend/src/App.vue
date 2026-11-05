@@ -159,11 +159,6 @@
               <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
             </div>
           </div>
-          <!-- 文件夹名称标签 -->
-          <div v-if="item.type === 'folder'" class="folder-label">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-            <span>{{ item.name }}</span>
-          </div>
           <!-- 角标 -->
           <div v-if="item.type === 'folder'" class="card-badge badge-count">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>{{ item.count }}
@@ -185,8 +180,8 @@
 
     <!-- 预览弹窗 -->
     <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
-      <div class="preview-box">
-        <button class="close-btn" @click="closePreview">×</button>
+      <div class="preview-box" ref="previewBoxRef">
+        <button class="close-btn" ref="closeBtnRef" :style="closeBtnStyle" @click="closePreview">×</button>
         <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
         <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
         <div class="preview-image-area"
@@ -194,14 +189,20 @@
              @touchend="onTouchEnd">
           <img
             v-if="previewItem.type === 'image'"
+            ref="previewMediaRef"
             :src="getSrcUrl(previewItem.path)"
             alt=""
             :style="imgRotateStyle"
+            @load="updateCloseBtnPos"
           />
           <video
             v-else
+            ref="previewMediaRef"
             controls
+            autoplay
+            playsinline
             :src="getSrcUrl(previewItem.path)"
+            @loadedmetadata="onPreviewMediaReady"
           ></video>
         </div>
         <div class="preview-footer">
@@ -650,6 +651,7 @@ function onWindowResize(){
   clearTimeout(resizeTimer)
   resizeTimer = setTimeout(()=>{
     layoutWaterfall()
+    updateCloseBtnPos()
   },150)
 }
 
@@ -665,17 +667,81 @@ const imgRotateStyle = ref({
   transition: 'transform 0.25s ease'
 })
 
+// 预览关闭按钮跟随图片实际显示区域的右上角；未测量到时回退到容器右上角（CSS 默认）
+const previewBoxRef = ref(null)
+const previewMediaRef = ref(null)
+const closeBtnRef = ref(null)
+const closeBtnStyle = ref({})
+
+async function updateCloseBtnPos() {
+  await nextTick()
+  const box = previewBoxRef.value
+  const media = previewMediaRef.value
+  const btn = closeBtnRef.value
+  if (!box || !media || !btn) return
+  const br = box.getBoundingClientRect()
+  const mr = media.getBoundingClientRect()
+  if (!mr.width || !mr.height) return
+  const gap = 8
+  const bw = btn.offsetWidth || 34
+  const bh = btn.offsetHeight || 34
+  // 旋转后 getBoundingClientRect 是外接矩形，右上角按视觉区域计算
+  let left = mr.right - br.left - bw - gap
+  let top = mr.top - br.top + gap
+  left = Math.max(gap, Math.min(left, br.width - bw - gap))
+  top = Math.max(gap, Math.min(top, br.height - bh - gap))
+  closeBtnStyle.value = { left: left + 'px', top: top + 'px', right: 'auto' }
+}
+
+// 视频预览：元数据就绪即自动播放；被浏览器策略拦截时静音重试，保证点开就播
+let videoMutedFallback = false
+let closeBtnPosTimer = null
+
+function scheduleCloseBtnPos() {
+  clearTimeout(closeBtnPosTimer)
+  closeBtnPosTimer = setTimeout(updateCloseBtnPos, 260)
+}
+
+function onPreviewMediaReady() {
+  updateCloseBtnPos()
+  const v = previewMediaRef.value
+  if (!v || v.tagName !== 'VIDEO') return
+  // 上一个视频因策略降级为静音时，新视频先恢复有声再尝试
+  if (videoMutedFallback) {
+    v.muted = false
+    videoMutedFallback = false
+  }
+  const p = v.play()
+  if (p && typeof p.catch === 'function') {
+    p.catch(() => {
+      v.muted = true
+      videoMutedFallback = true
+      v.play().catch(() => {})
+    })
+  }
+}
+
+watch(previewShow, async (show) => {
+  closeBtnStyle.value = {}
+  if (!show) return
+  await nextTick()
+  updateCloseBtnPos()
+})
+
 function rotateLeft() {
   imgRotateDeg.value -= 90
   imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
+  scheduleCloseBtnPos()
 }
 function rotateRight() {
   imgRotateDeg.value += 90
   imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
+  scheduleCloseBtnPos()
 }
 function resetRotate() {
   imgRotateDeg.value = 0
   imgRotateStyle.value.transform = 'rotate(0deg)'
+  scheduleCloseBtnPos()
 }
 function openOriginal() {
   window.open(getSrcUrl(previewItem.value.path), '_blank')
@@ -765,6 +831,23 @@ function syncDirToUrl(dir) {
   window.history.pushState({ dir }, '', url.toString())
 }
 
+// 预览弹窗占用一条浏览器历史：按后退只关预览，不把目录一起退回去
+let previewHistoryPushed = false
+
+function pushPreviewHistory() {
+  if (previewHistoryPushed) return
+  try {
+    window.history.pushState(
+      { ...(window.history.state || {}), preview: true },
+      '',
+      window.location.href
+    )
+    previewHistoryPushed = true
+  } catch (e) {
+    // 历史 API 不可用时退化为原行为，不影响预览本身
+  }
+}
+
 function checkAuthResp(r) {
   if (r.status === 401) {
     isLogin.value = false
@@ -811,6 +894,7 @@ function handleCardClick(item) {
     imgRotateDeg.value = 0
     imgRotateStyle.value.transform = 'rotate(0deg)'
     previewShow.value = true
+    pushPreviewHistory()
   }
 }
 
@@ -1063,9 +1147,21 @@ function closePreview() {
   previewItem.value = null
   previewMediaList = []
   previewCurrentIndex = 0
+  // 界面主动关闭时把预览占用的那条历史退掉；popstate 会负责清标志
+  if (previewHistoryPushed) {
+    window.history.back()
+  }
 }
 
 function onPopState(e) {
+  // 预览占着一条历史：这次 pop 只用于关闭预览，保持当前目录与 URL 不变
+  if (previewHistoryPushed) {
+    previewHistoryPushed = false
+    if (previewShow.value) closePreview()
+    return
+  }
+  // 前进到预览那条历史时不做无谓的目录重载（预览本身不重新打开）
+  if (e.state?.preview) return
   const dir = e.state?.dir ?? getDirFromUrl()
   loadMedia(dir, false)
 }
@@ -1837,25 +1933,6 @@ input[type="checkbox"] {
   background: var(--surface-2);
 }
 .folder-placeholder svg { opacity: .8 }
-.folder-label {
-  position: absolute;
-  left: 10px;
-  top: 10px;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  max-width: calc(100% - 20px);
-  padding: 5px 9px;
-  border-radius: 8px;
-  background: rgba(10, 12, 18, .55);
-  border: 1px solid rgba(255, 255, 255, .14);
-  backdrop-filter: blur(8px);
-  color: #fff;
-  font-size: 11px;
-}
-.folder-label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.folder-label svg { width: 13px; height: 13px; flex-shrink: 0 }
 .card-badge {
   position: absolute;
   right: 8px;

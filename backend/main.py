@@ -639,10 +639,23 @@ def _is_under(path: Path, parent: Path) -> bool:
         return False
 
 
+def _walk_needed(path: Path, allow_dirs: tuple) -> bool:
+    """子目录值得继续遍历：它在允许目录内，或它是允许目录的祖先。"""
+    for allow_p in allow_dirs:
+        if _is_under(path, allow_p) or _is_under(allow_p, path):
+            return True
+    return False
+
+
 def _collect_all_images(allow_dirs: tuple) -> List[str]:
     """递归收集允许目录内全部图片的相对路径；跳过 cover，不做 stat 以保证速度。"""
     images = []
-    for root, _dirs, names in os.walk(REAL_BASE):
+    # 允许根目录时无需剪枝，避免对每个目录做多余的相对路径判断
+    skip_prune = any(p == REAL_BASE for p in allow_dirs)
+    for root, dirs, names in os.walk(REAL_BASE):
+        if not skip_prune:
+            root_path = Path(root)
+            dirs[:] = [d for d in dirs if _walk_needed(root_path / d, allow_dirs)]
         for name in names:
             if Path(name).suffix.lower() not in IMAGE_EXT or is_cover_file(name):
                 continue
@@ -664,9 +677,11 @@ def get_all_images(user: UserItem) -> List[str]:
         cached = _all_images_cache.get(key)
         if cached is not None and now - cached[0] < _ALL_IMAGES_TTL:
             return cached[1]
-        images = _collect_all_images(_resolved_allow_dirs(user.allow_dirs))
+    # 全库扫描可能耗时数秒，放到锁外，避免其它请求排队等锁
+    images = _collect_all_images(_resolved_allow_dirs(user.allow_dirs))
+    with _all_images_lock:
         _all_images_cache[key] = (time.time(), images)
-        return images
+    return images
 
 
 @app.get("/api/random-images")
@@ -813,7 +828,11 @@ def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
         cache_path = ensure_thumb(fp, rel)
         if cache_path is not None and cache_path.exists():
             return FileResponse(cache_path)
-    # 生成失败或未知类型，回退原图
+    # 视频封面生成失败时不回退原文件：<img> 无法渲染视频，
+    # 回退只会把几十 MB 原片白白传给浏览器且没有任何显示效果
+    if suf in VIDEO_EXT:
+        raise HTTPException(404)
+    # 图片生成失败仍回退原图，至少能看到内容
     return FileResponse(fp)
 
 # ========== 缓存统计接口 ==========
