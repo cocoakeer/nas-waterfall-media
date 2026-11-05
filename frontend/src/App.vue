@@ -129,7 +129,7 @@
               loading="lazy"
               decoding="async"
               :class="{loaded: item._loaded}"
-              @load="onImageLoaded(item, $event)"
+              @load="onImageLoaded(item)"
             />
             <div v-else class="folder-placeholder">
               <svg width="80" height="80" viewBox="0 0 24 24" fill="#f0c040">
@@ -144,7 +144,7 @@
             loading="lazy"
             decoding="async"
             :class="{loaded: item._loaded}"
-            @load="onImageLoaded(item, $event)"
+            @load="onImageLoaded(item)"
           />
           <div v-else-if="item.type === 'video'" class="video-wrap">
             <img
@@ -153,7 +153,7 @@
               loading="lazy"
               decoding="async"
               :class="{loaded: item._loaded}"
-              @load="onImageLoaded(item, $event)"
+              @load="onImageLoaded(item)"
             />
             <div class="play-icon">
               <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
@@ -555,6 +555,8 @@ const STORAGE_KEY = "waterfall_last_dir"
 let resizeTimer = null
 // 卡片高度缓存：图片逐张加载时不再全量读 offsetHeight，避免 O(n^2) 的强制重排
 const cardHeightCache = new Map()
+// 上一次的列宽：卡片高度依赖宽度，列宽一变缓存就整体失效
+let lastCardWidth = null
 
 // 根据容器宽度决定列数与卡片宽度（均分填满整行，无留白、无边界跳变）
 function getCardLayout(boxWidth) {
@@ -584,7 +586,13 @@ function layoutWaterfall(){
   const boxWidth = waterfallBoxRef.value.clientWidth
   const { cardWidth, gap, colCount } = getCardLayout(boxWidth)
 
-  // 通过 CSS 变量联动卡片宽度与间距
+  // 首次布局或列宽变化时，缓存是在旧宽度下测出来的，必须整体作废
+  if (lastCardWidth === null || Math.abs(cardWidth - lastCardWidth) > 0.5) {
+    cardHeightCache.clear()
+  }
+  lastCardWidth = cardWidth
+
+  // 先设列宽再测高度：否则读到的 offsetHeight 属于旧的 270px 回退宽度
   waterfallBoxRef.value.style.setProperty('--card-width', cardWidth + 'px')
   waterfallBoxRef.value.style.setProperty('--card-gap', gap + 'px')
 
@@ -615,11 +623,10 @@ function layoutWaterfall(){
   waterfallBoxRef.value.style.height = maxH + 'px'
 }
 
-// 图片加载完成：只更新该卡片的高度缓存，防抖后重排（其余卡片不再读 DOM）
-function onImageLoaded(item, e){
+// 图片加载完成：只让该卡片高度失效，由 layoutWaterfall 在列宽确定后统一测量
+function onImageLoaded(item){
   item._loaded = true
-  const card = e?.target?.closest?.('.media-card')
-  if (card) cardHeightCache.set(item.id, card.offsetHeight || 280)
+  cardHeightCache.delete(item.id)
   clearTimeout(resizeTimer)
   resizeTimer = setTimeout(()=>{
     layoutWaterfall()
@@ -1045,6 +1052,10 @@ async function checkLoginStatus() {
     isLogin.value = false
   } finally {
     initLoading.value = false
+    // 首次挂载时 app-container 到此刻才渲染，先前所有布局都因容器不存在被跳过。
+    // DOM 就绪后补一次，确保 --card-width 与卡片位置立即生效（不依赖图片 load）。
+    await nextTick()
+    layoutWaterfall()
   }
 }
 
