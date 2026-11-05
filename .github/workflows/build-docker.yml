@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04   # 固定版本，避免 ubuntu-latest 未来迁移到 Ubuntu 26 的不确定性
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

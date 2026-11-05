@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 from .cover import (
@@ -23,6 +24,8 @@ from .cover import (
     is_cache_fresh,
     cleanup_orphan_thumbs,
     get_video_duration,
+    load_duration_cache,
+    save_duration_cache,
 )
 from .config import load_settings, save_settings
 
@@ -55,7 +58,8 @@ class ChangePwdForm(BaseModel):
     new_password: str
 
 class SettingsForm(BaseModel):
-    slide_delay: int = 5
+    # 限制 1~3600 秒，避免 0/负值让前端 setTimeout 空转打满 CPU
+    slide_delay: int = Field(5, ge=1, le=3600)
     slide_loop: bool = True
 
 class AdminUserForm(BaseModel):
@@ -68,8 +72,17 @@ class UserRenameForm(BaseModel):
     old_username: str
     new_username: str
 
-# 内存会话存储
-sessions: Dict[str, str] = {}
+# 内存会话存储：sid -> (用户名, 过期时间戳)，带过期清理避免长期运行内存无限增长
+sessions: Dict[str, tuple] = {}
+_session_lock = threading.Lock()
+
+
+def _purge_expired_sessions():
+    now = time.time()
+    with _session_lock:
+        for sid, (_uname, expire_ts) in list(sessions.items()):
+            if expire_ts <= now:
+                sessions.pop(sid, None)
 
 def load_users() -> List[UserItem]:
     if not USER_CONFIG_PATH.exists():
@@ -105,9 +118,17 @@ users = load_users()
 # ========== 鉴权依赖 ==========
 async def get_current_user(request: Request) -> UserItem:
     session_id = request.cookies.get("session_id")
-    if not session_id or session_id not in sessions:
+    if not session_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    uname = sessions[session_id]
+    with _session_lock:
+        entry = sessions.get(session_id)
+    if not entry:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    uname, expire_ts = entry
+    if expire_ts <= time.time():
+        with _session_lock:
+            sessions.pop(session_id, None)
+        raise HTTPException(status_code=401, detail="Unauthorized")
     user = next((u for u in users if u.username == uname), None)
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -213,10 +234,22 @@ load_cache_stats()  # 启动时加载上次快照
 _LOG_FILE = CONFIG_DIR / "logs.jsonl"
 _log_lock = threading.Lock()
 _LOG_MAX_LINES = 2000  # 最多保留的日志条数
+_log_line_count = 0  # 内存行数：避免每次写日志都全量读文件
+
+
+def _init_log_count():
+    """启动时只统计一次现有日志行数。"""
+    global _log_line_count
+    try:
+        with open(_LOG_FILE, "r", encoding="utf-8") as f:
+            _log_line_count = sum(1 for _ in f)
+    except OSError:
+        _log_line_count = 0
 
 
 def add_log(operator: str, action: str, detail: str = ""):
-    """追加一条执行日志：操作员 / 事件 / 时间 / 详情。"""
+    """追加一条执行日志；仅在超过上限时裁剪，追加与裁剪同锁保护。"""
+    global _log_line_count
     entry = {
         "id": uuid.uuid4().hex[:8],
         "time": time.time(),
@@ -224,40 +257,45 @@ def add_log(operator: str, action: str, detail: str = ""):
         "action": action,
         "detail": detail,
     }
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
     with _log_lock:
         try:
             with open(_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(line)
+            _log_line_count += 1
         except Exception:
-            pass
-    # 裁剪：超过上限时截断保留最近 N 条
-    try:
-        with open(_LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        if len(lines) > _LOG_MAX_LINES:
-            with open(_LOG_FILE, "w", encoding="utf-8") as f:
-                f.writelines(lines[-_LOG_MAX_LINES:])
-    except Exception:
-        pass
+            return
+        if _log_line_count > _LOG_MAX_LINES:
+            try:
+                with open(_LOG_FILE, "r", encoding="utf-8") as f:
+                    lines = deque(f, maxlen=_LOG_MAX_LINES)
+                with open(_LOG_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                _log_line_count = len(lines)
+            except Exception:
+                pass
 
 
 def read_logs(limit: int = 200) -> List[dict]:
-    """读取最近 limit 条日志（最新在前）。"""
+    """读取最近 limit 条日志（最新在前），流式读尾部，内存占用 O(limit)。"""
     if not _LOG_FILE.exists():
         return []
     try:
-        lines = _LOG_FILE.read_text(encoding="utf-8").strip().splitlines()
+        with _log_lock:
+            with open(_LOG_FILE, "r", encoding="utf-8") as f:
+                lines = list(deque(f, maxlen=limit))
         entries = []
-        for line in lines[-limit:]:
+        for line in reversed(lines):
             try:
                 entries.append(json.loads(line))
             except Exception:
                 continue
-        entries.reverse()
         return entries
     except Exception:
         return []
 
+
+_init_log_count()
 
 
 # ========== 预生成缓存任务（后台线程） ==========
@@ -322,6 +360,10 @@ class CacheTask:
         except Exception as exc:
             self._set(message=f"任务异常：{exc}")
         finally:
+            try:
+                save_duration_cache()
+            except Exception:
+                pass
             self._set(running=False)
             self._stop.clear()
 
@@ -341,6 +383,8 @@ class CacheTask:
             if self._stop.is_set():
                 break
             for name in names:
+                if self._stop.is_set():
+                    break
                 if Path(name).suffix.lower() not in MEDIA_EXTS:
                     continue
                 if is_cover_file(name):
@@ -351,6 +395,9 @@ class CacheTask:
                 except ValueError:
                     continue
                 all_total += 1
+                # 视频时长缓存补齐：仅在缓存缺失时才 ffprobe，任务结束统一落盘
+                if full.suffix.lower() in VIDEO_EXT:
+                    get_video_duration(str(full), fetch=True)
                 # 增量判断：缓存存在且不旧于源文件则跳过
                 if is_cache_fresh(full, get_thumb_cache_path(str(rel))):
                     cached_count += 1
@@ -386,9 +433,6 @@ class CacheTask:
             if result is None:
                 failed += 1
                 failed_files.append({"path": str(rel), "error": err_out.get("error", "未知错误")})
-            # 视频顺便探测并缓存时长，供列表接口直接读取
-            if full.suffix.lower() in VIDEO_EXT:
-                get_video_duration(str(full), fetch=True)
             processed += 1
             self._set(processed=processed, percent=int(processed * 100 / total), current=rel)
         succeeded = processed - failed
@@ -418,6 +462,7 @@ def daily_cache_job():
 # ========== APP初始化 ==========
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    load_duration_cache()
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     scheduler.add_job(daily_cache_job, "cron", hour=3, minute=0, id="daily_cache")
     scheduler.start()
@@ -431,24 +476,27 @@ app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="asset
 
 # ========== 登录登出接口 ==========
 @app.post("/api/login")
-async def login(form: LoginForm, resp: Response):
+def login(form: LoginForm, resp: Response):
     reload_users()
     user = next((u for u in users if u.username == form.username), None)
     if not user:
         raise HTTPException(status_code=401, detail="账号或密码错误")
     if not bcrypt.checkpw(form.password.encode(), user.password_hash.encode()):
         raise HTTPException(status_code=401, detail="账号或密码错误")
+    _purge_expired_sessions()
     sid = str(uuid.uuid4())
-    sessions[sid] = user.username
+    with _session_lock:
+        sessions[sid] = (user.username, time.time() + SESSION_EXPIRE_SEC)
     resp.set_cookie(key="session_id", value=sid, max_age=SESSION_EXPIRE_SEC, httponly=True)
     add_log(user.username, "login", "登录系统")
     return {"code": 0, "msg": "ok"}
 
 @app.post("/api/logout")
 async def logout(resp: Response, user: UserItem = Depends(get_current_user)):
-    to_del = [k for k, v in sessions.items() if v == user.username]
-    for k in to_del:
-        del sessions[k]
+    with _session_lock:
+        to_del = [k for k, (uname, _exp) in list(sessions.items()) if uname == user.username]
+        for k in to_del:
+            sessions.pop(k, None)
     resp.delete_cookie("session_id")
     add_log(user.username, "logout", "退出登录")
     return {"code":0}
@@ -465,7 +513,7 @@ async def whoami(user: UserItem = Depends(get_current_user)):
 # ========== 用户账号管理接口 ==========
 ## 修改本人密码
 @app.post("/api/user/change-password")
-async def api_change_my_pwd(form: ChangePwdForm, user: UserItem = Depends(get_current_user)):
+def api_change_my_pwd(form: ChangePwdForm, user: UserItem = Depends(get_current_user)):
     reload_users()
     u = next((x for x in users if x.username == user.username), None)
     if not u:
@@ -513,9 +561,10 @@ async def admin_rename_user(form: UserRenameForm, _admin: UserItem = Depends(req
     if u_target is None:
         raise HTTPException(404, "原用户不存在")
     # 更新内存会话中该用户的session映射
-    for sid, uname in list(sessions.items()):
-        if uname == old:
-            sessions[sid] = new
+    with _session_lock:
+        for sid, (uname, expire_ts) in list(sessions.items()):
+            if uname == old:
+                sessions[sid] = (new, expire_ts)
     u_target.username = new
     save_users(users)
     add_log(_admin.username, "user_rename", f"重命名用户 {old} → {new}")
@@ -523,7 +572,7 @@ async def admin_rename_user(form: UserRenameForm, _admin: UserItem = Depends(req
 
 ## 管理员新增/编辑用户（支持设置is_admin管理员标记）
 @app.post("/api/admin/user-save")
-async def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(require_admin)):
+def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(require_admin)):
     reload_users()
     exist = next((u for u in users if u.username == form.username), None)
     if exist is not None:
@@ -561,9 +610,10 @@ async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin
     # 删除之后校验至少还有一个管理员
     check_at_least_one_admin(users)
     # 清理该用户全部session
-    to_del = [k for k, v in sessions.items() if v == username]
-    for k in to_del:
-        del sessions[k]
+    with _session_lock:
+        to_del = [k for k, (uname, _exp) in list(sessions.items()) if uname == username]
+        for k in to_del:
+            sessions.pop(k, None)
     save_users(users)
     add_log(_admin.username, "user_delete", f"删除用户 {username}")
     return {"code":0,"msg":"已删除"}
@@ -631,46 +681,47 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
         return None, 0
 
     items = []
-    entries = sorted(work_path.iterdir(), key=lambda x: x.name.lower())
-    for entry in entries:
-        if is_cover_file(entry.name):
-            continue
-        try:
-            rel = entry.relative_to(REAL_BASE)
-            rel_str = str(rel).replace(os.sep, "/")
-        except Exception:
-            continue
-        try:
-            st = entry.stat()
-            size = st.st_size
-            entry_mtime = st.st_mtime
-        except OSError:
-            size = None
-            entry_mtime = None
-        if entry.is_dir():
-            cover, count = get_folder_info(entry)
-            items.append({
-                "id": rel_str,
-                "name": entry.name,
-                "type": "folder",
-                "path": rel_str,
-                "cover_path": cover,
-                "count": count,
-                "mtime": entry_mtime,
-            })
-        else:
-            suf = entry.suffix.lower()
-            if suf in IMAGE_EXT:
+    # scandir 复用目录项缓存：is_dir()/stat() 不再重复发起系统调用（NAS 上收益明显）
+    with os.scandir(work_path) as it:
+        entries = sorted(it, key=lambda e: e.name.lower())
+        for entry in entries:
+            if is_cover_file(entry.name):
+                continue
+            try:
+                rel_str = os.path.relpath(entry.path, REAL_BASE).replace(os.sep, "/")
+            except Exception:
+                continue
+            try:
+                st = entry.stat()
+                size = st.st_size
+                entry_mtime = st.st_mtime
+            except OSError:
+                size = None
+                entry_mtime = None
+            if entry.is_dir():
+                cover, count = get_folder_info(Path(entry.path))
                 items.append({
-                    "id": rel_str, "name": entry.name, "type": "image",
-                    "path": rel_str, "size": size, "mtime": entry_mtime,
+                    "id": rel_str,
+                    "name": entry.name,
+                    "type": "folder",
+                    "path": rel_str,
+                    "cover_path": cover,
+                    "count": count,
+                    "mtime": entry_mtime,
                 })
-            elif suf in VIDEO_EXT:
-                duration = get_video_duration(str(entry), fetch=False)
-                items.append({
-                    "id": rel_str, "name": entry.name, "type": "video",
-                    "path": rel_str, "size": size, "mtime": entry_mtime, "duration": duration,
-                })
+            else:
+                suf = Path(entry.name).suffix.lower()
+                if suf in IMAGE_EXT:
+                    items.append({
+                        "id": rel_str, "name": entry.name, "type": "image",
+                        "path": rel_str, "size": size, "mtime": entry_mtime,
+                    })
+                elif suf in VIDEO_EXT:
+                    duration = get_video_duration(str(Path(entry.path)), fetch=False)
+                    items.append({
+                        "id": rel_str, "name": entry.name, "type": "video",
+                        "path": rel_str, "size": size, "mtime": entry_mtime, "duration": duration,
+                    })
 
     with _dir_cache_lock:
         if len(_dir_cache) >= _DIR_CACHE_MAX:
@@ -727,10 +778,12 @@ def api_logs(limit: int = 200, _admin: UserItem = Depends(require_admin)):
 @app.delete("/api/logs")
 def api_clear_logs(_admin: UserItem = Depends(require_admin)):
     """清空全部执行日志（保留一条清空操作记录，便于审计）。"""
+    global _log_line_count
     try:
         with _log_lock:
             if _LOG_FILE.exists():
                 _LOG_FILE.write_text("", encoding="utf-8")
+            _log_line_count = 0
     except Exception:
         raise HTTPException(500, detail="清除日志失败")
     # 清空后记录一条操作日志（add_log 内部自加锁，不可在 _log_lock 内调用）

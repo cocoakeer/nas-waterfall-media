@@ -1,15 +1,61 @@
+/* ===== 设计变量：A 克制精致（全局） ===== */
+:root {
+  --bg: #0e1014;
+  --surface: #171a21;
+  --surface-2: #1f232b;
+  --surface-3: #282d36;
+  --border: rgba(255, 255, 255, .08);
+  --border-strong: rgba(255, 255, 255, .16);
+  --text: #e9ecf1;
+  --text-2: #aab1bd;
+  --muted: #7b8492;
+  --accent: #5b82f7;
+  --accent-2: #7ea0ff;
+  --accent-soft: rgba(91, 130, 247, .16);
+  --danger: #f26363;
+  --danger-soft: rgba(242, 99, 99, .13);
+  --radius: 14px;
+  --radius-sm: 9px;
+  --shadow: 0 14px 34px rgba(0, 0, 0, .45);
+  --shadow-sm: 0 4px 14px rgba(0, 0, 0, .28);
+  --header-bg: rgba(23, 26, 33, .86);
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Segoe UI", sans-serif;
+}
+
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
 }
+
 body {
-  background: #111;
-  color: #fff;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  scrollbar-color: var(--surface-3) var(--bg);
 }
+
+button, input, select {
+  font-family: inherit;
+}
+
 button {
   cursor: pointer;
-  padding: 6px 12px;
-  border: none;
-  border-radius: 4px;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
 }

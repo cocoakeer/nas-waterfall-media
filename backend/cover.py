@@ -5,12 +5,15 @@
 所有缓存写入 CACHE_PATH/thumbs/ 下，保持原目录结构，按源文件 mtime 判断是否过期。
 """
 import os
+import json
+import errno
+import re
 import subprocess
 import threading
 from pathlib import Path
 from typing import Optional
 
-from .config import CACHE_PATH
+from .config import CACHE_PATH, CONFIG_PATH
 
 # 缩略图宽度（卡片 270px 的 2 倍，retina 屏足够清晰）
 THUMB_WIDTH = 540
@@ -88,18 +91,16 @@ def generate_video_cover(video_full: Path, dest_full: Path) -> tuple:
         return False, f"ffmpeg: {exc}"
 
 
-# 缩略图生成的 per-file 锁，防止同一文件被并发请求重复生成
-_locks_guard = threading.Lock()
-_locks: dict = {}
+# 条带锁：固定 64 把锁按 key 取模复用，避免为每个文件常驻一把锁导致内存无限增长
+_LOCK_STRIPES = 64
+_locks = tuple(threading.Lock() for _ in range(_LOCK_STRIPES))
+# 限制缩略图并发生成数，避免浏览器一次请求几十张图时把 NAS CPU/IO 打满
+_GEN_SLOTS = 4
+_gen_semaphore = threading.BoundedSemaphore(_GEN_SLOTS)
 
 
 def _get_lock(key: str) -> threading.Lock:
-    with _locks_guard:
-        lock = _locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _locks[key] = lock
-        return lock
+    return _locks[hash(key) % _LOCK_STRIPES]
 
 
 def ensure_thumb(src_full: Path, rel_path: str, err_out: dict = None):
@@ -116,75 +117,178 @@ def ensure_thumb(src_full: Path, rel_path: str, err_out: dict = None):
     with lock:
         if is_cache_fresh(src_full, dest):
             return dest
-        if suf in IMAGE_EXT:
-            ok, err = generate_image_thumb(src_full, dest)
-        elif suf in VIDEO_EXT:
-            ok, err = generate_video_cover(src_full, dest)
-        else:
-            return None
+        with _gen_semaphore:
+            if suf in IMAGE_EXT:
+                ok, err = generate_image_thumb(src_full, dest)
+            elif suf in VIDEO_EXT:
+                ok, err = generate_video_cover(src_full, dest)
+            else:
+                return None
     if not ok and err_out is not None:
         err_out["error"] = err
     return dest if ok else None
 
 
-def _original_exists(stem_path: Path) -> bool:
-    """判断 stem 对应的原文件是否存在（文件名与扩展名大小写均不敏感）。
+def _collect_media_stems(parent: Path):
+    """收集目录内所有媒体文件的 stem（大小写不敏感）。
 
-    用 scandir 列出目录后按 stem 匹配，避免 Linux 大小写敏感文件系统下
-    大写扩展名（如 .JPG）的原图被误判为「已删除」。
+    返回 (stems, trustworthy)。trustworthy=False 表示目录存在但读取失败
+    （无权限 / I/O 故障 / NAS 挂载异常），调用方必须跳过该目录，不能把
+    空集合当成「原图已删除」而误删缓存。
     """
-    parent = stem_path.parent
-    stem_lower = stem_path.name.lower()
+    stems = set()
     try:
         with os.scandir(parent) as it:
             for entry in it:
                 if not entry.is_file():
                     continue
-                name = entry.name
-                if Path(name).stem.lower() == stem_lower and Path(name).suffix.lower() in MEDIA_EXTS:
+                name = Path(entry.name)
+                if name.suffix.lower() in MEDIA_EXTS:
+                    stems.add(name.stem.lower())
+    except OSError as exc:
+        # 目录确实不存在或不再是目录：可安全按「原图已删除」处理
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return stems, True
+        # 其它错误无法判定，跳过不删（保守优先）
+        return stems, False
+    return stems, True
+
+
+def _media_mount_ready(media_root: Path, mountinfo_path: str = "/proc/self/mountinfo") -> bool:
+    """判断媒体根是否确实挂载生效，用于区分「媒体库真清空」与「挂载未就绪」。
+
+    Linux 容器里 /proc/self/mountinfo 第 5 列是挂载点；同时匹配媒体根
+    及其祖先目录（不含 /），兼容 MEDIA_ROOT 配到子目录的情况。
+    非 Linux 或读不到信息时返回 False，保持保守跳过。
+    """
+    try:
+        # 同时保留原始路径与符号链接解析后的路径（/tmp、软链接挂载都适用）
+        targets = {str(media_root), str(media_root.resolve())}
+    except OSError:
+        return False
+    candidates = set()
+    for target in targets:
+        cur = Path(target)
+        while cur != cur.parent:
+            candidates.add(str(cur))
+            cur = cur.parent
+    try:
+        with open(mountinfo_path, "r", encoding="utf-8") as f:
+            for line in f:
+                head = line.split(" - ", 1)[0].split()
+                if len(head) < 5:
+                    continue
+                mount_point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), head[4])
+                if mount_point.rstrip("/") in candidates:
                     return True
     except OSError:
-        pass
+        return False
     return False
 
 
 def cleanup_orphan_thumbs(media_root: Path) -> int:
     """删除原图已不存在的孤儿缩略图缓存，返回删除数量。
 
-    缓存文件名为「原文件名 stem + .jpg」，反推原图时需检查任意图片/视频扩展名。
+    按目录缓存原图 stem 集合：同一目录只 scandir 一次，避免每个缓存文件
+    都遍历整个目录（原实现 O(n^2)，媒体库大时缓存任务会卡很久）。
+    媒体根不可读、或为空且未检测到有效挂载时整体跳过，绝不误删。
     """
     thumbs_root = CACHE_PATH / "thumbs"
     if not thumbs_root.exists():
         return 0
+
+    # 挂载掉线时 /media 往往仍是个可访问的空目录。空根时看挂载点是否
+    # 真的生效：生效 = 媒体库确实清空，可按目录清理；未生效 = 跳过不删。
+    # 只取第一个条目判断，开销 O(1)。
+    try:
+        with os.scandir(media_root) as root_it:
+            root_empty = next(root_it, None) is None
+    except OSError:
+        print("[CACHE] 媒体根目录不可读，跳过孤儿缓存清理")
+        return 0
+    if root_empty:
+        if not _media_mount_ready(media_root):
+            print("[CACHE] 媒体根为空且未检测到有效挂载，跳过孤儿缓存清理")
+            return 0
+        print("[CACHE] 媒体根为空但挂载正常，按目录判定清理孤儿缓存")
+
+    stem_cache: dict = {}
     removed = 0
+    skipped_dirs = set()
     for cache_file in thumbs_root.rglob("*.jpg"):
-        rel = cache_file.relative_to(thumbs_root)  # 例如 photos/a.jpg
-        stem_path = media_root / rel.with_suffix("")  # 原图 stem：photos/a
-        if not _original_exists(stem_path):
+        rel = cache_file.relative_to(thumbs_root)
+        stem_path = media_root / rel.with_suffix("")
+        parent_key = str(stem_path.parent)
+        cached = stem_cache.get(parent_key)
+        if cached is None:
+            cached = _collect_media_stems(stem_path.parent)
+            stem_cache[parent_key] = cached
+        stems, trustworthy = cached
+        if not trustworthy:
+            skipped_dirs.add(parent_key)
+            continue
+        if stem_path.name.lower() not in stems:
             try:
                 cache_file.unlink()
                 removed += 1
             except OSError:
                 pass
+    if skipped_dirs:
+        print(f"[CACHE] {len(skipped_dirs)} 个原目录读取失败，已跳过其缓存不做删除")
     return removed
 
 
-# 视频时长缓存（内存），由缓存任务填充；列表接口默认只读，避免阻塞
+# 视频时长缓存：进程内字典 + 落盘快照，避免容器重启后时长角标全部丢失
+_DURATION_FILE = CONFIG_PATH / "durations.json"
+_DURATION_MAX = 50000
 _duration_cache: dict = {}
 _duration_lock = threading.Lock()
+_duration_dirty = False
+
+
+def load_duration_cache():
+    """启动时载入上次持久化的视频时长快照。"""
+    try:
+        if _DURATION_FILE.exists():
+            data = json.loads(_DURATION_FILE.read_text(encoding="utf-8"))
+            with _duration_lock:
+                _duration_cache.update(data)
+    except Exception:
+        pass
+
+
+def save_duration_cache():
+    """缓存任务结束后一次性落盘，避免每次探测都写文件。"""
+    global _duration_dirty
+    with _duration_lock:
+        if not _duration_dirty:
+            return
+        snapshot = dict(_duration_cache)
+        if len(snapshot) > _DURATION_MAX:
+            snapshot = dict(list(snapshot.items())[-_DURATION_MAX:])
+            _duration_cache.clear()
+            _duration_cache.update(snapshot)
+        _duration_dirty = False
+    try:
+        _DURATION_FILE.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def get_video_duration(video_path: str, fetch: bool = False) -> Optional[float]:
     """获取视频时长（秒）。fetch=False 只读缓存，缺失返回 None，不阻塞。"""
+    global _duration_dirty
     with _duration_lock:
         if video_path in _duration_cache:
             return _duration_cache[video_path]
     if not fetch:
         return None
     dur = _probe_video_duration(video_path)
-    if dur is not None:
-        with _duration_lock:
+    with _duration_lock:
+        if video_path not in _duration_cache:
+            # 探测失败也记入缓存（值为 None），避免损坏文件每次任务都重复 ffprobe
             _duration_cache[video_path] = dur
+            _duration_dirty = True
     return dur
 
 
