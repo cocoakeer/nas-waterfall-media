@@ -417,9 +417,8 @@ class CacheTask:
                 save_duration_cache()
             except Exception:
                 pass
-            # 缓存任务可能新增/删除图片，让随机幻灯片索引失效，下次请求重建
-            with _all_images_lock:
-                _all_images_cache.clear()
+            # 缓存任务可能改动媒体库：标记索引待后台重建，不阻塞用户点击
+            _mark_images_index_dirty()
             invalidate_folder_stats()
             self._set(running=False)
             self._stop.clear()
@@ -439,12 +438,17 @@ class CacheTask:
         for root, _dirs, names in os.walk(base):
             if self._stop.is_set():
                 break
+            # 每个目录算一次同名视频集合，避免 is_cover_file 对每个文件 stat 父目录
+            video_stems = {
+                Path(n).stem.lower()
+                for n in names if Path(n).suffix.lower() in VIDEO_EXT
+            }
             for name in names:
                 if self._stop.is_set():
                     break
                 if Path(name).suffix.lower() not in MEDIA_EXTS:
                     continue
-                if is_cover_file(name, Path(root)):
+                if is_cover_file(name, Path(root), video_stems):
                     continue  # 封面/元数据图不预生成缓存、不参与统计与失败计数
                 full = Path(root) / name
                 try:
@@ -521,6 +525,7 @@ def daily_cache_job():
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     load_duration_cache()
+    load_images_index()
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     scheduler.add_job(daily_cache_job, "cron", hour=3, minute=0, id="daily_cache")
     scheduler.start()
@@ -528,7 +533,12 @@ async def lifespan(_app: FastAPI):
     _folder_watcher_stop.clear()
     threading.Thread(target=_folder_watcher_loop, daemon=True, name="folder-watcher").start()
     print(f"[FOLDER] 目录变化后台校验已启动：每 {_FOLDER_STATS_CHECK_SEC} 秒")
+    _images_index_stop.clear()
+    threading.Thread(target=_images_index_loop, daemon=True, name="images-index").start()
+    print(f"[IMAGES] 图片索引后台维护已启动"
+          f"（目录变化增量合并，兜底全量 {_IMAGES_INDEX_MAX_AGE}s）")
     yield
+    _images_index_stop.set()
     _folder_watcher_stop.set()
     scheduler.shutdown(wait=False)
 
@@ -688,9 +698,35 @@ async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin
     add_log(_admin.username, "user_delete", f"删除用户 {username}")
     return {"code":0,"msg":"已删除"}
 
-# ========== 随机幻灯片：全库图片索引（按用户允许目录过滤） ==========
-_ALL_IMAGES_TTL = 300  # 索引缓存有效期（秒）
-_all_images_cache: Dict[tuple, tuple] = {}  # allow_dirs -> (构建时间, 相对路径列表)
+# ========== 随机幻灯片：全库图片索引（后台维护，点击路径只读） ==========
+# 用户点击时只读内存索引，绝不触发全库扫描。索引按目录分组维护：
+# 后台发现哪个目录变了就只重扫那一层（只有新增子目录才递归进子树），
+# 因此「往一部影片目录里加几张图」只花一次 scandir，不再重走整个媒体库。
+# 索引持久化到 config/，容器重启后也能立刻播放。
+_IMAGES_INDEX_FILE = CONFIG_DIR / "random_images.json"
+_IMAGES_INDEX_CHECK_SEC = 60        # 后台检查（兜底重建 / 落盘防抖）的间隔
+_IMAGES_INDEX_MAX_AGE = 3600        # 兜底全量重建周期，修正 mtime 基线漂移
+_IMAGES_INDEX_SAVE_MIN_INTERVAL = 120  # 增量变化后写盘的最短间隔（写盘防抖）
+_IMAGES_INDEX_FORMAT = 2            # 落盘格式版本：2 = 按目录分组
+
+# 目录绝对路径 -> 该目录下「非缩图」图片的相对路径列表。
+# 空目录不入表：全库目录数远大于有图的目录数，省内存也省拼接时间。
+_images_by_dir: Dict[str, List[str]] = {}
+# 目录绝对路径 -> 直接子目录绝对路径列表，增量时用它判断子目录增删。
+_images_subdirs: Dict[str, List[str]] = {}
+# 派生：所有目录拼接成的一维列表，get_all_images 直接读它
+_images_index: List[str] = []
+_images_index_ts: float = 0.0        # 上次「全量重建」时间，只用于兜底周期
+_images_index_gen: int = 0
+_images_index_dirty: bool = True     # 语义：有人报告索引可能过期，请尽快校验一次
+_images_index_unsaved: bool = False  # 内存已更新但还没落盘
+_images_index_saved_ts: float = 0.0
+_images_index_lock = threading.Lock()        # 只保护引用与标记，锁内绝不做 IO
+_images_index_write_lock = threading.RLock()  # 串行化全量重建与增量合并（可重入）
+_images_index_stop = threading.Event()
+
+# 派生缓存：allow_dirs -> (主索引版本, 按权限过滤后的图片列表)
+_all_images_cache: Dict[tuple, tuple] = {}
 _all_images_lock = threading.Lock()
 
 
@@ -743,55 +779,401 @@ def _entry_visible(path: Path, allowed: tuple, is_dir: bool) -> bool:
     return False
 
 
-def _walk_needed(path: Path, allow_dirs: tuple) -> bool:
-    """子目录值得继续遍历：它在允许目录内，或它是允许目录的祖先。"""
-    for allow_p in allow_dirs:
-        if _is_under(path, allow_p) or _is_under(allow_p, path):
-            return True
-    return False
+def _flatten_images(by_dir: Dict[str, List[str]]) -> List[str]:
+    """把按目录分组的索引拼成一维列表（点击路径只认这个）。"""
+    flat: List[str] = []
+    for items in by_dir.values():
+        flat.extend(items)
+    return flat
 
 
-def _collect_all_images(allow_dirs: tuple) -> List[str]:
-    """递归收集允许目录内全部图片的相对路径；跳过 cover，不做 stat 以保证速度。"""
+def _save_images_index(by_dir: Dict[str, List[str]], subdirs: Dict[str, List[str]], ts: float):
+    """原子落盘：先写临时文件再 rename，避免断电写坏索引。"""
+    tmp = _IMAGES_INDEX_FILE.with_name(_IMAGES_INDEX_FILE.name + ".tmp")
+    payload = {
+        "v": _IMAGES_INDEX_FORMAT,
+        "ts": ts,
+        "count": sum(len(v) for v in by_dir.values()),
+        "dirs": by_dir,
+        "subdirs": subdirs,
+    }
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, _IMAGES_INDEX_FILE)
+
+
+def _migrate_legacy_images(images: List[str]) -> tuple:
+    """把 v1 的一维图片列表还原成目录分组。
+
+    旧索引没有目录信息，但相对路径自带的父目录就够用：
+    dirname 即分组键，再按 key 反推一层父子关系。完全空、且没有任何图片的
+    子目录无法还原，代价只是第一次增量时多做一次递归扫描，不影响结果。
+    """
+    by_dir: Dict[str, List[str]] = {}
+    for rel in images:
+        try:
+            abs_dir = str((REAL_BASE / Path(rel).parent))
+        except Exception:
+            continue
+        by_dir.setdefault(abs_dir, []).append(rel)
+    subdirs: Dict[str, List[str]] = {}
+    for key in by_dir:
+        parent = str(Path(key).parent)
+        if parent != key:
+            subdirs.setdefault(parent, []).append(key)
+    return by_dir, subdirs
+
+
+def load_images_index():
+    """启动时从 config/ 恢复索引（毫秒级），文件损坏或不存在则由后台重建。"""
+    global _images_by_dir, _images_subdirs, _images_index
+    global _images_index_ts, _images_index_gen, _images_index_dirty
+    global _images_index_unsaved, _images_index_saved_ts
+    try:
+        if _IMAGES_INDEX_FILE.exists():
+            data = json.loads(_IMAGES_INDEX_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                by_dir = subdirs = None
+                if isinstance(data.get("dirs"), dict):
+                    by_dir = {}
+                    for key, items in data["dirs"].items():
+                        if isinstance(key, str) and isinstance(items, list):
+                            by_dir[key] = [x for x in items if isinstance(x, str)]
+                    raw_subs = data.get("subdirs")
+                    subdirs = {}
+                    if isinstance(raw_subs, dict):
+                        for key, items in raw_subs.items():
+                            if isinstance(key, str) and isinstance(items, list):
+                                subdirs[key] = [x for x in items if isinstance(x, str)]
+                    ts = float(data.get("ts", 0)) or time.time()
+                elif isinstance(data.get("images"), list):
+                    # v1 兼容：按路径分组，并在 60 秒内补一次全量重建
+                    legacy = [x for x in data["images"] if isinstance(x, str)]
+                    by_dir, subdirs = _migrate_legacy_images(legacy)
+                    ts = 0.0
+                if by_dir is not None:
+                    flat = _flatten_images(by_dir)
+                    with _images_index_lock:
+                        _images_by_dir = by_dir
+                        _images_subdirs = subdirs or {}
+                        _images_index = flat
+                        _images_index_ts = ts
+                        _images_index_gen += 1
+                        _images_index_dirty = False
+                        # 重新排一次盘：把旧格式升级成分组格式
+                        _images_index_unsaved = ts == 0.0
+                        _images_index_saved_ts = ts
+                    print(f"[IMAGES] 从磁盘恢复图片索引 {len(flat)} 张 / {len(by_dir)} 个目录")
+                    return
+    except Exception as exc:
+        print(f"[IMAGES] 图片索引文件损坏（{exc}），由后台重建")
+    _images_index_dirty = True
+
+
+def _mark_images_index_dirty():
+    """媒体库可能变了：只做标记，实际校验交给后台，不阻塞用户点击。"""
+    global _images_index_dirty
+    with _images_index_lock:
+        _images_index_dirty = True
+
+
+def _clear_images_index_dirty():
+    global _images_index_dirty
+    with _images_index_lock:
+        _images_index_dirty = False
+
+
+def _images_index_loop():
+    """兜底维护：启动预热一次 + 每 _IMAGES_INDEX_MAX_AGE 全量重建一次。
+
+    日常「哪个目录变了」由目录 watcher 驱动增量合并，这里不再定时全扫，
+    百万级图库也不会出现「每十分钟全库重走一遍」的持续压力。
+    """
+    if not _images_index or _images_index_dirty:
+        _rebuild_images_index("（启动预热）")
+    while not _images_index_stop.wait(_IMAGES_INDEX_CHECK_SEC):
+        try:
+            with _images_index_lock:
+                age = time.time() - _images_index_ts
+                unsaved = _images_index_unsaved
+                saved_age = time.time() - _images_index_saved_ts
+            if age >= _IMAGES_INDEX_MAX_AGE:
+                _rebuild_images_index("（兜底全量）")
+            elif unsaved and saved_age >= _IMAGES_INDEX_SAVE_MIN_INTERVAL:
+                _flush_images_index()
+        except Exception as exc:
+            print(f"[IMAGES] 后台索引维护异常：{exc}")
+
+
+def _images_in_names(dir_p: Path, names) -> List[str]:
+    """一个目录内的图片（排除封面/剧照/与视频同名的缩图）。
+
+    video_stems 在本层只算一次，避免每张图片都去 scandir 父目录。
+    """
+    video_stems = {
+        Path(n).stem.lower() for n in names if Path(n).suffix.lower() in VIDEO_EXT
+    }
     images = []
-    # 允许根目录时无需剪枝，避免对每个目录做多余的相对路径判断
-    skip_prune = any(p == REAL_BASE for p in allow_dirs)
-    for root, dirs, names in os.walk(REAL_BASE):
-        if not skip_prune:
-            root_path = Path(root)
-            dirs[:] = [d for d in dirs if _walk_needed(root_path / d, allow_dirs)]
-        for name in names:
-            if Path(name).suffix.lower() not in IMAGE_EXT or is_cover_file(name, Path(root)):
-                continue
-            full = Path(root) / name
-            if not any(_is_under(full, allow_p) for allow_p in allow_dirs):
-                continue
-            try:
-                images.append(str(full.relative_to(REAL_BASE)).replace(os.sep, "/"))
-            except ValueError:
-                continue
+    for name in names:
+        if Path(name).suffix.lower() not in IMAGE_EXT:
+            continue
+        if is_cover_file(name, dir_p, video_stems):
+            continue
+        try:
+            images.append(str((dir_p / name).relative_to(REAL_BASE)).replace(os.sep, "/"))
+        except ValueError:
+            continue
     return images
 
 
+def _collect_images_grouped(root_p: Path) -> tuple:
+    """walk 整棵子树：返回 ({目录: [图片]}, {目录: [直接子目录]})。"""
+    by_dir: Dict[str, List[str]] = {}
+    subdirs: Dict[str, List[str]] = {}
+    for root, dirs, names in os.walk(root_p):
+        root_path = Path(root)
+        key = str(root_path)
+        images = _images_in_names(root_path, names)
+        if images:
+            by_dir[key] = images
+        if dirs:
+            subdirs[key] = [str(root_path / d) for d in dirs]
+    return by_dir, subdirs
+
+
+def _scan_dir_shallow(dir_p: Path) -> Optional[tuple]:
+    """只扫一层：返回 ([文件名], [子目录绝对路径])；目录已消失返回 None。
+
+    其它 OSError（权限、I/O 故障、ESTALE）直接抛出，调用方据此保留原有条目
+    —— 挂载抖一下就把整棵子树从索引里删掉是最坏的结果。
+    """
+    try:
+        with os.scandir(dir_p) as it:
+            entries = list(it)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise
+    names = [e.name for e in entries if not e.is_dir()]
+    subs = [str(dir_p / e.name) for e in entries if e.is_dir()]
+    return names, subs
+
+
+def _drop_images_subtree(by_dir: dict, subdirs: dict, root_key: str):
+    """从副本里删掉某个目录及其整棵子树的条目。"""
+    prefix = root_key + os.sep
+    for k in [k for k in by_dir if k == root_key or k.startswith(prefix)]:
+        by_dir.pop(k, None)
+    for k in [k for k in subdirs if k == root_key or k.startswith(prefix)]:
+        subdirs.pop(k, None)
+
+
+def _refresh_images_subtrees(changed, removed=()) -> bool:
+    """按目录增量刷新图片索引，替代「有变化就全量重扫」。
+
+    每个变化目录只重扫本层；只有子目录清单出现新增时才递归进新子树。
+    父目录 mtime 变化必然意味着它的直接内容变了，而深层变化会让那一层
+    自己出现在 changed 里，所以逐层处理不会漏。copy-on-write：构建期间
+    用户点击读到的仍是旧索引，合并完成才整体换引用。
+    """
+    global _images_by_dir, _images_subdirs, _images_index
+    global _images_index_gen, _images_index_unsaved
+    changed = [str(k) for k in changed]
+    # 删除项先归并到最顶层：整棵目录树被删时，逐个删会退化成 O(n²)
+    removed = _topmost_paths([str(k) for k in removed])
+    if not changed and not removed:
+        return False
+    if not _media_root_ready():
+        print("[IMAGES] /media 未挂载或不可读，跳过索引增量刷新")
+        return False
+    t0 = time.perf_counter()
+    with _images_index_write_lock:
+        with _images_index_lock:
+            if not _images_index:
+                return False
+            new_by_dir = dict(_images_by_dir)
+            new_subdirs = dict(_images_subdirs)
+            old_subdirs = _images_subdirs
+        touched = 0
+        rescanned = []  # 已整棵重扫过的子树，其内部目录不必再逐个处理
+        for key in sorted(set(removed), key=len):
+            if any(key == r or key.startswith(r + os.sep) for r in rescanned):
+                continue
+            _drop_images_subtree(new_by_dir, new_subdirs, key)
+            touched += 1
+        for key in sorted(set(changed), key=len):
+            if any(key == r or key.startswith(r + os.sep) for r in rescanned):
+                continue
+            dir_p = Path(key)
+            try:
+                scanned = _scan_dir_shallow(dir_p)
+            except OSError as exc:
+                print(f"[IMAGES] 目录暂时不可读，保留原有条目：{key}（{exc}）")
+                continue
+            touched += 1
+            if scanned is None:
+                _drop_images_subtree(new_by_dir, new_subdirs, key)
+                continue
+            names, subs = scanned
+            images = _images_in_names(dir_p, names)
+            if images:
+                new_by_dir[key] = images
+            else:
+                new_by_dir.pop(key, None)
+            if subs:
+                new_subdirs[key] = subs
+            else:
+                new_subdirs.pop(key, None)
+            # 子目录增删：新增的递归收进来，消失的整支摘掉
+            previous = set(old_subdirs.get(key, []))
+            current = set(subs)
+            for gone in previous - current:
+                _drop_images_subtree(new_by_dir, new_subdirs, gone)
+            for added in current - previous:
+                sub_by_dir, sub_dirs = _collect_images_grouped(Path(added))
+                new_by_dir.update(sub_by_dir)
+                new_subdirs.update(sub_dirs)
+                rescanned.append(added)
+        if not touched:
+            return False
+        ts = time.time()
+        flat = _flatten_images(new_by_dir)
+        with _images_index_lock:
+            _images_by_dir = new_by_dir
+            _images_subdirs = new_subdirs
+            _images_index = flat
+            _images_index_gen += 1
+            _images_index_unsaved = True
+            _images_index_dirty = False
+            need_save = ts - _images_index_saved_ts >= _IMAGES_INDEX_SAVE_MIN_INTERVAL
+        with _all_images_lock:
+            _all_images_cache.clear()
+        if need_save:
+            _flush_images_index()
+        print(f"[IMAGES] 增量刷新 {len(flat)} 张 / {touched} 个目录，"
+              f"耗时 {time.perf_counter()-t0:.3f}s")
+        return True
+
+
+def _flush_images_index() -> bool:
+    """把当前内存索引落盘（写盘防抖由调用方判断）。"""
+    global _images_index_unsaved, _images_index_saved_ts
+    with _images_index_write_lock:
+        with _images_index_lock:
+            if not _images_index_unsaved or not _images_by_dir:
+                return False
+            by_dir = _images_by_dir
+            subdirs = _images_subdirs
+        ts = time.time()
+        try:
+            _save_images_index(by_dir, subdirs, ts)
+        except Exception as exc:
+            print(f"[IMAGES] 索引落盘失败：{exc}")
+            return False
+        with _images_index_lock:
+            _images_index_unsaved = False
+            _images_index_saved_ts = ts
+        return True
+
+
+def _rebuild_images_index(reason: str = "") -> bool:
+    """全量重建：整库扫描 → 原子落盘 → 替换内存引用 → 失效派生缓存。"""
+    global _images_by_dir, _images_subdirs, _images_index
+    global _images_index_ts, _images_index_gen, _images_index_dirty
+    global _images_index_unsaved, _images_index_saved_ts
+    t0 = time.perf_counter()
+    if not _media_root_ready():
+        print("[IMAGES] /media 未挂载或不可读，跳过本次重建")
+        return False
+    with _images_index_write_lock:
+        try:
+            by_dir, subdirs = _collect_images_grouped(REAL_BASE)
+        except Exception as exc:
+            print(f"[IMAGES] 索引重建失败：{exc}")
+            return False
+        with _images_index_lock:
+            old_len = len(_images_index)
+        if old_len and not by_dir:
+            # 索引非空却扫出 0 张：几乎都是挂载点没生效或库暂时读不到
+            print(f"[IMAGES] 扫描结果从 {old_len} 张变成 0 张，疑似挂载异常，保留原索引")
+            return False
+        ts = time.time()
+        flat = _flatten_images(by_dir)
+        with _images_index_lock:
+            _images_by_dir = by_dir
+            _images_subdirs = subdirs
+            _images_index = flat
+            _images_index_ts = ts
+            _images_index_gen += 1
+            _images_index_dirty = False
+        with _all_images_lock:
+            _all_images_cache.clear()
+        try:
+            _save_images_index(by_dir, subdirs, ts)
+            with _images_index_lock:
+                _images_index_unsaved = False
+                _images_index_saved_ts = ts
+        except Exception as exc:
+            print(f"[IMAGES] 索引落盘失败（{exc}），仅更新内存")
+            with _images_index_lock:
+                _images_index_unsaved = True
+    print(f"[IMAGES] 索引重建完成 {len(flat)} 张 / {len(by_dir)} 个目录，"
+          f"耗时 {time.perf_counter()-t0:.2f}s{reason}")
+    return True
+
+
+def _allow_prefixes(allowed) -> List[str]:
+    """把允许目录换算成「相对媒体根的 posix 路径前缀」。
+
+    受限用户的过滤是百万级热路径：原来每条都要构造 Path 再 relative_to
+    并捕获异常，实测 100 万张要 10 秒以上；换成字符串前缀后只剩几十毫秒。
+    索引里的路径都是 posix 分隔、且都位于 REAL_BASE 之内，语义完全等价。
+    """
+    prefixes = []
+    for p in allowed:
+        try:
+            rel = p.relative_to(REAL_BASE).as_posix()
+        except ValueError:
+            continue
+        if rel in ("", "."):
+            continue
+        prefixes.append(rel + "/")
+    return prefixes
+
+
 def get_all_images(user: UserItem) -> List[str]:
-    """按用户允许目录缓存全库图片索引，避免每次随机播放都遍历整个媒体库。"""
+    """点击路径：只读内存索引并按 allow_dirs 过滤，绝不触发全库扫描。"""
     key = tuple(sorted(user.allow_dirs))
-    now = time.time()
+    with _images_index_lock:
+        source = _images_index
+        gen = _images_index_gen
     with _all_images_lock:
         cached = _all_images_cache.get(key)
-        if cached is not None and now - cached[0] < _ALL_IMAGES_TTL:
+        if cached is not None and cached[0] == gen:
             return cached[1]
-    # 全库扫描可能耗时数秒，放到锁外，避免其它请求排队等锁
-    images = _collect_all_images(_resolved_allow_dirs(user.allow_dirs))
+    allowed = _resolved_allow_dirs(user.allow_dirs)
+    if any(x == REAL_BASE for x in allowed):
+        images = list(source)
+    else:
+        prefixes = _allow_prefixes(allowed)
+        images = [rel for rel in source if any(rel.startswith(pfx) for pfx in prefixes)]
     with _all_images_lock:
-        _all_images_cache[key] = (time.time(), images)
+        _all_images_cache[key] = (gen, images)
     return images
 
 
 @app.get("/api/random-images")
 def api_random_images(limit: int = 1000, user: UserItem = Depends(get_current_user)):
     """从整个媒体库随机抽取图片（按用户允许目录过滤），供首页随机幻灯片使用。"""
+    global _last_list_activity
+    _last_list_activity = time.time()  # 只看幻灯片也算有人访问，后台别因空闲暂停
     limit = max(1, min(limit, RANDOM_IMAGES_LIMIT_MAX))
+    # 首次部署时后台预热可能尚未完成，最多等 1.5 秒；不在这里自己扫全库
+    if not _images_index:
+        deadline = time.time() + 1.5
+        while time.time() < deadline and not _images_index:
+            time.sleep(0.05)
+    if not _images_index:
+        return {"code": 2, "list": [], "total": 0, "msg": "图片索引准备中，请稍候重试"}
     images = get_all_images(user)
     picked = random.sample(images, min(limit, len(images))) if images else []
     items = [
@@ -1042,6 +1424,9 @@ def _verify_folder_stats(mountinfo_path: str = "/proc/self/mountinfo") -> int:
     with _folder_stats_lock:
         snap = _folder_stats
     if not snap:
+        # 还没人翻过目录时快照是空的，角标和图片索引都需要一个 mtime 基线
+        snap = _get_folder_stats()
+    if not snap:
         return 0
     changed, removed = [], []
     unreadable = 0
@@ -1064,13 +1449,20 @@ def _verify_folder_stats(mountinfo_path: str = "/proc/self/mountinfo") -> int:
         print("[FOLDER] 子目录读取异常或大量目录消失，跳过本次校验")
         return 0
     if not changed and not removed:
+        _clear_images_index_dirty()
         return 0
     roots = _topmost_paths(changed)
     removed_roots = [k for k in _topmost_paths(removed)
                      if not any(k == r or k.startswith(r + os.sep) for r in roots)]
     if not roots and not removed_roots:
+        _clear_images_index_dirty()
         return 0
     _refresh_folder_subtrees([Path(k) for k in roots], removed_roots)
+    # 同一次 mtime 比对顺带更新图片索引，不再为它单独全库重扫一遍。
+    # 父目录被子目录覆盖时（changed 里父子都有）恰好只处理父，子目录的
+    # 旧 mtime 留在快照里，下一轮会被再次发现并补上，最多晚一个周期。
+    _refresh_images_subtrees(roots, removed_roots)
+    _clear_images_index_dirty()
     return len(roots) + len(removed_roots)
 
 
@@ -1078,11 +1470,14 @@ def _folder_watcher_loop():
     """空闲时自动暂停，有人访问才按周期校验，避免没人看也一直打扰 NAS。"""
     while not _folder_watcher_stop.wait(_FOLDER_STATS_CHECK_SEC):
         try:
-            if time.time() - _last_list_activity > _FOLDER_STATS_IDLE_SEC:
+            with _images_index_lock:
+                hint = _images_index_dirty
+            # 缓存任务 / 启动预热报告过索引可能过期，就插队校验一次
+            if not hint and time.time() - _last_list_activity > _FOLDER_STATS_IDLE_SEC:
                 continue
             n = _verify_folder_stats()
             if n:
-                print(f"[FOLDER] 后台检测到 {n} 处目录变化，已增量刷新角标快照")
+                print(f"[FOLDER] 后台检测到 {n} 处目录变化，已增量刷新角标与图片索引")
         except Exception as exc:
             print(f"[FOLDER] 后台目录校验异常：{exc}")
 

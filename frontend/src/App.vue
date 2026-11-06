@@ -85,7 +85,7 @@
           <svg class="sort-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
         </div>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
-        <button @click="startRandomSlide" class="btn primary" :disabled="randomSlideLoading">{{ randomSlideLoading ? '加载中…' : '随机幻灯片' }}</button>
+        <button @click="startRandomSlide" class="btn primary" :disabled="randomSlideLoading">{{ randomSlideLoading ? (randomSlideHint || '加载中…') : '随机幻灯片' }}</button>
       </div>
     </header>
     <div class="breadcrumb">
@@ -543,7 +543,14 @@ const currentSlide = ref({})
 const randomSlideLoading = ref(false)
 const randomSlideMode = ref(false)
 const randomBatchLoading = ref(false)
+// 首次启动后台要在后台建图片索引，大库可能要几十秒，这里把它显示出来
+const randomSlideHint = ref('')
 const RANDOM_BATCH_SIZE = 1000
+// 后端索引未就绪时返回 code=2：首点最多等 90 秒（NAS 冷扫 100 万图约 22~45 秒），
+// 换批只等 8 秒——换批失败有洗牌兜底，不能让播放干等
+const RANDOM_INDEX_WAIT_MS = 90000
+const RANDOM_BATCH_WAIT_MS = 8000
+const RANDOM_INDEX_RETRY_MS = 2000
 
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
@@ -1069,21 +1076,45 @@ async function saveSetting() {
 }
 
 // 从整个媒体库随机取一批图片
-async function fetchRandomImages() {
-  const res = await fetch(`${baseUrl}/api/random-images?limit=${RANDOM_BATCH_SIZE}`)
-  if (!res.ok) { checkAuthResp(res); return null }
-  const j = await res.json()
-  if (j.code !== 0) return null
-  return j.list || []
+// onWaiting：索引还在预热时逐轮回调，用于把「正在建索引」显示给用户
+async function fetchRandomImages(onWaiting = null, waitMs = RANDOM_INDEX_WAIT_MS) {
+  const deadline = Date.now() + waitMs
+  let attempt = 0
+  while (Date.now() < deadline) {
+    const res = await fetch(`${baseUrl}/api/random-images?limit=${RANDOM_BATCH_SIZE}`)
+    if (!res.ok) { checkAuthResp(res); return null }
+    const j = await res.json()
+    if (j.code === 2) {
+      // 索引还没建好：不是故障，继续等，但不超过 waitMs
+      attempt++
+      onWaiting?.(attempt)
+      const left = deadline - Date.now()
+      if (left <= 0) break
+      await new Promise(r => setTimeout(r, Math.min(RANDOM_INDEX_RETRY_MS, left)))
+      continue
+    }
+    if (j.code !== 0) return null
+    return j.list || []
+  }
+  return null
 }
 
 // 首页随机幻灯片：点击后播放第一批（不影响预览里的顺序播放）
 async function startRandomSlide() {
   if (randomSlideLoading.value) return
   randomSlideLoading.value = true
+  randomSlideHint.value = ''
+  let warming = false
   try {
-    const list = await fetchRandomImages()
-    if (list === null) return alert('❌ 随机幻灯片加载失败')
+    const list = await fetchRandomImages(n => {
+      warming = true
+      randomSlideHint.value = `正在建立图片索引（${n * 2}s）`
+    })
+    if (list === null) {
+      return alert(warming
+        ? '图片索引还在建立中：媒体库越大首次启动越慢，过一会儿再试即可'
+        : '❌ 随机幻灯片加载失败')
+    }
     if (!list.length) return alert('媒体库里没有可用于幻灯片的图片')
     slideList.value = list
     randomSlideMode.value = true
@@ -1096,6 +1127,7 @@ async function startRandomSlide() {
     alert('❌ 加载图片失败，请稍后重试')
   } finally {
     randomSlideLoading.value = false
+    randomSlideHint.value = ''
   }
 }
 
@@ -1104,7 +1136,8 @@ async function reloadRandomBatch() {
   if (randomBatchLoading.value) return false
   randomBatchLoading.value = true
   try {
-    const list = await fetchRandomImages()
+    // 换批用短窗口：失败就洗牌续播，不能让轮播卡在等索引上
+    const list = await fetchRandomImages(null, RANDOM_BATCH_WAIT_MS)
     if (list && list.length) {
       slideList.value = list
       return true
