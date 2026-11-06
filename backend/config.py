@@ -21,11 +21,10 @@ def _default_slide_delay() -> int:
 
 def load_settings():
     if not SETTINGS_FILE.exists():
+        # 只存真正被读取的字段；media_root 来自环境变量、view_mode 从未使用
         default = {
-            "media_root": os.getenv("MEDIA_ROOT", "/media"),
             "slide_delay": _default_slide_delay(),
             "slide_loop": True,
-            "view_mode": "waterfall",
         }
         save_settings(default)
         return default
@@ -43,5 +42,7 @@ def load_settings():
 
 
 def save_settings(data: dict):
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # 原子写：写一半被 kill 会留下损坏的 settings.json
+    tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, SETTINGS_FILE)

@@ -8,6 +8,7 @@ import os
 import json
 import errno
 import re
+import time
 import subprocess
 import threading
 from collections import OrderedDict
@@ -88,23 +89,64 @@ def artwork_rank(name: str, video_stems: set = None) -> int:
 
 
 def get_thumb_cache_path(rel_path: str) -> Path:
-    """缩略图缓存绝对路径（图片与视频统一，按 stem + .jpg 命名）。"""
+    """缩略图缓存绝对路径：保留源文件完整文件名再加 .jpg。
+
+    只按 stem 命名会让同目录的 a.jpg 和 a.mp4 撞到同一个缓存文件：
+    谁后生成谁赢，另一边反复判定过期并重建，还可能把视频封面显示成图片。
+    """
     p = Path(rel_path)
-    return CACHE_PATH / "thumbs" / p.parent / (p.stem + ".jpg")
+    return CACHE_PATH / "thumbs" / p.parent / (p.name + ".jpg")
+
+
+def _freshness_mtime(src: Path) -> float:
+    """缩略图的新鲜度基准时间。
+
+    图片用自己的 mtime。视频优先看本地海报：换海报要重建。
+    海报被**删掉**时不能只回退到视频 mtime——视频 mtime 通常很旧，会让
+    「用已删除海报生成的旧缩略图」永远判定新鲜。所以无海报时取「视频 mtime
+    与所在目录 mtime 中较新的那个」，目录有变动就重建。
+    """
+    if src.suffix.lower() not in VIDEO_EXT:
+        return src.stat().st_mtime
+    artwork = find_local_artwork(src)
+    if artwork is not None:
+        try:
+            return artwork.stat().st_mtime
+        except OSError:
+            pass
+    dir_mtime = 0.0
+    try:
+        dir_mtime = src.parent.stat().st_mtime
+    except OSError:
+        pass
+    try:
+        return max(src.stat().st_mtime, dir_mtime)
+    except OSError:
+        return dir_mtime
 
 
 def is_cache_fresh(src_full: Path, cache_full: Path) -> bool:
-    """缓存存在且不旧于源文件，则视为新鲜，可跳过生成。"""
+    """缓存存在且 mtime 不旧于新鲜度基准（见 _freshness_mtime）即可跳过生成。"""
     try:
         if not cache_full.exists():
             return False
-        return cache_full.stat().st_mtime >= src_full.stat().st_mtime
+        return cache_full.stat().st_mtime >= _freshness_mtime(src_full)
     except OSError:
         return False
 
 
+def _part_path(dest: Path) -> Path:
+    """缩略图的临时文件名：保持 .jpg 后缀让 Pillow/ffmpeg 能推断格式。
+
+    孤儿清理识别 .part.jpg：停放不足 1 小时的视为正在写、跳过；
+    超过 1 小时的才当残留清掉，所以半截文件不会永久堆积。
+    """
+    return dest.with_name(f"{dest.stem}.part{dest.suffix}")
+
+
 def generate_image_thumb(src_full: Path, dest_full: Path) -> tuple:
     """Pillow 生成图片缩略图，返回 (成功与否, 错误信息)。"""
+    tmp = _part_path(dest_full)
     try:
         from PIL import Image, ImageFile
 
@@ -115,9 +157,16 @@ def generate_image_thumb(src_full: Path, dest_full: Path) -> tuple:
             img = img.convert("RGB")  # 统一处理 PNG 透明 / GIF 等
             img.thumbnail((THUMB_WIDTH, THUMB_MAX_HEIGHT), Image.LANCZOS)
             dest_full.parent.mkdir(parents=True, exist_ok=True)
-            img.save(dest_full, "JPEG", quality=80)
+            # 先写临时文件再原子换名：直接写目标文件时若进程被杀会留下半截 JPEG，
+            # 而它的 mtime 已经是新的，is_cache_fresh 会永远认为它新鲜，再也不重建
+            img.save(tmp, "JPEG", quality=80)
+        os.replace(tmp, dest_full)
         return True, ""
     except Exception as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False, f"Pillow: {exc}"
 
 
@@ -248,35 +297,48 @@ def find_local_artwork(video_full: Path):
     return _cache_put(_artwork_result_cache, cache_key, chosen, _RESULT_CACHE_MAX)
 
 
-def thumb_source(video_full: Path) -> Path:
-    """视频缩略图的新鲜度依据：有本地封面就跟着封面 mtime，否则跟着视频 mtime。"""
-    return find_local_artwork(video_full) or video_full
-
-
 def generate_video_cover(video_full: Path, dest_full: Path) -> tuple:
     """优先用同目录 Emby 本地封面生成缩略图，没有才回退 ffmpeg 抽首帧。"""
-    dest_full.parent.mkdir(parents=True, exist_ok=True)
-    artwork = find_local_artwork(video_full)
-    if artwork is not None:
-        ok, err = generate_image_thumb(artwork, dest_full)
-        return ok, (f"Pillow(artwork): {err}" if not ok else "")
-    cmd = [
-        "ffmpeg",
-        "-i", str(video_full),
-        "-vframes", "1",
-        "-vf", f"scale={THUMB_WIDTH}:-1",
-        "-q:v", "9",
-        "-y",
-        str(dest_full),
-    ]
+    tmp = _part_path(dest_full)
     try:
+        dest_full.parent.mkdir(parents=True, exist_ok=True)
+        artwork = find_local_artwork(video_full)
+        if artwork is not None:
+            ok, err = generate_image_thumb(artwork, dest_full)
+            return ok, (f"Pillow(artwork): {err}" if not ok else "")
+        cmd = [
+            "ffmpeg",
+            "-i", str(video_full),
+            "-vframes", "1",
+            "-vf", f"scale={THUMB_WIDTH}:-1",
+            "-q:v", "9",
+            "-y",
+            str(tmp),
+        ]
         result = subprocess.run(cmd, capture_output=True, timeout=15)
-        if dest_full.exists():
+        # 不能只看文件存在：ffmpeg 失败时也会留下 0 字节文件，而它 mtime 是新的，
+        # is_cache_fresh 会一直判定新鲜，坏图永不重建
+        if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, dest_full)
             return True, ""
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         # 抽帧失败：错误信息在 stderr 末尾（头部是版本/版权声明），取末尾 300 字符
         err = result.stderr.decode("utf-8", errors="ignore").strip()
         return False, f"ffmpeg: {err[-300:]}"
+    except subprocess.TimeoutExpired:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, "ffmpeg: 抽帧超时（15 秒）"
     except Exception as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False, f"ffmpeg: {exc}"
 
 
@@ -299,50 +361,56 @@ def ensure_thumb(src_full: Path, rel_path: str, err_out: dict = None):
     """
     suf = src_full.suffix.lower()
     dest = get_thumb_cache_path(rel_path)
-    # 视频缩略图可能来自本地 Emby 封面，新鲜度以封面图为准（换海报能自动重建）
-    freshness_src = thumb_source(src_full) if suf in VIDEO_EXT else src_full
-    if is_cache_fresh(freshness_src, dest):
+    # 新鲜度规则只有一处：is_cache_fresh → _freshness_mtime。
+    # 图片看自身 mtime；视频有海报看海报、无海报看 max(视频, 目录 mtime)。
+    if is_cache_fresh(src_full, dest):
         return dest
     # double-checked locking：同一文件并发请求时串行化，避免重复生成
     lock = _get_lock(str(dest))
     with lock:
-        if is_cache_fresh(freshness_src, dest):
+        if is_cache_fresh(src_full, dest):
             return dest
         with _gen_semaphore:
-            if suf in IMAGE_EXT:
-                ok, err = generate_image_thumb(src_full, dest)
-            elif suf in VIDEO_EXT:
-                ok, err = generate_video_cover(src_full, dest)
-            else:
-                return None
+            # 单个文件出任何意外都只算这一个失败，不能让整个缓存任务中断
+            try:
+                if suf in IMAGE_EXT:
+                    ok, err = generate_image_thumb(src_full, dest)
+                elif suf in VIDEO_EXT:
+                    ok, err = generate_video_cover(src_full, dest)
+                else:
+                    return None
+            except Exception as exc:
+                ok, err = False, f"未捕获异常：{exc}"
     if not ok and err_out is not None:
         err_out["error"] = err
     return dest if ok else None
 
 
-def _collect_media_stems(parent: Path):
-    """收集目录内所有媒体文件的 stem（大小写不敏感）。
+def _collect_media_names(parent: Path):
+    """收集目录内所有媒体文件名（小写、含扩展名）。
 
-    返回 (stems, trustworthy)。trustworthy=False 表示目录存在但读取失败
+    必须带扩展名：缓存名现在是「源文件名 + .jpg」，a.jpg 与 a.mp4 是两个
+    不同条目，只比 stem 会把它们混为一谈。
+
+    返回 (names, trustworthy)。trustworthy=False 表示目录存在但读取失败
     （无权限 / I/O 故障 / NAS 挂载异常），调用方必须跳过该目录，不能把
     空集合当成「原图已删除」而误删缓存。
     """
-    stems = set()
+    names = set()
     try:
         with os.scandir(parent) as it:
             for entry in it:
                 if not entry.is_file():
                     continue
-                name = Path(entry.name)
-                if name.suffix.lower() in MEDIA_EXTS:
-                    stems.add(name.stem.lower())
+                if Path(entry.name).suffix.lower() in MEDIA_EXTS:
+                    names.add(entry.name.lower())
     except OSError as exc:
         # 目录确实不存在或不再是目录：可安全按「原图已删除」处理
         if exc.errno in (errno.ENOENT, errno.ENOTDIR):
-            return stems, True
+            return names, True
         # 其它错误无法判定，跳过不删（保守优先）
-        return stems, False
-    return stems, True
+        return names, False
+    return names, True
 
 
 def _media_mount_ready(media_root: Path, mountinfo_path: str = "/proc/self/mountinfo") -> bool:
@@ -380,7 +448,7 @@ def _media_mount_ready(media_root: Path, mountinfo_path: str = "/proc/self/mount
 def cleanup_orphan_thumbs(media_root: Path) -> int:
     """删除原图已不存在的孤儿缩略图缓存，返回删除数量。
 
-    按目录缓存原图 stem 集合：同一目录只 scandir 一次，避免每个缓存文件
+    按目录缓存原图文件名集合：同一目录只 scandir 一次，避免每个缓存文件
     都遍历整个目录（原实现 O(n^2)，媒体库大时缓存任务会卡很久）。
     媒体根不可读、或为空且未检测到有效挂载时整体跳过，绝不误删。
     """
@@ -403,22 +471,40 @@ def cleanup_orphan_thumbs(media_root: Path) -> int:
             return 0
         print("[CACHE] 媒体根为空但挂载正常，按目录判定清理孤儿缓存")
 
-    stem_cache: dict = {}
+    name_cache: dict = {}
     removed = 0
     skipped_dirs = set()
     for cache_file in thumbs_root.rglob("*.jpg"):
         rel = cache_file.relative_to(thumbs_root)
-        stem_path = media_root / rel.with_suffix("")
-        parent_key = str(stem_path.parent)
-        cached = stem_cache.get(parent_key)
+        # 缓存名 = 源文件名 + .jpg，去掉最外层后缀正好还原原媒体的文件名
+        src_path = media_root / rel.with_suffix("")
+        # 生成中的临时文件（a.mp4.part.jpg）：绝不能删——缓存任务清理阶段
+        # 和 /api/thumb 的生成可能同时进行，删掉会让 os.replace 失败、缩略图丢失。
+        # 只有停放超过一小时、明显是残留的才清掉。
+        if src_path.name.lower().endswith(".part"):
+            try:
+                st = cache_file.stat()
+                if time.time() - st.st_mtime < 3600:
+                    continue
+                # TOCTOU 复核：stat 与 unlink 之间可能正好有新的生成任务
+                # 重建了同名 .part，mtime 会变（新文件不可能是 1 小时前的）
+                if cache_file.stat().st_mtime != st.st_mtime:
+                    continue
+                cache_file.unlink()
+                removed += 1
+            except OSError:
+                continue
+            continue
+        parent_key = str(src_path.parent)
+        cached = name_cache.get(parent_key)
         if cached is None:
-            cached = _collect_media_stems(stem_path.parent)
-            stem_cache[parent_key] = cached
-        stems, trustworthy = cached
+            cached = _collect_media_names(src_path.parent)
+            name_cache[parent_key] = cached
+        names, trustworthy = cached
         if not trustworthy:
             skipped_dirs.add(parent_key)
             continue
-        if stem_path.name.lower() not in stems:
+        if src_path.name.lower() not in names:
             try:
                 cache_file.unlink()
                 removed += 1
@@ -459,11 +545,20 @@ def save_duration_cache():
             snapshot = dict(list(snapshot.items())[-_DURATION_MAX:])
             _duration_cache.clear()
             _duration_cache.update(snapshot)
-        _duration_dirty = False
+    tmp = _DURATION_FILE.with_name(_DURATION_FILE.name + ".tmp")
     try:
-        _DURATION_FILE.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, _DURATION_FILE)
     except Exception:
-        pass
+        # 写失败（只读配置卷 / 磁盘满）就保留 dirty，下次任务结束再试，
+        # 否则这一批探测结果永远不会再落盘
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    with _duration_lock:
+        _duration_dirty = False
 
 
 def get_video_duration(video_path: str, fetch: bool = False) -> Optional[float]:

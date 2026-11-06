@@ -4,6 +4,8 @@ import json
 import bcrypt
 import uuid
 import random
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
@@ -28,22 +30,19 @@ from .cover import (
     cleanup_orphan_thumbs,
     _media_mount_ready,
     get_video_duration,
-    thumb_source,
     load_duration_cache,
     save_duration_cache,
 )
-from .config import load_settings, save_settings
+from .config import load_settings, save_settings, CONFIG_PATH, CACHE_PATH
 
 # ========== 配置读取 适配compose CONFIG_PATH / CACHE_PATH ==========
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
 REAL_BASE = Path(MEDIA_ROOT).resolve()  # 预计算，避免每个请求重复 resolve
-CONFIG_DIR = Path(os.getenv("CONFIG_PATH", "/config"))
-CACHE_DIR = Path(os.getenv("CACHE_PATH", "/cache"))
-# 创建目录并设置权限，打印路径用于排错
-CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o775)
-CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o775)
+# 目录统一复用 config.py 的定义（它 import 时就已 mkdir），不再各建一套
+# Path 对象，避免以后改一处漏一处；mode 对已存在目录本来也不生效
+CONFIG_DIR = CONFIG_PATH
+CACHE_DIR = CACHE_PATH
 USER_CONFIG_PATH = CONFIG_DIR / "users.json"
-print(f"[CONFIG] 用户配置文件路径: {USER_CONFIG_PATH}")
 
 SESSION_EXPIRE_SEC = 86400
 # 各接口的 limit 上限分开命名：逻辑相同但语义不同，避免改一处误伤另一处
@@ -79,6 +78,20 @@ class AdminUserForm(BaseModel):
 class UserRenameForm(BaseModel):
     old_username: str
     new_username: str
+
+
+def _valid_password(pw: str) -> bool:
+    """bcrypt 只接受 72 字节以内、不含 NUL 的口令，超限会直接抛 ValueError。
+
+    不先挡住的话，超长口令会让登录/改密接口直接 500，而不是给出正常提示。
+    """
+    if not pw:
+        return False
+    try:
+        raw = pw.encode("utf-8")
+    except UnicodeError:
+        return False
+    return len(raw) <= 72 and b"\x00" not in raw
 
 # 内存会话存储：sid -> (用户名, 过期时间戳)，带过期清理避免长期运行内存无限增长
 sessions: Dict[str, tuple] = {}
@@ -127,11 +140,66 @@ def load_users() -> List[UserItem]:
 
 def save_users(user_list: List[UserItem]):
     data = [u.model_dump() for u in user_list]
-    USER_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 原子写：直接写目标文件时若进程被杀，会留下半截 JSON，
+    # 下次启动读失败就会回落到默认账号，等于把密码重置成 admin123
+    tmp = USER_CONFIG_PATH.with_name(USER_CONFIG_PATH.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, USER_CONFIG_PATH)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+def _check_username(raw: str) -> str:
+    """校验并返回规范化的用户名，不合法直接 400。
+
+    用户名既是登录标识，又是 /api/admin/user/{username} 的路径参数，
+    所以不能容忍空值、首尾空格、路径分隔符以及 . / ..——
+    否则能造出「改不了、也删不掉」的账号。
+    """
+    name = (raw or "").strip()
+    if not name:
+        raise HTTPException(400, "用户名不能为空")
+    if name != raw:
+        raise HTTPException(400, "用户名首尾不能包含空格")
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise HTTPException(400, "用户名不能包含 / \\ 或为 . / ..")
+    return name
+
+
+def _check_allow_dirs(dirs: List[str]) -> List[str]:
+    """校验允许目录：拒绝含 .. 或解析后越出媒体根的配置。
+
+    只做放行判断是不够的："/photos/2024/../../" 会解析回媒体根，等于把
+    受限用户悄悄升级成全库可见；"/foo/../.." 更是直接解析到容器根。
+    写接口挡住脏数据，读接口再做边界兜底（_resolved_allow_dirs）。
+    """
+    cleaned = []
+    for raw in dirs or []:
+        d = (raw or "").strip()
+        if ".." in Path(d).parts:
+            raise HTTPException(400, "允许目录不能包含 .. ")
+        try:
+            (REAL_BASE / d.lstrip("/")).resolve().relative_to(REAL_BASE)
+        except (ValueError, OSError):
+            raise HTTPException(400, f"允许目录超出媒体库范围：{d}")
+        cleaned.append(d)
+    return cleaned
+
+
+# 用户写操作都是「读盘 → 改内存 → 写盘」，必须串行化：
+# 否则两个管理员同时保存时，后写者会用旧快照覆盖前者刚保存的修改。
+# 用 RLock：写操作持锁期间还会调 reload_users() 重入。
+_users_lock = threading.RLock()
+
 
 def reload_users():
     global users
-    users = load_users()
+    with _users_lock:
+        users = load_users()
 
 users = load_users()
 
@@ -170,10 +238,21 @@ def _resolved_allow_dirs(allow_dirs: List[str]):
     cached = _allow_dirs_cache.get(key)
     if cached is not None:
         return cached
-    resolved = tuple((REAL_BASE / ad.lstrip("/")).resolve() for ad in allow_dirs)
+    resolved = []
+    for ad in allow_dirs:
+        try:
+            p = (REAL_BASE / ad.lstrip("/")).resolve()
+            # allow_dirs 可能来自手工编辑的 users.json / 旧备份。解析后越出媒体根
+            # 的值（例如 "/foo/../.." 解析成 "/"）会让 relative_to 对全库成立，
+            # 等于直接放行全库，必须丢掉。
+            p.relative_to(REAL_BASE)
+        except (ValueError, OSError):
+            continue
+        resolved.append(p)
+    result = tuple(resolved)
     if len(_allow_dirs_cache) < 100:
-        _allow_dirs_cache[key] = resolved
-    return resolved
+        _allow_dirs_cache[key] = result
+    return result
 
 
 def check_path_allowed(user: UserItem, target_dir: str) -> Path:
@@ -240,12 +319,16 @@ def check_at_least_one_admin(user_list: List[UserItem]):
 
 # ========== 缓存统计（缓存任务执行后记录快照，持久化到磁盘） ==========
 _CACHE_STATS_FILE = CONFIG_DIR / "cache_stats.json"
+# 失败明细只保留前这么多条：全库失败时（比如 ffmpeg 没装）明细能到几十 MB，
+# 存内存、整份落盘、每次请求全量返回都会把后端和浏览器一起拖死
+_FAILED_FILES_MAX = 500
 _cache_stats = {
     "total": 0,
     "cached": 0,
     "uncached": 0,
     "failed": 0,
-    "failed_files": [],  # 缓存失败的文件相对路径列表
+    "failed_files": [],  # 缓存失败的文件相对路径列表（最多 _FAILED_FILES_MAX 条）
+    "failed_files_truncated": False,  # 明细是否被截断
     "last_finish_time": None,  # 上次缓存任务完成时间（epoch 秒）
 }
 _cache_stats_lock = threading.Lock()
@@ -256,28 +339,57 @@ def load_cache_stats():
     try:
         if _CACHE_STATS_FILE.exists():
             data = json.loads(_CACHE_STATS_FILE.read_text(encoding="utf-8"))
-            with _cache_stats_lock:
-                _cache_stats.update(data)
+            if isinstance(data, dict):
+                files = data.get("failed_files")
+                if not isinstance(files, list):
+                    files = []
+                # 旧版本没有条数上限，升级后第一次启动可能带着几万条明细回来，
+                # 载入时就截断，别等下一次缓存任务跑完才生效
+                truncated_now = False
+                if len(files) > _FAILED_FILES_MAX:
+                    files = files[:_FAILED_FILES_MAX]
+                    data["failed_files_truncated"] = True
+                    truncated_now = True
+                data["failed_files"] = files
+                data.setdefault("failed_files_truncated", False)
+                with _cache_stats_lock:
+                    _cache_stats.update(data)
+                # 截断结果写回磁盘，否则每次启动都要重新解析几十 MB 的旧文件，
+                # 而且磁盘上的明细与内存长期不一致
+                if truncated_now:
+                    try:
+                        tmp = _CACHE_STATS_FILE.with_name(_CACHE_STATS_FILE.name + ".tmp")
+                        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                        os.replace(tmp, _CACHE_STATS_FILE)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
 
 def record_cache_stats(total: int, cached: int, failed: int = 0, failed_files: list = None):
     """缓存任务完成后记录统计快照（内存 + 磁盘持久化）。"""
+    files = failed_files or []
     snapshot = {
         "total": total,
         "cached": cached,
         "uncached": total - cached,
         "failed": failed,
-        "failed_files": failed_files or [],
+        "failed_files": files[:_FAILED_FILES_MAX],
+        "failed_files_truncated": len(files) > _FAILED_FILES_MAX,
         "last_finish_time": time.time(),
     }
     with _cache_stats_lock:
         _cache_stats.update(snapshot)
+    tmp = _CACHE_STATS_FILE.with_name(_CACHE_STATS_FILE.name + ".tmp")
     try:
-        _CACHE_STATS_FILE.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, _CACHE_STATS_FILE)
     except Exception:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 load_cache_stats()  # 启动时加载上次快照
@@ -401,7 +513,15 @@ class CacheTask:
             self.current = ""
             self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception as exc:
+            # 线程起不来（线程数/内存耗尽）必须把状态退回去，否则界面永远显示运行中，
+            # 后续 cache-run 也永远返回「已有任务在运行」，只能重启进程
+            with self._lock:
+                self.running = False
+            print(f"[CACHE] 缓存任务启动失败：{exc}")
+            return False
         return True
 
     def stop(self):
@@ -421,7 +541,8 @@ class CacheTask:
             _mark_images_index_dirty()
             invalidate_folder_stats()
             self._set(running=False)
-            self._stop.clear()
+            # 不在这里 _stop.clear()：start() 已经清过了。旧任务收尾时清一次，
+            # 会把「刚启动的新任务」收到的停止请求吞掉。
 
     def _build(self):
         base = Path(self._media_root).resolve()
@@ -459,12 +580,18 @@ class CacheTask:
                 # 视频时长缓存补齐：仅在缓存缺失时才 ffprobe，任务结束统一落盘
                 if full.suffix.lower() in VIDEO_EXT:
                     get_video_duration(str(full), fetch=True)
-                # 视频以本地 Emby 封面为准判断新鲜度，海报更新后缓存任务会重新生成
-                freshness_src = thumb_source(full) if full.suffix.lower() in VIDEO_EXT else full
-                if is_cache_fresh(freshness_src, get_thumb_cache_path(str(rel))):
+                # 新鲜度判断内部已区分：视频看本地海报，海报被删则看目录 mtime
+                if is_cache_fresh(full, get_thumb_cache_path(str(rel))):
                     cached_count += 1
                     continue
                 files.append((full, str(rel)))
+        if self._stop.is_set():
+            # 收集阶段就被取消：这时 all_total/cached_count 只是扫到的那一部分，
+            # 既不能当成「缓存已是最新」，也不能落成全库统计快照
+            msg = f"已取消，扫描到 {all_total} 个媒体文件，尚未开始生成缓存"
+            self._set(message=msg, percent=0, succeeded=0, failed=0)
+            add_log(self.operator, "cache_result", msg)
+            return
         total = len(files)
         self._set(total=total)
         if total == 0:
@@ -541,11 +668,19 @@ async def lifespan(_app: FastAPI):
     _images_index_stop.set()
     _folder_watcher_stop.set()
     _folder_watcher_wake.set()  # 立刻打断 wait，别让退出等满一个周期
+    # 丢弃排队中的任务；已在跑的生成任务由解释器退出钩子 join，
+    # wait=False 只省掉 shutdown 自身的等待，仍可能等最慢的一个 ffmpeg
+    _thumb_pool.shutdown(wait=False, cancel_futures=True)
     scheduler.shutdown(wait=False)
 
 
 app = FastAPI(lifespan=lifespan)
-app.mount("/assets", StaticFiles(directory="/frontend/dist/assets"), name="assets")
+# 容器里是 Dockerfile COPY 出来的 /frontend/dist；本地开发回退到项目内
+# frontend/dist，否则注释里那句 `python -m backend.main` 根本起不来。
+_FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", "/frontend/dist"))
+if not _FRONTEND_DIST.is_dir():
+    _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIST / "assets"), check_dir=False), name="assets")
 
 # ========== 登录登出接口 ==========
 @app.post("/api/login")
@@ -553,6 +688,8 @@ def login(form: LoginForm, resp: Response):
     reload_users()
     user = next((u for u in users if u.username == form.username), None)
     if not user:
+        raise HTTPException(status_code=401, detail="账号或密码错误")
+    if not _valid_password(form.password):
         raise HTTPException(status_code=401, detail="账号或密码错误")
     if not bcrypt.checkpw(form.password.encode(), user.password_hash.encode()):
         raise HTTPException(status_code=401, detail="账号或密码错误")
@@ -587,21 +724,30 @@ async def whoami(user: UserItem = Depends(get_current_user)):
 ## 修改本人密码
 @app.post("/api/user/change-password")
 def api_change_my_pwd(form: ChangePwdForm, user: UserItem = Depends(get_current_user)):
-    reload_users()
-    u = next((x for x in users if x.username == user.username), None)
-    if not u:
-        raise HTTPException(404, "用户不存在")
-    if not bcrypt.checkpw(form.old_password.encode(), u.password_hash.encode()):
-        raise HTTPException(400, "原密码错误")
-    new_hash = bcrypt.hashpw(form.new_password.encode(), bcrypt.gensalt()).decode()
-    u.password_hash = new_hash
-    save_users(users)
+    with _users_lock:
+        reload_users()
+        u = next((x for x in users if x.username == user.username), None)
+        if not u:
+            raise HTTPException(404, "用户不存在")
+        if not _valid_password(form.old_password):
+            raise HTTPException(400, "原密码错误")
+        if not bcrypt.checkpw(form.old_password.encode(), u.password_hash.encode()):
+            raise HTTPException(400, "原密码错误")
+        if not _valid_password(form.new_password):
+            raise HTTPException(400, "新密码需为 1~72 字节，且不能包含空字符")
+        u.password_hash = bcrypt.hashpw(form.new_password.encode(), bcrypt.gensalt()).decode()
+        try:
+            save_users(users)
+        except Exception as exc:
+            # 落盘失败就回滚内存，否则会出现「内存已改、磁盘没改」，重启后又变回去
+            reload_users()
+            raise HTTPException(500, f"保存失败：{exc}")
     add_log(user.username, "change_password", "修改本人密码")
     return {"code":0, "msg":"密码修改成功"}
 
 ## 管理员获取全部用户
 @app.get("/api/admin/users")
-async def admin_get_all_users(_admin: UserItem = Depends(require_admin)):
+def admin_get_all_users(_admin: UserItem = Depends(require_admin)):
     reload_users()
     out = []
     for u in users:
@@ -614,88 +760,114 @@ async def admin_get_all_users(_admin: UserItem = Depends(require_admin)):
 
 ## 获取媒体库目录下拉选项
 @app.get("/api/admin/dirs")
-async def admin_get_dir_options(_admin: UserItem = Depends(require_admin)):
+def admin_get_dir_options(_admin: UserItem = Depends(require_admin)):
+    # scan_media_root_dirs 要对媒体根做 iterdir + is_dir，NAS 上可能慢，放线程池
     dir_options = scan_media_root_dirs()
     return {"code":0, "options": dir_options}
 
 ## 管理员重命名用户名
 @app.post("/api/admin/user-rename")
-async def admin_rename_user(form: UserRenameForm, _admin: UserItem = Depends(require_admin)):
-    reload_users()
-    old = form.old_username.strip()
-    new = form.new_username.strip()
-    if not old or not new:
-        raise HTTPException(400, "用户名不能为空")
-    if old == new:
-        return {"code":0, "msg":"未变更"}
-    if next((u for u in users if u.username == new), None) is not None:
-        raise HTTPException(400, "新用户名已存在")
-    u_target = next((u for u in users if u.username == old), None)
-    if u_target is None:
-        raise HTTPException(404, "原用户不存在")
-    # 更新内存会话中该用户的session映射
-    with _session_lock:
-        for sid, (uname, expire_ts) in list(sessions.items()):
-            if uname == old:
-                sessions[sid] = (new, expire_ts)
-    u_target.username = new
-    save_users(users)
+def admin_rename_user(form: UserRenameForm, _admin: UserItem = Depends(require_admin)):
+    """同步端点：内部持 _users_lock，不能用 async 在事件循环里阻塞等锁。"""
+    with _users_lock:
+        reload_users()
+        old = form.old_username.strip()
+        if not old:
+            raise HTTPException(400, "用户名不能为空")
+        # 旧名只做 strip（可能是历史脏数据），新名必须完全合规
+        new = _check_username(form.new_username)
+        if old == new:
+            return {"code":0, "msg":"未变更"}
+        if next((u for u in users if u.username == new), None) is not None:
+            raise HTTPException(400, "新用户名已存在")
+        u_target = next((u for u in users if u.username == old), None)
+        if u_target is None:
+            raise HTTPException(404, "原用户不存在")
+        u_target.username = new
+        try:
+            save_users(users)
+        except Exception as exc:
+            reload_users()
+            raise HTTPException(500, f"保存失败：{exc}")
+        # 落盘成功之后再改会话映射：写盘失败时磁盘和内存都是旧名，
+        # 若先把 session 改成新名，get_current_user 会找不到用户，把人踢下线
+        with _session_lock:
+            for sid, (uname, expire_ts) in list(sessions.items()):
+                if uname == old:
+                    sessions[sid] = (new, expire_ts)
     add_log(_admin.username, "user_rename", f"重命名用户 {old} → {new}")
     return {"code":0, "msg":"用户名修改成功"}
 
 ## 管理员新增/编辑用户（支持设置is_admin管理员标记）
 @app.post("/api/admin/user-save")
 def admin_save_user(form: AdminUserForm, _admin: UserItem = Depends(require_admin)):
-    reload_users()
-    exist = next((u for u in users if u.username == form.username), None)
-    if exist is not None:
-        # 编辑已有用户
-        if form.password is not None and form.password.strip()!="":
-            exist.password_hash = bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode()
-        exist.allow_dirs = form.allow_dirs
-        exist.is_admin = form.is_admin
-    else:
-        # 新增用户
-        if not form.password or form.password.strip()=="":
-            raise HTTPException(400, "新增用户必须填写密码")
-        new_u = UserItem(
-            username=form.username,
-            password_hash=bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode(),
-            allow_dirs=form.allow_dirs,
-            is_admin=form.is_admin
-        )
-        users.append(new_u)
-    # 校验：至少保留一个管理员账号；失败时从磁盘回滚，避免内存留下半写入状态
-    try:
-        check_at_least_one_admin(users)
-    except HTTPException:
+    with _users_lock:
         reload_users()
-        raise
-    save_users(users)
-    add_log(_admin.username, "user_save", f"{'编辑' if exist is not None else '新增'}用户 {form.username}")
+        # 用户名要做成「可登录、可作路径参数」的标识，空值/首尾空格/路径字符都不行
+        name = _check_username(form.username)
+        allow_dirs = _check_allow_dirs(form.allow_dirs)
+        # bcrypt 对超 72 字节或含 NUL 的口令会抛 ValueError，不先挡住接口就变成 500
+        if form.password is not None and form.password.strip() != "" and not _valid_password(form.password):
+            raise HTTPException(400, "密码需为 1~72 字节，且不能包含空字符")
+        exist = next((u for u in users if u.username == name), None)
+        if exist is not None:
+            # 编辑已有用户
+            if form.password is not None and form.password.strip()!="":
+                exist.password_hash = bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode()
+            exist.allow_dirs = allow_dirs
+            exist.is_admin = form.is_admin
+        else:
+            # 新增用户
+            if not form.password or form.password.strip()=="":
+                raise HTTPException(400, "新增用户必须填写密码")
+            new_u = UserItem(
+                username=name,
+                password_hash=bcrypt.hashpw(form.password.encode(), bcrypt.gensalt()).decode(),
+                allow_dirs=allow_dirs,
+                is_admin=form.is_admin
+            )
+            users.append(new_u)
+        # 校验：至少保留一个管理员账号；失败时从磁盘回滚，避免内存留下半写入状态
+        try:
+            check_at_least_one_admin(users)
+        except HTTPException:
+            reload_users()
+            raise
+        try:
+            save_users(users)
+        except Exception as exc:
+            reload_users()
+            raise HTTPException(500, f"保存失败：{exc}")
+    add_log(_admin.username, "user_save", f"{'编辑' if exist is not None else '新增'}用户 {name}")
     return {"code":0,"msg":"保存成功"}
 
-## 管理员删除用户【修复：global放到函数第一行】
+## 管理员删除用户
 @app.delete("/api/admin/user/{username}")
-async def admin_del_user(username: str, _admin: UserItem = Depends(require_admin)):
+def admin_del_user(username: str, _admin: UserItem = Depends(require_admin)):
+    """同步端点：内部持 _users_lock，不能用 async 在事件循环里阻塞等锁。"""
     global users
-    reload_users()
-    target_user = next((u for u in users if u.username == username), None)
-    if not target_user:
-        raise HTTPException(404, "用户不存在")
-    users = [u for u in users if u.username != username]
-    # 删除之后校验至少还有一个管理员；失败时回滚内存
-    try:
-        check_at_least_one_admin(users)
-    except HTTPException:
+    with _users_lock:
         reload_users()
-        raise
-    # 清理该用户全部session
-    with _session_lock:
-        to_del = [k for k, (uname, _exp) in list(sessions.items()) if uname == username]
-        for k in to_del:
-            sessions.pop(k, None)
-    save_users(users)
+        target_user = next((u for u in users if u.username == username), None)
+        if not target_user:
+            raise HTTPException(404, "用户不存在")
+        users = [u for u in users if u.username != username]
+        # 删除之后校验至少还有一个管理员；失败时回滚内存
+        try:
+            check_at_least_one_admin(users)
+        except HTTPException:
+            reload_users()
+            raise
+        try:
+            save_users(users)
+        except Exception as exc:
+            reload_users()
+            raise HTTPException(500, f"保存失败：{exc}")
+        # 落盘成功之后再清会话：写盘失败时用户其实还在，提前清会话会把他踢下线
+        with _session_lock:
+            to_del = [k for k, (uname, _exp) in list(sessions.items()) if uname == username]
+            for k in to_del:
+                sessions.pop(k, None)
     add_log(_admin.username, "user_delete", f"删除用户 {username}")
     return {"code":0,"msg":"已删除"}
 
@@ -977,7 +1149,7 @@ def _refresh_images_subtrees(changed, removed=()) -> bool:
     用户点击读到的仍是旧索引，合并完成才整体换引用。
     """
     global _images_by_dir, _images_subdirs, _images_index
-    global _images_index_gen, _images_index_unsaved
+    global _images_index_gen, _images_index_unsaved, _images_index_dirty
     changed = [str(k) for k in changed]
     # 删除项先归并到最顶层：整棵目录树被删时，逐个删会退化成 O(n²)
     removed = _topmost_paths([str(k) for k in removed])
@@ -1396,6 +1568,30 @@ def _topmost_paths(paths):
     return result
 
 
+def _removed_are_real(removed: list, sample: int = 12) -> bool:
+    """区分「用户真的删了一批目录」和「挂载掉线导致全库 stat 不到」。
+
+    真删除时父目录还在、可 scandir，且里面确实没有这个子目录名；
+    挂载异常时父目录本身也读不到。只抽查少量最顶层路径，首尾各取一半，
+    避免为保护逻辑再走一遍全库。
+    """
+    roots = _topmost_paths(removed)
+    if len(roots) > sample:
+        half = sample // 2
+        picks = roots[:half] + roots[-half:]
+    else:
+        picks = roots
+    for key in picks:
+        p = Path(key)
+        try:
+            with os.scandir(p.parent) as it:
+                if any(e.name == p.name for e in it):
+                    return False  # 目录其实还在，是读取时序问题
+        except OSError:
+            return False
+    return True
+
+
 def _media_root_ready(mountinfo_path: str = "/proc/self/mountinfo") -> bool:
     """校验前先体检 /media：挂载是否生效、媒体根是否可访问。
 
@@ -1445,10 +1641,16 @@ def _verify_folder_stats(mountinfo_path: str = "/proc/self/mountinfo") -> int:
             continue
         if mt != old_mt:
             changed.append(key)
-    # 第二层保护：挂载点正常、但中途掉线或大范围子目录读不到时仍然拦住
+    # 第二层保护：中途掉线或大范围子目录读不到时拦住。
+    # 注意 removed 不能按「数量大」整体放弃：快照没更新就会每 15 秒重复跳过，
+    # 后台校验被永久楔住，已删除的图片会一直留在随机幻灯片索引里。
+    # 改为逐个确认「父目录可读且里面确实没这个目录」，真删除照常刷新。
     total_dirs = len(snap.get("mtimes", {}))
-    if unreadable > max(5, total_dirs // 5) or len(removed) > max(10, total_dirs // 2):
-        print("[FOLDER] 子目录读取异常或大量目录消失，跳过本次校验")
+    if unreadable > max(5, total_dirs // 5):
+        print("[FOLDER] 子目录大面积不可判定（I/O 故障或挂载掉线），跳过本次校验")
+        return 0
+    if removed and not _removed_are_real(removed):
+        print("[FOLDER] 目录消失但父目录不可读，疑似挂载异常，跳过本次校验")
         return 0
     if not changed and not removed:
         _clear_images_index_dirty()
@@ -1554,12 +1756,16 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
     if not work_path.exists() or not work_path.is_dir():
         return {"list": [], "breadcrumb": []}
 
-    # 面包屑直接计算（开销小，不缓存）
+    # 面包屑必须基于已解析的真实目录算，不能用原始 dir：
+    # dir="/photos/2024" 的 Path.parts 首段是 '/'，会拼出 '//photos'，
+    # 前端回传后斜杠逐次累加；dir 里带 .. 还会把编造的名字塞进面包屑。
     breadcrumb = []
-    parts = Path(dir).parts
+    try:
+        parts = work_path.relative_to(REAL_BASE).parts
+    except ValueError:
+        parts = ()
     for i in range(len(parts)):
-        p = "/".join(parts[:i+1])
-        breadcrumb.append({"name": parts[i], "path": p})
+        breadcrumb.append({"name": parts[i], "path": "/".join(parts[:i + 1])})
 
     # 目录缓存：目录 mtime 未变则复用上次结果，避免重复遍历
     try:
@@ -1683,14 +1889,29 @@ def api_src(path: str, user: UserItem = Depends(get_current_user)):
     return FileResponse(fp)
 
 # ========== 缩略图接口（图片 Pillow / 视频 ffmpeg，结果落盘缓存） ==========
-@app.get("/api/thumb")
-def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
+# 缩略图生成专用线程池：不占用 Starlette 默认的 40 线程池，否则一次列表
+# 请求几十张图时，线程全卡在等生成槽上，/api/list、/api/cache-status 一起排队。
+# 16 个 worker：其中最多 4 个会阻塞在生成信号量上（cover._GEN_SLOTS），
+# 其余要能立刻服务「缓存已命中」的请求。
+_thumb_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="thumb")
+
+
+def _thumb_response(user: UserItem, path: str):
+    """缩略图的整条流程都在这里，包括路径校验和两次 stat。
+
+    这些全是阻塞调用：NAS 上一次 lstat 就要 0.5~3ms，一个请求 5~8 次，
+    留在事件循环里会把所有接口一起卡住（改造前该端点是同步 def，整段在
+    线程池里跑，所以这里必须整体丢进专用线程池，不能只挪 ensure_thumb）。
+    """
     fp = check_path_allowed(user, path)
     if not fp.exists() or not fp.is_file():
         raise HTTPException(404)
     suf = fp.suffix.lower()
     if suf in MEDIA_EXTS:
-        rel = str(fp.relative_to(REAL_BASE)).replace(os.sep, "/")
+        try:
+            rel = str(fp.relative_to(REAL_BASE)).replace(os.sep, "/")
+        except ValueError:
+            raise HTTPException(404)
         cache_path = ensure_thumb(fp, rel)
         if cache_path is not None and cache_path.exists():
             return FileResponse(cache_path)
@@ -1701,9 +1922,16 @@ def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
     # 图片生成失败仍回退原图，至少能看到内容
     return FileResponse(fp)
 
+
+@app.get("/api/thumb")
+async def api_thumb(path: str, user: UserItem = Depends(get_current_user)):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_thumb_pool, _thumb_response, user, path)
+
 # ========== 缓存统计接口 ==========
 @app.get("/api/cache-stats")
-def cache_stats(user: UserItem = Depends(get_current_user)):
+def cache_stats(_admin: UserItem = Depends(require_admin)):
+    """统计里带着全库失败文件的相对路径，会把无权目录的文件名暴露给受限用户。"""
     with _cache_stats_lock:
         stats = dict(_cache_stats)
     return {
@@ -1713,6 +1941,7 @@ def cache_stats(user: UserItem = Depends(get_current_user)):
         "uncached": stats["uncached"],
         "failed": stats.get("failed", 0),
         "failed_files": stats.get("failed_files", []),
+        "failed_files_truncated": stats.get("failed_files_truncated", False),
         "last_finish_time": stats["last_finish_time"],
     }
 
@@ -1743,24 +1972,34 @@ def api_clear_logs(_admin: UserItem = Depends(require_admin)):
 # ========== 缓存任务接口 ==========
 @app.get("/api/cache-status")
 async def cache_status(user: UserItem = Depends(get_current_user)):
-    return cache_task.snapshot()
+    snap = cache_task.snapshot()
+    if not user.is_admin:
+        # 缓存任务遍历的是全库，current 会带出受限用户无权目录的文件名。
+        # 进度只需要数值字段，把路径剔掉（前端也没用到 current）。
+        snap.pop("current", None)
+    return snap
 
 @app.get("/api/cache-run")
-async def cache_run(user: UserItem = Depends(get_current_user)):
-    if cache_task.start(operator=user.username):
-        add_log(user.username, "cache_run", "手动触发预生成缓存")
+async def cache_run(admin: UserItem = Depends(require_admin)):
+    """触发全库扫描，NAS 上会打满 IO，只允许管理员操作。"""
+    if cache_task.start(operator=admin.username):
+        add_log(admin.username, "cache_run", "手动触发预生成缓存")
         return {"code": 0, "msg": "任务已启动"}
+    if not cache_task.running:
+        # start() 返回 False 但状态不是运行中，说明线程根本没起来（内存/线程数耗尽）
+        return {"code": 2, "msg": "任务启动失败，请查看服务日志"}
     return {"code": 1, "msg": "已有任务在运行"}
 
 @app.get("/api/cache-stop")
-async def cache_stop(user: UserItem = Depends(get_current_user)):
+async def cache_stop(admin: UserItem = Depends(require_admin)):
+    """会打断管理员或定时任务，同样只允许管理员操作。"""
     cache_task.stop()
-    add_log(user.username, "cache_stop", "取消缓存任务")
+    add_log(admin.username, "cache_stop", "取消缓存任务")
     return {"code": 0, "msg": "停止指令已发送"}
 
 # ========== 设置持久化接口 ==========
 @app.get("/api/settings")
-async def api_get_settings(user: UserItem = Depends(get_current_user)):
+def api_get_settings(user: UserItem = Depends(get_current_user)):
     s = load_settings()
     return {
         "code": 0,
@@ -1771,7 +2010,8 @@ async def api_get_settings(user: UserItem = Depends(get_current_user)):
     }
 
 @app.post("/api/settings")
-async def api_save_settings(form: SettingsForm, user: UserItem = Depends(get_current_user)):
+def api_save_settings(form: SettingsForm, _admin: UserItem = Depends(require_admin)):
+    """这组设置是全局的，会影响所有人，因此只允许管理员修改。"""
     s = load_settings()
     s["slide_delay"] = form.slide_delay
     s["slide_loop"] = form.slide_loop
@@ -1780,7 +2020,7 @@ async def api_save_settings(form: SettingsForm, user: UserItem = Depends(get_cur
 
 @app.get("/")
 async def index():
-    return FileResponse("/frontend/dist/index.html")
+    return FileResponse(_FRONTEND_DIST / "index.html")
 
 if __name__ == "__main__":
     # 在项目根目录执行：python -m backend.main

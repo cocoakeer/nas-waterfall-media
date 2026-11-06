@@ -37,7 +37,7 @@
           </div>
           <transition name="drop">
             <div v-if="showUserDrop" class="user-dropdown">
-              <div class="drop-section">
+              <div v-if="userInfo.is_admin" class="drop-section">
                 <div v-if="cacheRunning" class="drop-item cache-status-item">缓存处理中 {{cachePercent}}%</div>
                 <div v-else class="drop-item cache-run-item" @click="runCacheTask">
                   <span>预生成缓存</span>
@@ -230,9 +230,10 @@
           <input v-model="slideLoop" type="checkbox" />
         </div>
         <div class="btn-group">
-          <button @click="saveSetting" class="btn primary">保存</button>
-          <button @click="settingShow=false" class="btn">取消</button>
+          <button v-if="userInfo.is_admin" @click="saveSetting" class="btn primary">保存</button>
+          <button @click="settingShow=false" class="btn">{{ userInfo.is_admin ? '取消' : '关闭' }}</button>
         </div>
+        <p v-if="!userInfo.is_admin" class="setting-hint">这组设置对所有人生效，只有管理员可以修改。</p>
       </div>
     </div>
     <!-- 修改本人密码弹窗 -->
@@ -365,8 +366,11 @@
     <div v-if="failedFilesModal" class="preview-mask" @click.self="failedFilesModal=false">
       <div class="log-box">
         <div class="um-header">
-          <h3>缓存失败文件（{{ cacheStats.failed_files.length }}）</h3>
+          <h3>缓存失败文件（{{ cacheStats.failed_files.length }}<template v-if="cacheStats.failed_files_truncated">，共 {{ cacheStats.failed }} 条，仅显示前 500</template>）</h3>
           <button class="um-close-btn" @click="failedFilesModal=false">×</button>
+        </div>
+        <div v-if="cacheStats.failed_files_truncated" class="failed-truncate-tip">
+          失败太多，明细只保留前 500 条；完整清单请用「执行日志」或直接在 NAS 上排查。
         </div>
         <div class="log-list">
           <div v-for="(f, idx) in cacheStats.failed_files" :key="idx" class="log-item">
@@ -385,7 +389,7 @@
            @touchstart="onTouchStart"
            @touchend="onTouchEnd">
         <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
-        <video v-else controls :src="getSrcUrl(currentSlide.path)"></video>
+        <video v-else controls autoplay muted playsinline :src="getSrcUrl(currentSlide.path)"></video>
         <div class="slide-name">{{ currentSlide.name }}</div>
         <button class="slide-exit-btn" @click="exitSlide">退出全屏</button>
         <button class="slide-prev-btn" @click="slidePrev">‹</button>
@@ -555,15 +559,15 @@ const RANDOM_INDEX_RETRY_MS = 2000
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
 let statusPollTimer = null
+// 组件卸载后，在途请求返回时不要再把轮询链重新挂起来
+let disposed = false
 // 缓存统计：total 全部 / cached 已缓存 / uncached 未缓存 / failed 失败 / failed_files 失败文件 / last_finish_time 上次完成时间
-const cacheStats = ref({ total: 0, cached: 0, uncached: 0, failed: 0, failed_files: [], last_finish_time: null })
+const cacheStats = ref({ total: 0, cached: 0, uncached: 0, failed: 0, failed_files: [], failed_files_truncated: false, last_finish_time: null })
 // 执行日志
 const logModal = ref(false)
 const logList = ref([])
 // 缓存失败文件弹窗
 const failedFilesModal = ref(false)
-
-const STORAGE_KEY = "waterfall_last_dir"
 
 // ========= JS瀑布流【响应式：手机2列 / 平板3-4列 / 桌面270px】 =========
 let resizeTimer = null
@@ -673,10 +677,11 @@ const getSrcUrl = (path) => {
   return `${baseUrl}/api/src?path=${encodeURIComponent(path)}`
 }
 
-const imgRotateStyle = ref({
-  transform: 'rotate(0deg)',
+// 旋转只保留一个角度源，样式由它派生，避免两份状态不同步
+const imgRotateStyle = computed(() => ({
+  transform: `rotate(${imgRotateDeg.value}deg)`,
   transition: 'transform 0.25s ease'
-})
+}))
 
 // 预览关闭按钮跟随图片实际显示区域的右上角；未测量到时回退到容器右上角（CSS 默认）
 const previewBoxRef = ref(null)
@@ -741,17 +746,14 @@ watch(previewShow, async (show) => {
 
 function rotateLeft() {
   imgRotateDeg.value -= 90
-  imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
   scheduleCloseBtnPos()
 }
 function rotateRight() {
   imgRotateDeg.value += 90
-  imgRotateStyle.value.transform = `rotate(${imgRotateDeg.value}deg)`
   scheduleCloseBtnPos()
 }
 function resetRotate() {
   imgRotateDeg.value = 0
-  imgRotateStyle.value.transform = 'rotate(0deg)'
   scheduleCloseBtnPos()
 }
 function openOriginal() {
@@ -772,6 +774,7 @@ async function pollCacheStatus() {
   statusPollTimer = null
   try {
     const res = await fetch(`${baseUrl}/api/cache-status`)
+    if (disposed) return
     if (!res.ok) {
       checkAuthResp(res)
       stopStatusPoll()
@@ -779,6 +782,7 @@ async function pollCacheStatus() {
       return
     }
     const st = await res.json()
+    if (disposed) return
     cachePercent.value = st.percent
     if (!st.running) {
       stopStatusPoll()
@@ -790,11 +794,19 @@ async function pollCacheStatus() {
     startStatusPoll()
   } catch (err) {
     console.error("查询任务状态失败", err)
+    if (disposed) return
     startStatusPoll()  // 网络抖动继续重试，不中断进度显示
   }
 }
 
 async function initCheckCacheTask() {
+  // 非管理员看不到缓存入口，也不该接管上一位管理员留下的轮询链
+  if (!userInfo.value.is_admin) {
+    stopStatusPoll()
+    cacheRunning.value = false
+    cachePercent.value = 0
+    return
+  }
   try {
     const res = await fetch(`${baseUrl}/api/cache-status`)
     if (!res.ok) { checkAuthResp(res); return }
@@ -803,6 +815,10 @@ async function initCheckCacheTask() {
       cacheRunning.value = true
       cachePercent.value = st.percent
       startStatusPoll()
+    } else {
+      // 重新登录时任务可能已经结束，必须复位，否则永远显示「缓存处理中」
+      cacheRunning.value = false
+      cachePercent.value = 0
     }
   } catch (err) {
     console.error("初始化检查缓存任务失败", err)
@@ -815,11 +831,21 @@ async function runCacheTask() {
   cachePercent.value = 0
   try {
     const res = await fetch(`${baseUrl}/api/cache-run`)
-    if (!res.ok) { checkAuthResp(res); return }
+    if (!res.ok) {
+      // 先复位再交给鉴权处理，否则界面会永远停在「缓存处理中 0%」
+      cacheRunning.value = false
+      checkAuthResp(res)
+      return
+    }
     const ret = await res.json()
     if (ret.code !== 0) {
-      alert("❌" + ret.msg)
-      cacheRunning.value = false
+      if (ret.code === 1) {
+        // code=1 = 后端已有任务在跑：接管进度显示，这不是失败，别弹错误框
+        startStatusPoll()
+      } else {
+        alert("❌" + ret.msg)
+        cacheRunning.value = false
+      }
       return
     }
     startStatusPoll()
@@ -857,6 +883,11 @@ function syncDirToUrl(dir) {
   } else {
     url.searchParams.delete('dir')
   }
+  // 深链首次加载时 URL 已经指向这个目录，再压一条会让第一次后退「看不出反应」
+  if ((new URL(window.location.href).searchParams.get('dir') ?? '') === dir) {
+    window.history.replaceState({ dir }, '', url.toString())
+    return
+  }
   window.history.pushState({ dir }, '', url.toString())
 }
 
@@ -885,6 +916,8 @@ function checkAuthResp(r) {
 }
 
 const isLoading = ref(false)
+// 加载中又来了新的目录请求：只保留最后一次，等当前请求结束再执行
+let pendingLoad = null
 const LIST_REFRESH_MS = 15000  // 静默刷新间隔，与后端目录校验周期配套
 let listRefreshTimer = null
 
@@ -895,14 +928,24 @@ function listSignature(list) {
     x.size, x.mtime, x.cover_path, x.duration]))
 }
 
+// 静默刷新互斥：定时器和 visibilitychange 都会触发，NAS 上单次请求可能
+// 超过刷新间隔，不拦住就会叠请求、先发后到的旧响应还会盖掉新数据
+let silentRefreshing = false
+
 async function silentRefreshList() {
+  if (silentRefreshing) return
   if (!isLogin.value || document.visibilityState !== 'visible') return
   if (isLoading.value || previewShow.value || slideShow.value ||
       userManageModal.value || logModal.value || changePwdModal.value ||
       settingShow.value || failedFilesModal.value) return
+  silentRefreshing = true
   const dirAtStart = currentDir.value
+  // 请求挂住时不能让互斥标记一直占着，否则静默刷新永久停摆
+  const abortCtrl = new AbortController()
+  const abortTimer = setTimeout(() => abortCtrl.abort(), 8000)
   try {
-    const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dirAtStart)}`)
+    const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dirAtStart)}`,
+      { signal: abortCtrl.signal })
     if (!res.ok) { checkAuthResp(res); return }
     const data = await res.json()
     // 请求期间用户可能已切换目录（或新的加载正在进行）。
@@ -910,11 +953,24 @@ async function silentRefreshList() {
     if (currentDir.value !== dirAtStart || isLoading.value) return
     const next = data.list || []
     if (listSignature(next) !== listSignature(mediaList.value)) {
-      mediaList.value = next
+      // 必须保留瀑布流挂在 item 上的 UI 字段：img 按 :key 复用、src 没变就不会
+      // 再触发 load，丢掉 _loaded 会让整页缩略图永久停在 opacity:0 的骨架态
+      const prev = new Map(mediaList.value.map(x => [x.id, x]))
+      mediaList.value = next.map(item => {
+        const old = prev.get(item.id)
+        if (!old) return item
+        item._loaded = old._loaded
+        item._left = old._left
+        item._top = old._top
+        return item
+      })
       breadcrumbList.value = data.breadcrumb || []
     }
   } catch (e) {
-    // 静默失败，不打扰正在浏览的用户
+    // 静默失败（含 8 秒超时中断），不打扰正在浏览的用户
+  } finally {
+    clearTimeout(abortTimer)
+    silentRefreshing = false
   }
 }
 
@@ -923,9 +979,17 @@ function onVisibilityChange() {
 }
 
 async function loadMedia(dir = '', pushHistory = false) {
-  if(isLoading.value) return
+  // 正在加载时不并发打 NAS：记下最后一次目标，当前请求结束后接着加载它，
+  // 这样加载中按后退不会被静默丢弃（否则 URL 变了、列表还停在旧目录）
+  if (isLoading.value) {
+    pendingLoad = { dir, pushHistory }
+    return
+  }
   isLoading.value = true
   currentDir.value = dir
+  // 导航意图要立刻反映到地址栏：如果等响应回来再压栈，加载中途按后退时
+  // 排队请求会让列表退到旧目录、URL 却还留在新目录
+  if (pushHistory) syncDirToUrl(dir)
   mediaList.value = []
   breadcrumbList.value = []
   try {
@@ -934,15 +998,16 @@ async function loadMedia(dir = '', pushHistory = false) {
     const data = await res.json()
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
-    localStorage.setItem(STORAGE_KEY, dir)
-    if (pushHistory) {
-      syncDirToUrl(dir)
-    }
   } catch (err) {
     console.error(err)
     mediaList.value = []
   }finally{
     isLoading.value = false
+    if (pendingLoad) {
+      const next = pendingLoad
+      pendingLoad = null
+      loadMedia(next.dir, next.pushHistory)
+    }
   }
 }
 
@@ -958,8 +1023,7 @@ function handleCardClick(item) {
     previewMediaList = displayList.value.filter(x => x.type !== 'folder')
     previewCurrentIndex = previewMediaList.findIndex(x => x.id === item.id)
     previewItem.value = item
-    imgRotateDeg.value = 0
-    imgRotateStyle.value.transform = 'rotate(0deg)'
+    resetRotate()
     previewShow.value = true
     pushPreviewHistory()
   }
@@ -969,8 +1033,7 @@ function prevMedia() {
   if (previewCurrentIndex > 0) {
     previewCurrentIndex -= 1
     previewItem.value = previewMediaList[previewCurrentIndex]
-    imgRotateDeg.value = 0
-    imgRotateStyle.value.transform = 'rotate(0deg)'
+    resetRotate()
   }
 }
 
@@ -978,8 +1041,7 @@ function nextMedia() {
   if (previewCurrentIndex < previewMediaList.length - 1) {
     previewCurrentIndex += 1
     previewItem.value = previewMediaList[previewCurrentIndex]
-    imgRotateDeg.value = 0
-    imgRotateStyle.value.transform = 'rotate(0deg)'
+    resetRotate()
   }
 }
 
@@ -1064,13 +1126,22 @@ async function openSlideSetting() {
 async function saveSetting() {
   slideDelay.value = clampSlideDelay(slideDelay.value)
   try {
-    await fetch(`${baseUrl}/api/settings`, {
+    const res = await fetch(`${baseUrl}/api/settings`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slide_delay: slideDelay.value, slide_loop: slideLoop.value })
     })
+    if (!res.ok) {
+      checkAuthResp(res)
+      return alert(res.status === 403
+        ? '幻灯片设置是全局的，只有管理员可以修改'
+        : '❌ 保存失败，请稍后重试')
+    }
+    const ret = await res.json()
+    if (ret.code !== 0) return alert("❌" + (ret.msg || "保存失败"))
   } catch (e) {
     console.error("保存幻灯片设置失败", e)
+    return alert('❌ 保存失败，请稍后重试')
   }
   settingShow.value = false
 }
@@ -1106,26 +1177,41 @@ async function startRandomSlide() {
   randomSlideHint.value = ''
   let warming = false
   const startedAt = Date.now()
+  // 全屏必须由用户手势触发。首次建索引可能要等几十秒，等完再请求全屏
+  // 浏览器会因手势过期而拒绝，所以先进全屏再等数据。
+  // 必须 await：否则 fetch 失败时 exitSlide 可能赶在全屏 Promise 落地之前，
+  // 结果页面被留在全屏而幻灯片已经关了。
+  await openRootFullscreen()
+  // 记录是否真的进了全屏：等待期间用户按 ESC 退全屏，就等于取消了这次启动
+  const hadFullscreen = slideFullscreenOwned
   try {
     const list = await fetchRandomImages(() => {
       warming = true
       // 用真实经过时间，别拿重试次数估算（每轮还有请求本身的耗时）
       randomSlideHint.value = `正在建立图片索引（${Math.round((Date.now() - startedAt) / 1000)}s）`
     })
+    if (hadFullscreen && !slideFullscreenOwned) {
+      // 用户等得不耐烦退出了全屏，别再几十秒后突然弹出幻灯片
+      return
+    }
     if (list === null) {
+      exitSlide()
       return alert(warming
         ? '图片索引还在建立中：媒体库越大首次启动越慢，过一会儿再试即可'
         : '❌ 随机幻灯片加载失败')
     }
-    if (!list.length) return alert('媒体库里没有可用于幻灯片的图片')
+    if (!list.length) {
+      exitSlide()
+      return alert('媒体库里没有可用于幻灯片的图片')
+    }
     slideList.value = list
     randomSlideMode.value = true
     slideIndex.value = 0
-    openRootFullscreen()
     slideShow.value = true
     runSlide()
   } catch (e) {
     console.error('加载随机图片失败', e)
+    exitSlide()
     alert('❌ 加载图片失败，请稍后重试')
   } finally {
     randomSlideLoading.value = false
@@ -1176,32 +1262,44 @@ function startSlideFromCurrent() {
   runSlide()
 }
 
+// 我们自己请求的全屏是否还在生效：用来区分「用户按 ESC 退出全屏」和
+// 「幻灯片里的视频全屏被退出」——后者不该把整个幻灯片关掉
+let slideFullscreenOwned = false
+
 async function openRootFullscreen() {
   const docEl = document.documentElement
+  const req = docEl.requestFullscreen || docEl.webkitRequestFullscreen || docEl.msRequestFullscreen
+  if (!req) return
   try {
-    if (docEl.requestFullscreen) {
-      await docEl.requestFullscreen()
-    } else if (docEl.webkitRequestFullscreen) {
-      await docEl.webkitRequestFullscreen()
-    } else if (docEl.msRequestFullscreen) {
-      await docEl.msRequestFullscreen()
-    }
+    await req.call(docEl)
+    slideFullscreenOwned = true
   } catch (e) {
+    // 浏览器要求全屏必须由用户手势触发：等索引太久会走到这里，只当降级处理
+    slideFullscreenOwned = false
     console.warn("无法进入全屏，浏览器策略限制", e)
   }
+}
+
+// 前缀 API 的老浏览器（旧 Safari / 旧 Edge）没有标准属性，必须一起判断
+function currentFullscreenElement() {
+  return document.fullscreenElement
+    || document.webkitFullscreenElement
+    || document.msFullscreenElement
+    || null
 }
 
 function exitSlide() {
   clearTimeout(slideTimer.value)
   slideShow.value = false
   randomSlideMode.value = false
-  if (document.exitFullscreen) {
-    document.exitFullscreen()
-  } else if (document.webkitExitFullscreen) {
-    document.webkitExitFullscreen()
-  } else if (document.msExitFullscreen) {
-    document.msExitFullscreen()
+  const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
+  // 已经不在全屏时（用户按 ESC 退出）再调 exitFullscreen 一定 reject，要兜住
+  if (exit && currentFullscreenElement()) {
+    try {
+      Promise.resolve(exit.call(document)).catch(() => {})
+    } catch (e) { /* 忽略：退出全屏失败不影响关闭幻灯片界面 */ }
   }
+  slideFullscreenOwned = false
 }
 
 function runSlide() {
@@ -1294,6 +1392,11 @@ async function doLogin() {
 
 async function doLogout() {
   await fetch(`${baseUrl}/api/logout`, {method:"POST"})
+  // 停掉轮询链并复位进度，否则快速切换账号时会把上一位管理员的任务
+  // 结束提示弹给下一位用户，或让新会话永久卡在「缓存处理中」
+  stopStatusPoll()
+  cacheRunning.value = false
+  cachePercent.value = 0
   isLogin.value = false
   userInfo.value = {}
   showUserDrop.value = false
@@ -1307,8 +1410,7 @@ async function checkLoginStatus() {
       isLogin.value = true
       userInfo.value = ret
       const urlDir = getDirFromUrl()
-      const initDir = urlDir ?? ''
-      await loadMedia(initDir, !!urlDir)
+      await loadMedia(urlDir, !!urlDir)
       await loadSlideSettings()
       initCheckCacheTask()
     } else {
@@ -1338,6 +1440,7 @@ async function loadCacheStats() {
         uncached: j.uncached,
         failed: j.failed || 0,
         failed_files: j.failed_files || [],
+        failed_files_truncated: !!j.failed_files_truncated,
         last_finish_time: j.last_finish_time
       }
     }
@@ -1347,7 +1450,8 @@ async function loadCacheStats() {
 }
 function toggleUserDrop(){
   showUserDrop.value = !showUserDrop.value
-  if (showUserDrop.value) {
+  // /api/cache-stats 只允许管理员访问，普通用户点开下拉不必打这个 403
+  if (showUserDrop.value && userInfo.value.is_admin) {
     loadCacheStats()
   }
 }
@@ -1571,9 +1675,19 @@ function onClickOutsideDrop(e){
 }
 
 function onFullscreenChange(){
-  if (!document.fullscreenElement && slideShow.value) {
-    exitSlide()
+  const el = currentFullscreenElement()
+  if (el === document.documentElement) {
+    // 整个页面进了全屏，说明是我们（或用户）要的幻灯片全屏
+    slideFullscreenOwned = true
+    return
   }
+  if (el) {
+    // 幻灯片里的 video 抢了全屏：退出它不该把整个幻灯片一起关掉
+    slideFullscreenOwned = false
+    return
+  }
+  if (slideFullscreenOwned && slideShow.value) exitSlide()
+  slideFullscreenOwned = false
 }
 
 onMounted(() => {
@@ -1584,16 +1698,19 @@ onMounted(() => {
   document.addEventListener("click", onClickOutsideDrop)
 
   document.addEventListener('fullscreenchange', onFullscreenChange)
+  document.addEventListener('webkitfullscreenchange', onFullscreenChange)
   document.addEventListener('visibilitychange', onVisibilityChange)
   listRefreshTimer = setInterval(silentRefreshList, LIST_REFRESH_MS)
 })
 
 onUnmounted(() => {
+  disposed = true
   document.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('popstate', onPopState)
   document.removeEventListener("click", onClickOutsideDrop)
   document.removeEventListener('fullscreenchange', onFullscreenChange)
+  document.removeEventListener('webkitfullscreenchange', onFullscreenChange)
   document.removeEventListener('visibilitychange', onVisibilityChange)
   clearInterval(listRefreshTimer)
   stopStatusPoll()
@@ -2262,6 +2379,7 @@ input[type="checkbox"] {
 }
 .setting-box h3,
 .um-header h3 { font-size: 14px; font-weight: 500; color: var(--text) }
+.setting-hint { font-size: 12px; color: var(--muted); margin: 10px 0 0; line-height: 1.5 }
 .setting-box h3 { margin-bottom: 20px }
 .form-row {
   display: flex;
@@ -2337,6 +2455,15 @@ input[type="checkbox"] {
 .event-tag.warn { background: var(--danger-soft); color: var(--danger) }
 .log-detail { color: var(--text-2); font-size: 12.5px; word-break: break-all; line-height: 1.5 }
 .failed-item { display: flex; flex-direction: column; gap: 6px; min-width: 0; width: 100% }
+.failed-truncate-tip {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  background: var(--surface-2, rgba(128, 128, 128, .08));
+  border-radius: 7px;
+  padding: 8px 10px;
+  margin: 0 0 10px;
+}
 .log-error {
   color: var(--danger);
   font-size: 11.5px;
