@@ -540,6 +540,7 @@ async def lifespan(_app: FastAPI):
     yield
     _images_index_stop.set()
     _folder_watcher_stop.set()
+    _folder_watcher_wake.set()  # 立刻打断 wait，别让退出等满一个周期
     scheduler.shutdown(wait=False)
 
 
@@ -1164,8 +1165,7 @@ def get_all_images(user: UserItem) -> List[str]:
 @app.get("/api/random-images")
 def api_random_images(limit: int = 1000, user: UserItem = Depends(get_current_user)):
     """从整个媒体库随机抽取图片（按用户允许目录过滤），供首页随机幻灯片使用。"""
-    global _last_list_activity
-    _last_list_activity = time.time()  # 只看幻灯片也算有人访问，后台别因空闲暂停
+    _touch_activity()  # 只看幻灯片也算有人访问，后台别因空闲暂停
     limit = max(1, min(limit, RANDOM_IMAGES_LIMIT_MAX))
     # 首次部署时后台预热可能尚未完成，最多等 1.5 秒；不在这里自己扫全库
     if not _images_index:
@@ -1201,7 +1201,9 @@ _folder_stats_refresh_lock = threading.Lock()  # 串行化增量刷新，避免�
 _folder_stats: dict = {}
 _folder_stats_building = False
 _last_list_activity = time.time()
+_last_verify_ts = 0.0                        # 上次真正比对完全库 mtime 的时间
 _folder_watcher_stop = threading.Event()
+_folder_watcher_wake = threading.Event()     # 有人访问时提前叫醒后台，不必等满周期
 
 
 def invalidate_folder_stats():
@@ -1466,9 +1468,30 @@ def _verify_folder_stats(mountinfo_path: str = "/proc/self/mountinfo") -> int:
     return len(roots) + len(removed_roots)
 
 
+def _touch_activity():
+    """有人访问：刷新活跃时间；距上次校验够久就顺带把后台立刻叫醒。
+
+    只做标记不清算，真正的全库 stat 仍在后台线程里跑，点击路径不会被拖慢。
+    """
+    global _last_list_activity
+    now = time.time()
+    _last_list_activity = now
+    if now - _last_verify_ts >= _FOLDER_STATS_CHECK_SEC:
+        _folder_watcher_wake.set()
+
+
 def _folder_watcher_loop():
-    """空闲时自动暂停，有人访问才按周期校验，避免没人看也一直打扰 NAS。"""
-    while not _folder_watcher_stop.wait(_FOLDER_STATS_CHECK_SEC):
+    """空闲时自动暂停，有人访问才校验，避免没人看也一直打扰 NAS。
+
+    平时最多睡 _FOLDER_STATS_CHECK_SEC；页面一有请求就提前醒，
+    这样「打开页面 → 点随机幻灯片」之间那几秒就足够把新图并进索引。
+    """
+    global _last_verify_ts
+    while not _folder_watcher_stop.is_set():
+        _folder_watcher_wake.wait(_FOLDER_STATS_CHECK_SEC)
+        _folder_watcher_wake.clear()
+        if _folder_watcher_stop.is_set():
+            break
         try:
             with _images_index_lock:
                 hint = _images_index_dirty
@@ -1476,6 +1499,9 @@ def _folder_watcher_loop():
             if not hint and time.time() - _last_list_activity > _FOLDER_STATS_IDLE_SEC:
                 continue
             n = _verify_folder_stats()
+            _last_verify_ts = time.time()
+            # 校验期间攒下的唤醒已经过时，清掉，下一轮老老实实睡满周期
+            _folder_watcher_wake.clear()
             if n:
                 print(f"[FOLDER] 后台检测到 {n} 处目录变化，已增量刷新角标与图片索引")
         except Exception as exc:
@@ -1523,8 +1549,7 @@ def _folder_info_uncached(folder_abs: Path):
 
 @app.get("/api/list")
 def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
-    global _last_list_activity
-    _last_list_activity = time.time()
+    _touch_activity()
     work_path = check_dir_allowed(user, dir)
     if not work_path.exists() or not work_path.is_dir():
         return {"list": [], "breadcrumb": []}
