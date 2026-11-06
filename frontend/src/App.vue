@@ -1105,10 +1105,12 @@ async function startRandomSlide() {
   randomSlideLoading.value = true
   randomSlideHint.value = ''
   let warming = false
+  const startedAt = Date.now()
   try {
-    const list = await fetchRandomImages(n => {
+    const list = await fetchRandomImages(() => {
       warming = true
-      randomSlideHint.value = `正在建立图片索引（${n * 2}s）`
+      // 用真实经过时间，别拿重试次数估算（每轮还有请求本身的耗时）
+      randomSlideHint.value = `正在建立图片索引（${Math.round((Date.now() - startedAt) / 1000)}s）`
     })
     if (list === null) {
       return alert(warming
