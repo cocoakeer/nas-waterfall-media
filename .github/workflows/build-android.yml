@@ -13,9 +13,11 @@ permissions:
 
 jobs:
   build:
-    # 固定 24.04：ubuntu-latest 从 2026-10 起迁移到 Ubuntu 26，
-    # 预置 Android SDK 的路径会变，固定镜像避免 runner 漂移
-    runs-on: ubuntu-24.04
+    # 用 ubuntu-latest：自动跟进安全更新，不必手动换 runner 标签。
+    # 能安全用 latest 是因为构建不依赖 runner 预装内容：setup-android@v4
+    # 自装 cmdline-tools、sdkmanager 走绝对路径、显式安装 android-34 与
+    # build-tools 34.0.0，build.sh 也固定取 34.0.0 而不是「最高版本」。
+    runs-on: ubuntu-latest
     steps:
       - name: 检出代码
         uses: actions/checkout@v7

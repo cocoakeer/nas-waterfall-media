@@ -31,7 +31,13 @@ if [ -z "$ANDROID_JAR" ] || [ ! -f "$ANDROID_JAR" ]; then
   exit 1
 fi
 
-BT="$(ls -d "$SDK"/build-tools/*/ 2>/dev/null | sort | tail -1 || true)"
+# 优先用 workflow 明确安装的 34.0.0。ubuntu-latest 可能预装更高版本，
+# 取「最高」会让构建工具随 runner 镜像漂移、结果不可重现。
+BT="$SDK/build-tools/34.0.0"
+if [ ! -d "$BT" ]; then
+  BT="$(ls -d "$SDK"/build-tools/*/ 2>/dev/null | sort | tail -1 || true)"
+  BT="${BT%/}"
+fi
 if [ -z "$BT" ]; then
   echo "❌ 缺少 build-tools，请先运行 sdkmanager" >&2
   exit 1
