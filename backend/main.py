@@ -33,15 +33,14 @@ from .cover import (
     load_duration_cache,
     save_duration_cache,
 )
-from .config import load_settings, save_settings, CONFIG_PATH, CACHE_PATH
+from .config import load_settings, save_settings, CONFIG_PATH
 
 # ========== 配置读取 适配compose CONFIG_PATH / CACHE_PATH ==========
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
 REAL_BASE = Path(MEDIA_ROOT).resolve()  # 预计算，避免每个请求重复 resolve
-# 目录统一复用 config.py 的定义（它 import 时就已 mkdir），不再各建一套
-# Path 对象，避免以后改一处漏一处；mode 对已存在目录本来也不生效
+# 目录统一复用 config.py 的定义（它 import 时就已 mkdir）；缓存目录由
+# cover.py 直接用 CACHE_PATH，main.py 不需要再留一个没人用的别名
 CONFIG_DIR = CONFIG_PATH
-CACHE_DIR = CACHE_PATH
 USER_CONFIG_PATH = CONFIG_DIR / "users.json"
 
 SESSION_EXPIRE_SEC = 86400
@@ -1031,7 +1030,9 @@ def load_images_index():
                         _images_index = flat
                         _images_index_ts = ts
                         _images_index_gen += 1
-                        _images_index_dirty = False
+                        # 磁盘快照可能落后于停机期间的媒体库变更，标记待校准，
+                        # 让启动预热做一次全量重建对齐磁盘（在后台线程，不阻塞服务）
+                        _images_index_dirty = True
                         # 重新排一次盘：把旧格式升级成分组格式
                         _images_index_unsaved = ts == 0.0
                         _images_index_saved_ts = ts
@@ -1056,13 +1057,14 @@ def _clear_images_index_dirty():
 
 
 def _images_index_loop():
-    """兜底维护：启动预热一次 + 每 _IMAGES_INDEX_MAX_AGE 全量重建一次。
+    """启动时校准一次 + 每 _IMAGES_INDEX_MAX_AGE 全量重建一次。
 
-    日常「哪个目录变了」由目录 watcher 驱动增量合并，这里不再定时全扫，
-    百万级图库也不会出现「每十分钟全库重走一遍」的持续压力。
+    磁盘索引是上次落盘的快照，停机期间媒体库可能已经变了，所以启动后
+    无条件全量重建一次（后台线程，不阻塞服务可用）。日常「哪个目录变了」
+    由目录 watcher 驱动增量合并，这里不再定时全扫，百万级图库也不会出现
+    「每十分钟全库重走一遍」的持续压力。
     """
-    if not _images_index or _images_index_dirty:
-        _rebuild_images_index("（启动预热）")
+    _rebuild_images_index("（启动校准）")
     while not _images_index_stop.wait(_IMAGES_INDEX_CHECK_SEC):
         try:
             with _images_index_lock:
@@ -1144,9 +1146,9 @@ def _refresh_images_subtrees(changed, removed=()) -> bool:
     """按目录增量刷新图片索引，替代「有变化就全量重扫」。
 
     每个变化目录只重扫本层；只有子目录清单出现新增时才递归进新子树。
-    父目录 mtime 变化必然意味着它的直接内容变了，而深层变化会让那一层
-    自己出现在 changed 里，所以逐层处理不会漏。copy-on-write：构建期间
-    用户点击读到的仍是旧索引，合并完成才整体换引用。
+    调用方（_verify_folder_stats）传的是已 topmost 化的目录，父子同时变化
+    时本轮只处理父目录，子目录由 watcher 下一轮发现后补上，最多晚一个周期。
+    copy-on-write：构建期间用户点击读到的仍是旧索引，合并完成才整体换引用。
     """
     global _images_by_dir, _images_subdirs, _images_index
     global _images_index_gen, _images_index_unsaved, _images_index_dirty
@@ -1232,7 +1234,9 @@ def _flush_images_index() -> bool:
     global _images_index_unsaved, _images_index_saved_ts
     with _images_index_write_lock:
         with _images_index_lock:
-            if not _images_index_unsaved or not _images_by_dir:
+            # 全库真的被清空时 _images_by_dir 也是空的，仍要落盘并复位标记，
+            # 否则 unsaved 永远清不掉，后台每 60 秒空转一次
+            if not _images_index_unsaved:
                 return False
             by_dir = _images_by_dir
             subdirs = _images_subdirs
@@ -1621,11 +1625,23 @@ def _verify_folder_stats(mountinfo_path: str = "/proc/self/mountinfo") -> int:
         return 0
     with _folder_stats_lock:
         snap = _folder_stats
+    rebuilt_baseline = not snap
     if not snap:
         # 还没人翻过目录时快照是空的，角标和图片索引都需要一个 mtime 基线
         snap = _get_folder_stats()
     if not snap:
         return 0
+    # 缓存任务结束时 invalidate_folder_stats() 会清空快照。基线按「当前磁盘」
+    # 重建后，任务期间的增删已被吸收进 mtime，下面再比对必然是「无变化」。
+    # 若此时索引还标着 dirty，绝不能据此认定它是最新的，直接全量校准：
+    # 否则新图/已删图会一直留在随机幻灯片里，直到 1 小时后的兜底重建。
+    if rebuilt_baseline:
+        with _images_index_lock:
+            need_calibration = _images_index_dirty
+        if need_calibration:
+            # 成功时 dirty 已在重建内部清掉；失败保留，等下一轮重试
+            _rebuild_images_index("（基线重建后校准）")
+            return 0
     changed, removed = [], []
     unreadable = 0
     for key, old_mt in snap.get("mtimes", {}).items():
@@ -1659,14 +1675,15 @@ def _verify_folder_stats(mountinfo_path: str = "/proc/self/mountinfo") -> int:
     removed_roots = [k for k in _topmost_paths(removed)
                      if not any(k == r or k.startswith(r + os.sep) for r in roots)]
     if not roots and not removed_roots:
-        _clear_images_index_dirty()
         return 0
     _refresh_folder_subtrees([Path(k) for k in roots], removed_roots)
     # 同一次 mtime 比对顺带更新图片索引，不再为它单独全库重扫一遍。
-    # 父目录被子目录覆盖时（changed 里父子都有）恰好只处理父，子目录的
-    # 旧 mtime 留在快照里，下一轮会被再次发现并补上，最多晚一个周期。
-    _refresh_images_subtrees(roots, removed_roots)
-    _clear_images_index_dirty()
+    # 调用方传的是已 topmost 化的 roots，父子同时变化时只处理父目录；
+    # 子目录的旧 mtime 留在快照里，下一轮会被再次发现并补上，最多晚一个周期。
+    if _refresh_images_subtrees(roots, removed_roots):
+        # 增量刷新失败（挂载异常 / 目录不可读 / 索引为空）时不能清 dirty，
+        # 否则变化就再也没人补了
+        _clear_images_index_dirty()
     return len(roots) + len(removed_roots)
 
 

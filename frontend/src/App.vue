@@ -395,6 +395,20 @@
         <button class="slide-prev-btn" @click="slidePrev">‹</button>
         <button class="slide-next-btn" @click="slideNext">›</button>
       </div>
+      <!-- 触屏移动设备横屏、且方向锁未生效时（iOS 或全屏被拒），提示竖持并暂停轮播 -->
+      <div v-if="isTouchMobile && slideLandscape" class="slide-rotate-hint">
+        <svg class="rotate-phone" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+          <rect x="16" y="6" width="16" height="30" rx="3" stroke="currentColor" stroke-width="2"/>
+          <path d="M22 10h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <path d="M9 33a17 17 0 0 0 17-17" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-dasharray="3 4"/>
+          <path d="M9 27v6h6" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="rotate-title">请竖持设备</div>
+        <div class="rotate-sub">幻灯片以竖屏播放，转回竖屏后自动继续</div>
+        <button class="rotate-exit" @click="exitSlide">退出幻灯片</button>
+      </div>
     </div>
   </div>
 </template>
@@ -543,6 +557,9 @@ const slideIndex = ref(0)
 const slideTimer = ref(null)
 const slideList = ref([])
 const currentSlide = ref({})
+// 随机幻灯片换批是异步的：await 期间 slideIndex 暂时越界且没有计时器，
+// 方向变化触发的 runSlide 不能在这时插进来重设 currentSlide 或另起计时器
+let slideBatchReloading = false
 // 首页随机幻灯片：全库随机抽取；预览里的「从此处开始幻灯片」仍是顺序播放
 const randomSlideLoading = ref(false)
 const randomSlideMode = ref(false)
@@ -556,9 +573,68 @@ const RANDOM_INDEX_WAIT_MS = 90000
 const RANDOM_BATCH_WAIT_MS = 8000
 const RANDOM_INDEX_RETRY_MS = 2000
 
+// ========= 移动端竖屏播放 =========
+// 网页只能在「移动设备 + 全屏上下文」尝试锁定方向（Screen Orientation API
+// 非 Baseline）。iOS Safari 不提供 screen.orientation.lock，无法强制设备
+// 竖屏，横屏时改由引导层提示用户竖持，并暂停轮播。
+const isTouchMobile = ref(false)
+const slideLandscape = ref(false)
+let orientationMQ = null
+let orientationLockedByUs = false
+let orientationWanted = false
+
+function detectTouchMobile() {
+  const ua = navigator.userAgent || ''
+  const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+  const mobileUA = /Android|iPhone|iPad|iPod|Mobile|Tablet|Silk|Kindle/i.test(ua)
+  // iPadOS 13+ 请求桌面网站时 UA 是 Macintosh，但保留多点触控
+  const iPadOS = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1
+  // 桌面浏览器把窗口拉成宽屏也会命中 orientation: landscape，
+  // 必须同时判定「是触屏移动设备」，否则桌面会误弹提示
+  isTouchMobile.value = !!((mobileUA || iPadOS) && (coarse || navigator.maxTouchPoints > 0))
+}
+
+function syncSlideOrientation() {
+  slideLandscape.value = !!(orientationMQ && orientationMQ.matches)
+}
+
+async function tryLockPortrait() {
+  const so = window.screen && window.screen.orientation
+  // 只在手机/平板尝试：桌面窗口拉成宽屏既不该被锁，也不该弹竖持提示
+  if (!isTouchMobile.value || !so || typeof so.lock !== 'function' || orientationLockedByUs) return
+  orientationWanted = true
+  try {
+    await so.lock('portrait')
+    orientationLockedByUs = true
+    // lock() 是异步的：锁生效期间用户可能已经退出了幻灯片，
+    // 这时要立刻解掉，不能把设备留在竖屏直到刷新页面
+    if (!orientationWanted) unlockPortrait()
+  } catch (e) {
+    // iOS Safari / 未进全屏 / 桌面不支持：静默降级，靠横屏引导层兜底
+  }
+}
+
+function unlockPortrait() {
+  // 作废「启动意图」，让在途的 lock 完成后自行解锁
+  orientationWanted = false
+  // 只解我们自己加的锁，别动用户系统里原本的方向锁定
+  if (!orientationLockedByUs) return
+  orientationLockedByUs = false
+  try { window.screen.orientation.unlock() } catch (e) { /* 忽略 */ }
+}
+
+// 引导层出现时暂停自动切图；转回竖屏后从当前这张重新计时，不跳帧
+watch(slideLandscape, (land) => {
+  if (!slideShow.value || !isTouchMobile.value) return
+  if (land) clearTimeout(slideTimer.value)
+  else runSlide()
+})
+
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
 let statusPollTimer = null
+// 本次会话是否亲自点过「预生成缓存」。接管别人任务的进度时不该弹「任务结束」
+let cacheTaskOwnedByMe = false
 // 组件卸载后，在途请求返回时不要再把轮询链重新挂起来
 let disposed = false
 // 缓存统计：total 全部 / cached 已缓存 / uncached 未缓存 / failed 失败 / failed_files 失败文件 / last_finish_time 上次完成时间
@@ -788,7 +864,9 @@ async function pollCacheStatus() {
       stopStatusPoll()
       cacheRunning.value = false
       loadCacheStats()
-      alert(`✅缓存任务结束！\n${st.message}`)
+      // 只是接管了别人（或定时任务）的进度时，不给当前用户弹完成提示
+      if (cacheTaskOwnedByMe) alert(`✅缓存任务结束！\n${st.message}`)
+      cacheTaskOwnedByMe = false
       return
     }
     startStatusPoll()
@@ -805,6 +883,7 @@ async function initCheckCacheTask() {
     stopStatusPoll()
     cacheRunning.value = false
     cachePercent.value = 0
+    cacheTaskOwnedByMe = false
     return
   }
   try {
@@ -848,6 +927,7 @@ async function runCacheTask() {
       }
       return
     }
+    cacheTaskOwnedByMe = true
     startStatusPoll()
   } catch (err) {
     console.error(err)
@@ -908,10 +988,25 @@ function pushPreviewHistory() {
   }
 }
 
+let lastForbiddenAlert = 0
 function checkAuthResp(r) {
   if (r.status === 401) {
+    // 会话过期：把弹窗、列表、幻灯片全部复位，不能只切登录页
+    resetUiState()
+    stopStatusPoll()
+    cacheRunning.value = false
+    cachePercent.value = 0
+    cacheTaskOwnedByMe = false
     isLogin.value = false
     userInfo.value = {}
+  } else if (r.status === 403) {
+    // 静默刷新 / 进度轮询也走这里，降权后每 800ms 一次会把 alert 打爆，
+    // 所以同类提示 30 秒内只弹一次
+    const now = Date.now()
+    if (now - lastForbiddenAlert > 30000) {
+      lastForbiddenAlert = now
+      alert('没有权限执行此操作，请确认账号权限')
+    }
   }
 }
 
@@ -950,7 +1045,7 @@ async function silentRefreshList() {
     const data = await res.json()
     // 请求期间用户可能已切换目录（或新的加载正在进行）。
     // NAS 上旧请求可能更慢，不能让它把旧目录的数据盖回当前页面。
-    if (currentDir.value !== dirAtStart || isLoading.value) return
+    if (!isLogin.value || currentDir.value !== dirAtStart || isLoading.value) return
     const next = data.list || []
     if (listSignature(next) !== listSignature(mediaList.value)) {
       // 必须保留瀑布流挂在 item 上的 UI 字段：img 按 :key 复用、src 没变就不会
@@ -996,6 +1091,8 @@ async function loadMedia(dir = '', pushHistory = false) {
     const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
     if (!res.ok) { checkAuthResp(res); return }
     const data = await res.json()
+    // 请求在途时用户可能已经登出，别把上一位用户的目录内容写回来
+    if (!isLogin.value) return
     mediaList.value = data.list || []
     breadcrumbList.value = data.breadcrumb || []
   } catch (err) {
@@ -1003,7 +1100,7 @@ async function loadMedia(dir = '', pushHistory = false) {
     mediaList.value = []
   }finally{
     isLoading.value = false
-    if (pendingLoad) {
+    if (pendingLoad && isLogin.value) {
       const next = pendingLoad
       pendingLoad = null
       loadMedia(next.dir, next.pushHistory)
@@ -1075,15 +1172,19 @@ function onTouchEnd(e) {
 
 function handleKeydown(e) {
   if (slideShow.value) {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      exitSlide()
+      return
+    }
+    // 横屏引导层盖住了画面，此时左右键会「盲跳」到看不见的图，直接忽略
+    if (isTouchMobile.value && slideLandscape.value) return
     if (e.key === 'ArrowLeft') {
       e.preventDefault()
       slidePrev()
     } else if (e.key === 'ArrowRight') {
       e.preventDefault()
       slideNext()
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      exitSlide()
     }
     return
   }
@@ -1107,7 +1208,7 @@ function handleKeydown(e) {
 async function loadSlideSettings() {
   try {
     const res = await fetch(`${baseUrl}/api/settings`)
-    if (!res.ok) return
+    if (!res.ok) { checkAuthResp(res); return }
     const j = await res.json()
     if (j.code === 0 && j.settings) {
       slideDelay.value = clampSlideDelay(j.settings.slide_delay ?? 3)
@@ -1132,7 +1233,8 @@ async function saveSetting() {
       body: JSON.stringify({ slide_delay: slideDelay.value, slide_loop: slideLoop.value })
     })
     if (!res.ok) {
-      checkAuthResp(res)
+      // 403 用下面这条专属提示，别让 checkAuthResp 再弹一次通用提示
+      if (res.status === 401) checkAuthResp(res)
       return alert(res.status === 403
         ? '幻灯片设置是全局的，只有管理员可以修改'
         : '❌ 保存失败，请稍后重试')
@@ -1148,17 +1250,18 @@ async function saveSetting() {
 
 // 从整个媒体库随机取一批图片
 // onWaiting：索引还在预热时逐轮回调，用于把「正在建索引」显示给用户
-async function fetchRandomImages(onWaiting = null, waitMs = RANDOM_INDEX_WAIT_MS) {
+// shouldAbort：每轮检查一次取消条件（登出、用户按 ESC 退出全屏），
+// 否则首次建索引的 90 秒等待期间会一直打请求、回来后还弹出幻灯片
+async function fetchRandomImages(onWaiting = null, waitMs = RANDOM_INDEX_WAIT_MS, shouldAbort = null) {
   const deadline = Date.now() + waitMs
-  let attempt = 0
   while (Date.now() < deadline) {
+    if (shouldAbort && shouldAbort()) return null
     const res = await fetch(`${baseUrl}/api/random-images?limit=${RANDOM_BATCH_SIZE}`)
     if (!res.ok) { checkAuthResp(res); return null }
     const j = await res.json()
     if (j.code === 2) {
       // 索引还没建好：不是故障，继续等，但不超过 waitMs
-      attempt++
-      onWaiting?.(attempt)
+      onWaiting?.()
       const left = deadline - Date.now()
       if (left <= 0) break
       await new Promise(r => setTimeout(r, Math.min(RANDOM_INDEX_RETRY_MS, left)))
@@ -1189,9 +1292,11 @@ async function startRandomSlide() {
       warming = true
       // 用真实经过时间，别拿重试次数估算（每轮还有请求本身的耗时）
       randomSlideHint.value = `正在建立图片索引（${Math.round((Date.now() - startedAt) / 1000)}s）`
-    })
-    if (hadFullscreen && !slideFullscreenOwned) {
-      // 用户等得不耐烦退出了全屏，别再几十秒后突然弹出幻灯片
+    }, RANDOM_INDEX_WAIT_MS,
+      () => !isLogin.value || (hadFullscreen && !slideFullscreenOwned))
+    // 登出或按 ESC 取消：等待循环已提前结束，静默退出，别弹错误框也别弹幻灯片
+    if (!isLogin.value || (hadFullscreen && !slideFullscreenOwned)) {
+      unlockPortrait()
       return
     }
     if (list === null) {
@@ -1212,7 +1317,8 @@ async function startRandomSlide() {
   } catch (e) {
     console.error('加载随机图片失败', e)
     exitSlide()
-    alert('❌ 加载图片失败，请稍后重试')
+    // 等待期间可能已经登出，别给登录页弹一个幻灯片错误框
+    if (isLogin.value) alert('❌ 加载图片失败，请稍后重试')
   } finally {
     randomSlideLoading.value = false
     randomSlideHint.value = ''
@@ -1269,15 +1375,19 @@ let slideFullscreenOwned = false
 async function openRootFullscreen() {
   const docEl = document.documentElement
   const req = docEl.requestFullscreen || docEl.webkitRequestFullscreen || docEl.msRequestFullscreen
-  if (!req) return
-  try {
-    await req.call(docEl)
-    slideFullscreenOwned = true
-  } catch (e) {
-    // 浏览器要求全屏必须由用户手势触发：等索引太久会走到这里，只当降级处理
-    slideFullscreenOwned = false
-    console.warn("无法进入全屏，浏览器策略限制", e)
+  if (req) {
+    try {
+      await req.call(docEl)
+      slideFullscreenOwned = true
+    } catch (e) {
+      // 浏览器要求全屏必须由用户手势触发：等索引太久会走到这里，只当降级处理
+      slideFullscreenOwned = false
+      console.warn("无法进入全屏，浏览器策略限制", e)
+    }
   }
+  // 方向锁要求先处于全屏上下文，所以放在 requestFullscreen 之后。
+  // iOS 没有标准全屏也没有 lock，这里会静默跳过，由引导层兜底。
+  tryLockPortrait()
 }
 
 // 前缀 API 的老浏览器（旧 Safari / 旧 Edge）没有标准属性，必须一起判断
@@ -1292,6 +1402,7 @@ function exitSlide() {
   clearTimeout(slideTimer.value)
   slideShow.value = false
   randomSlideMode.value = false
+  unlockPortrait()
   const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
   // 已经不在全屏时（用户按 ESC 退出）再调 exitFullscreen 一定 reject，要兜住
   if (exit && currentFullscreenElement()) {
@@ -1304,7 +1415,20 @@ function exitSlide() {
 
 function runSlide() {
   clearTimeout(slideTimer.value)
-  currentSlide.value = slideList.value[slideIndex.value]
+  const list = slideList.value
+  if (!list.length) {
+    currentSlide.value = {}
+    return
+  }
+  // 换批 await 期间 slideIndex 可能等于 list.length，钳住避免 currentSlide=undefined
+  const i = Math.min(Math.max(slideIndex.value, 0), list.length - 1)
+  slideIndex.value = i
+  currentSlide.value = list[i]
+  // 换批还没回来时不再另起计时器，等 slideNext 的 await 恢复后统一计时
+  if (slideBatchReloading) return
+  // 移动端横屏时正显示「请竖持设备」引导层，不自动切图；
+  // 转回竖屏由 slideLandscape 的 watch 重新计时
+  if (isTouchMobile.value && slideLandscape.value) return
   slideTimer.value = setTimeout(() => {
     slideNext()
   }, clampSlideDelay(slideDelay.value) * 1000)
@@ -1318,7 +1442,13 @@ async function slideNext() {
       return
     }
     if (randomSlideMode.value) {
-      const ok = await reloadRandomBatch()
+      slideBatchReloading = true
+      let ok = false
+      try {
+        ok = await reloadRandomBatch()
+      } finally {
+        slideBatchReloading = false
+      }
       if (!slideShow.value) return
       if (!ok) shuffleSlideList()
     }
@@ -1390,6 +1520,50 @@ async function doLogin() {
   }
 }
 
+// 登出 / 会话失效时统一复位。否则下一位用户登录后，上一位管理员的
+// 弹窗、用户列表、执行日志还会以残留 ref 的形式显示出来（跨账号泄露）。
+function resetUiState() {
+  // 幻灯片：停定时器、解锁方向、退全屏，再关界面
+  clearTimeout(slideTimer.value)
+  unlockPortrait()
+  const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
+  if (exit && currentFullscreenElement()) {
+    try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (e) { /* 忽略 */ }
+  }
+  slideShow.value = false
+  randomSlideMode.value = false
+  slideFullscreenOwned = false
+  slideBatchReloading = false
+  slideList.value = []
+  currentSlide.value = {}
+  slideIndex.value = 0
+  randomSlideLoading.value = false
+  randomSlideHint.value = ''
+
+  previewShow.value = false
+  previewItem.value = null
+  previewHistoryPushed = false
+
+  settingShow.value = false
+  changePwdModal.value = false
+  userManageModal.value = false
+  logModal.value = false
+  failedFilesModal.value = false
+  showUserDrop.value = false
+  umView.value = 'list'
+  editUser.value = null
+  adminUserList.value = []
+  dirOptions.value = []
+  logList.value = []
+  cacheStats.value = { total: 0, cached: 0, uncached: 0, failed: 0,
+                       failed_files: [], failed_files_truncated: false, last_finish_time: null }
+
+  mediaList.value = []
+  breadcrumbList.value = []
+  currentDir.value = ''
+  pendingLoad = null
+}
+
 async function doLogout() {
   await fetch(`${baseUrl}/api/logout`, {method:"POST"})
   // 停掉轮询链并复位进度，否则快速切换账号时会把上一位管理员的任务
@@ -1397,9 +1571,12 @@ async function doLogout() {
   stopStatusPoll()
   cacheRunning.value = false
   cachePercent.value = 0
+  cacheTaskOwnedByMe = false
+  resetUiState()
   isLogin.value = false
   userInfo.value = {}
-  showUserDrop.value = false
+  loginForm.value = {username:'', password:''}
+  loginErr.value = ''
 }
 
 async function checkLoginStatus() {
@@ -1409,15 +1586,21 @@ async function checkLoginStatus() {
       const ret = await res.json()
       isLogin.value = true
       userInfo.value = ret
+      loginForm.value = {username:'', password:''}
+      loginErr.value = ''
       const urlDir = getDirFromUrl()
       await loadMedia(urlDir, !!urlDir)
       await loadSlideSettings()
       initCheckCacheTask()
     } else {
+      resetUiState()
       isLogin.value = false
+      userInfo.value = {}
     }
   } catch(e) {
+    resetUiState()
     isLogin.value = false
+    userInfo.value = {}
   } finally {
     initLoading.value = false
     // 首次挂载时 app-container 到此刻才渲染，先前所有布局都因容器不存在被跳过。
@@ -1431,7 +1614,7 @@ async function checkLoginStatus() {
 async function loadCacheStats() {
   try {
     const res = await fetch(`${baseUrl}/api/cache-stats`)
-    if (!res.ok) return
+    if (!res.ok) { checkAuthResp(res); return }
     const j = await res.json()
     if (j.code === 0) {
       cacheStats.value = {
@@ -1474,7 +1657,7 @@ function openFailedFilesModal(){
 async function loadLogs(){
   try {
     const res = await fetch(`${baseUrl}/api/logs?limit=200`)
-    if (!res.ok) return
+    if (!res.ok) { checkAuthResp(res); return }
     const j = await res.json()
     if (j.code === 0) {
       logList.value = j.logs || []
@@ -1517,7 +1700,12 @@ async function submitChangePwd(){
       body:JSON.stringify({old_password:f.old, new_password:f.new})
     })
     const json = await res.json()
-    if(res.ok && json.code ===0){
+    if (!res.ok) {
+      checkAuthResp(res)   // 401 切登录页、403 提示降权
+      pwdMsg.value = json.detail || "修改失败"
+      return
+    }
+    if(json.code ===0){
       pwdMsg.value = "密码修改成功！"
       setTimeout(()=>{changePwdModal.value=false},1200)
     }else{
@@ -1545,6 +1733,7 @@ function closeUserManageModal(){
 async function reloadDirOptions(){
   try{
     const res = await fetch("/api/admin/dirs")
+    if (!res.ok) { checkAuthResp(res); return }
     const json = await res.json()
     if(json.code===0){
       dirOptions.value = json.options
@@ -1554,6 +1743,7 @@ async function reloadDirOptions(){
 async function reloadAdminUserList(){
   try{
     const res = await fetch("/api/admin/users")
+    if (!res.ok) { checkAuthResp(res); return }
     const json = await res.json()
     if(json.code===0){
       adminUserList.value = json.list
@@ -1601,6 +1791,7 @@ async function triggerRename(){
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({old_username:oldU, new_username:newTrim})
     })
+    if (!res.ok) { checkAuthResp(res); return }
     const json = await res.json()
     if(json.code===0){
       adminMsg.value = "用户名修改成功"
@@ -1637,6 +1828,7 @@ async function submitUmForm(){
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify(body)
     })
+    if (!res.ok) { checkAuthResp(res); return }
     const json = await res.json()
     if(json.code===0){
       adminMsg.value = json.msg || "保存成功"
@@ -1658,6 +1850,7 @@ async function doInnerDelete(){
   const uname = umDelConfirm.value.user.username
   try{
     const res = await fetch(`/api/admin/user/${encodeURIComponent(uname)}`,{method:"DELETE"})
+    if (!res.ok) { checkAuthResp(res); umDelConfirm.value.show = false; return }
     const json = await res.json()
     if(json.code===0){
       await reloadAdminUserList()
@@ -1687,11 +1880,26 @@ function onFullscreenChange(){
     return
   }
   if (slideFullscreenOwned && slideShow.value) exitSlide()
+  // 等索引期间按 ESC 退全屏时 slideShow 还是 false，上面不会走 exitSlide，
+  // 方向锁必须在这里解掉，否则设备被留在竖屏直到刷新页面。
+  // 反过来：幻灯片里的视频退出全屏时 slideShow 仍为 true，不能解锁，
+  // 幻灯片还在播，方向锁要继续生效。
+  if (!slideShow.value) unlockPortrait()
   slideFullscreenOwned = false
 }
 
 onMounted(() => {
   checkLoginStatus()
+  detectTouchMobile()
+  orientationMQ = window.matchMedia ? window.matchMedia('(orientation: landscape)') : null
+  syncSlideOrientation()
+  if (orientationMQ) {
+    if (orientationMQ.addEventListener) {
+      orientationMQ.addEventListener('change', syncSlideOrientation)
+    } else if (orientationMQ.addListener) {
+      orientationMQ.addListener(syncSlideOrientation)
+    }
+  }
   document.addEventListener('keydown', handleKeydown)
   window.addEventListener('resize', onWindowResize)
   window.addEventListener('popstate', onPopState)
@@ -1705,6 +1913,14 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true
+  if (orientationMQ) {
+    if (orientationMQ.removeEventListener) {
+      orientationMQ.removeEventListener('change', syncSlideOrientation)
+    } else if (orientationMQ.removeListener) {
+      orientationMQ.removeListener(syncSlideOrientation)
+    }
+  }
+  unlockPortrait()  // 组件卸载时也别把用户设备留在锁定的竖屏
   document.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('popstate', onPopState)
@@ -2628,6 +2844,50 @@ input[type="checkbox"] {
 .slide-next-btn:hover { background: rgba(91, 130, 247, .8) }
 .slide-prev-btn { left: 20px }
 .slide-next-btn { right: 20px }
+
+/* 触屏移动设备横屏引导层：系统方向锁不可用时提示竖持，期间轮播已暂停 */
+.slide-rotate-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  padding-top: max(24px, env(safe-area-inset-top));
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
+  /* 横屏时刘海/圆角落在左右两侧，这两边才是主要危险区 */
+  padding-left: max(24px, env(safe-area-inset-left));
+  padding-right: max(24px, env(safe-area-inset-right));
+  background: #000;
+  color: var(--text);
+  text-align: center;
+}
+.rotate-phone {
+  width: 58px;
+  height: 58px;
+  color: var(--accent-2);
+  animation: rotate-nudge 2.2s ease-in-out infinite;
+}
+@keyframes rotate-nudge {
+  0%, 40% { transform: rotate(90deg) }
+  60%, 100% { transform: rotate(0deg) }
+}
+.rotate-title { font-size: 17px; font-weight: 500; letter-spacing: .02em }
+.rotate-sub { font-size: 12px; color: var(--muted); line-height: 1.6 }
+.rotate-exit {
+  margin-top: 10px;
+  padding: 9px 20px;
+  background: rgba(31, 35, 43, .9);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  border-radius: 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rotate-exit:hover { background: var(--accent-soft) }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 900px) {
