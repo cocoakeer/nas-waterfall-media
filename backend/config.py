@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 from pathlib import Path
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/config"))
@@ -41,8 +42,20 @@ def load_settings():
     return data
 
 
+_settings_lock = threading.Lock()
+
+
 def save_settings(data: dict):
-    # 原子写：写一半被 kill 会留下损坏的 settings.json
-    tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, SETTINGS_FILE)
+    # 原子写 + 串行化：两个管理员并发保存会共用同一个 tmp 文件，
+    # 后者可能因 tmp 已被 rename 而抛 FileNotFoundError 变成 500
+    with _settings_lock:
+        tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, SETTINGS_FILE)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise

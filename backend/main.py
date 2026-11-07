@@ -179,6 +179,10 @@ def _check_allow_dirs(dirs: List[str]) -> List[str]:
     cleaned = []
     for raw in dirs or []:
         d = (raw or "").strip()
+        # 空串会解析成 REAL_BASE，等同 "/" 的全库权限，但它是脏数据不是
+        # 管理员的本意（前端只校验数组长度，[""] 能通过），必须显式拒绝
+        if not d:
+            raise HTTPException(400, "允许目录不能为空（如需全库请填 /）")
         if ".." in Path(d).parts:
             raise HTTPException(400, "允许目录不能包含 .. ")
         try:
@@ -239,6 +243,10 @@ def _resolved_allow_dirs(allow_dirs: List[str]):
         return cached
     resolved = []
     for ad in allow_dirs:
+        # 空串（含纯空格）解析回 REAL_BASE 会悄悄给全库权限，读路径也要兜住
+        # 手工编辑 users.json / 旧备份里的脏数据；"/" 是合法的全库配置，保留
+        if not ad or not ad.strip():
+            continue
         try:
             p = (REAL_BASE / ad.lstrip("/")).resolve()
             # allow_dirs 可能来自手工编辑的 users.json / 旧备份。解析后越出媒体根
@@ -256,11 +264,14 @@ def _resolved_allow_dirs(allow_dirs: List[str]):
 
 def check_path_allowed(user: UserItem, target_dir: str) -> Path:
     target_dir = target_dir.strip()
-    req_path = (REAL_BASE / target_dir.lstrip("/")).resolve()
+    # Path.resolve() 对含内嵌 NUL 的路径会抛 ValueError，放在 try 外会变成 500
+    if "\x00" in target_dir:
+        raise HTTPException(400, "路径包含非法字符")
     # 文件接口同样守住媒体根边界，防止符号链接 / 路径穿越读到容器其它目录
     try:
+        req_path = (REAL_BASE / target_dir.lstrip("/")).resolve()
         req_path.relative_to(REAL_BASE)
-    except ValueError:
+    except (ValueError, OSError):
         raise HTTPException(status_code=403, detail="路径超出媒体库范围")
     for allow_p in _resolved_allow_dirs(user.allow_dirs):
         try:
@@ -278,11 +289,14 @@ def check_dir_allowed(user: UserItem, target_dir: str) -> Path:
     具体条目还会由 _entry_visible 再过滤一遍。
     文件访问（/api/src、/api/thumb）必须用严格的 check_path_allowed。
     """
-    req_path = (REAL_BASE / target_dir.strip().lstrip("/")).resolve()
+    target = target_dir.strip()
+    if "\x00" in target:
+        raise HTTPException(400, "路径包含非法字符")
     # 祖先放宽不能越出媒体根：否则 dir=../../.. 会把容器根目录也放行
     try:
+        req_path = (REAL_BASE / target.lstrip("/")).resolve()
         req_path.relative_to(REAL_BASE)
-    except ValueError:
+    except (ValueError, OSError):
         raise HTTPException(status_code=403, detail="路径超出媒体库范围")
     for allow_p in _resolved_allow_dirs(user.allow_dirs):
         try:
@@ -1636,12 +1650,15 @@ def _verify_folder_stats(mountinfo_path: str = "/proc/self/mountinfo") -> int:
     # 若此时索引还标着 dirty，绝不能据此认定它是最新的，直接全量校准：
     # 否则新图/已删图会一直留在随机幻灯片里，直到 1 小时后的兜底重建。
     if rebuilt_baseline:
-        with _images_index_lock:
-            need_calibration = _images_index_dirty
-        if need_calibration:
-            # 成功时 dirty 已在重建内部清掉；失败保留，等下一轮重试
-            _rebuild_images_index("（基线重建后校准）")
-            return 0
+        # 判定必须在写锁内做：启动校准可能正在持锁重建，若在锁外读到
+        # dirty=True 再排队等锁，等拿到时 dirty 已被清掉，会白白再扫一遍全库
+        with _images_index_write_lock:
+            with _images_index_lock:
+                need_calibration = _images_index_dirty
+            if need_calibration:
+                # 成功时 dirty 已在重建内部清掉；失败保留，等下一轮重试
+                _rebuild_images_index("（基线重建后校准）")
+        return 0
     changed, removed = [], []
     unreadable = 0
     for key, old_mt in snap.get("mtimes", {}).items():

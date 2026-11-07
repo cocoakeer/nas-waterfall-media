@@ -85,7 +85,7 @@
           <svg class="sort-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
         </div>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
-        <button @click="startRandomSlide" class="btn primary" :disabled="randomSlideLoading">{{ randomSlideLoading ? (randomSlideHint || '加载中…') : '随机幻灯片' }}</button>
+        <button @click="startRandomSlide" class="btn primary">{{ randomSlideLoading ? (randomSlideHint || '加载中…') + ' · 点此取消' : '随机幻灯片' }}</button>
       </div>
     </header>
     <div class="breadcrumb">
@@ -395,20 +395,6 @@
         <button class="slide-prev-btn" @click="slidePrev">‹</button>
         <button class="slide-next-btn" @click="slideNext">›</button>
       </div>
-      <!-- 触屏移动设备横屏、且方向锁未生效时（iOS 或全屏被拒），提示竖持并暂停轮播 -->
-      <div v-if="isTouchMobile && slideLandscape" class="slide-rotate-hint">
-        <svg class="rotate-phone" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-          <rect x="16" y="6" width="16" height="30" rx="3" stroke="currentColor" stroke-width="2"/>
-          <path d="M22 10h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          <path d="M9 33a17 17 0 0 0 17-17" stroke="currentColor" stroke-width="2"
-                stroke-linecap="round" stroke-dasharray="3 4"/>
-          <path d="M9 27v6h6" stroke="currentColor" stroke-width="2"
-                stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <div class="rotate-title">请竖持设备</div>
-        <div class="rotate-sub">幻灯片以竖屏播放，转回竖屏后自动继续</div>
-        <button class="rotate-exit" @click="exitSlide">退出幻灯片</button>
-      </div>
     </div>
   </div>
 </template>
@@ -560,6 +546,10 @@ const currentSlide = ref({})
 // 随机幻灯片换批是异步的：await 期间 slideIndex 暂时越界且没有计时器，
 // 方向变化触发的 runSlide 不能在这时插进来重设 currentSlide 或另起计时器
 let slideBatchReloading = false
+// 每次启动/退出幻灯片递增：在途的换批请求回来后凭它判断自己是否已作废
+let slideSessionId = 0
+// 首次建索引等待期间的显式取消（手机没有 ESC 键，靠再点一次按钮）
+let randomSlideCancelled = false
 // 首页随机幻灯片：全库随机抽取；预览里的「从此处开始幻灯片」仍是顺序播放
 const randomSlideLoading = ref(false)
 const randomSlideMode = ref(false)
@@ -572,63 +562,14 @@ const RANDOM_BATCH_SIZE = 1000
 const RANDOM_INDEX_WAIT_MS = 90000
 const RANDOM_BATCH_WAIT_MS = 8000
 const RANDOM_INDEX_RETRY_MS = 2000
+// 单次取数最长等待：连接挂起时不能让 slideBatchReloading / randomBatchLoading
+// 永久卡在 true，否则幻灯片再也不计时、按钮永远 disabled
+const RANDOM_FETCH_TIMEOUT_MS = 12000
 
-// ========= 移动端竖屏播放 =========
-// 网页只能在「移动设备 + 全屏上下文」尝试锁定方向（Screen Orientation API
-// 非 Baseline）。iOS Safari 不提供 screen.orientation.lock，无法强制设备
-// 竖屏，横屏时改由引导层提示用户竖持，并暂停轮播。
-const isTouchMobile = ref(false)
-const slideLandscape = ref(false)
-let orientationMQ = null
-let orientationLockedByUs = false
-let orientationWanted = false
-
-function detectTouchMobile() {
-  const ua = navigator.userAgent || ''
-  const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
-  const mobileUA = /Android|iPhone|iPad|iPod|Mobile|Tablet|Silk|Kindle/i.test(ua)
-  // iPadOS 13+ 请求桌面网站时 UA 是 Macintosh，但保留多点触控
-  const iPadOS = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1
-  // 桌面浏览器把窗口拉成宽屏也会命中 orientation: landscape，
-  // 必须同时判定「是触屏移动设备」，否则桌面会误弹提示
-  isTouchMobile.value = !!((mobileUA || iPadOS) && (coarse || navigator.maxTouchPoints > 0))
-}
-
-function syncSlideOrientation() {
-  slideLandscape.value = !!(orientationMQ && orientationMQ.matches)
-}
-
-async function tryLockPortrait() {
-  const so = window.screen && window.screen.orientation
-  // 只在手机/平板尝试：桌面窗口拉成宽屏既不该被锁，也不该弹竖持提示
-  if (!isTouchMobile.value || !so || typeof so.lock !== 'function' || orientationLockedByUs) return
-  orientationWanted = true
-  try {
-    await so.lock('portrait')
-    orientationLockedByUs = true
-    // lock() 是异步的：锁生效期间用户可能已经退出了幻灯片，
-    // 这时要立刻解掉，不能把设备留在竖屏直到刷新页面
-    if (!orientationWanted) unlockPortrait()
-  } catch (e) {
-    // iOS Safari / 未进全屏 / 桌面不支持：静默降级，靠横屏引导层兜底
-  }
-}
-
-function unlockPortrait() {
-  // 作废「启动意图」，让在途的 lock 完成后自行解锁
-  orientationWanted = false
-  // 只解我们自己加的锁，别动用户系统里原本的方向锁定
-  if (!orientationLockedByUs) return
-  orientationLockedByUs = false
-  try { window.screen.orientation.unlock() } catch (e) { /* 忽略 */ }
-}
-
-// 引导层出现时暂停自动切图；转回竖屏后从当前这张重新计时，不跳帧
-watch(slideLandscape, (land) => {
-  if (!slideShow.value || !isTouchMobile.value) return
-  if (land) clearTimeout(slideTimer.value)
-  else runSlide()
-})
+// ========= 全屏幻灯片方向策略 =========
+// 不锁设备方向、不弹方向提示：横屏竖屏都由 CSS 自适应布局，
+// 轮播在任何方向下都继续播放。旋转只改变视口尺寸，不重载页面也不中断计时，
+// 具体适配见 .slide-root / .slide-content 的媒体查询与安全区设置。
 
 const cacheRunning = ref(false)
 const cachePercent = ref(0)
@@ -689,7 +630,7 @@ function layoutWaterfall(){
 
   // 先设列宽再测高度：否则读到的 offsetHeight 属于旧的 270px 回退宽度
   waterfallBoxRef.value.style.setProperty('--card-width', cardWidth + 'px')
-  waterfallBoxRef.value.style.setProperty('--card-gap', gap + 'px')
+  // 间距由下面的 JS 常量 gap 直接参与定位，不需要再写一个没人读的 CSS 变量
 
   // 每列高度记录
   const colHeights = new Array(colCount).fill(0)
@@ -1171,14 +1112,18 @@ function onTouchEnd(e) {
 }
 
 function handleKeydown(e) {
+  // 等索引时按 ESC 也能取消（手机端点按钮取消）
+  if (randomSlideLoading.value && e.key === 'Escape') {
+    e.preventDefault()
+    randomSlideCancelled = true
+    return
+  }
   if (slideShow.value) {
     if (e.key === 'Escape') {
       e.preventDefault()
       exitSlide()
       return
     }
-    // 横屏引导层盖住了画面，此时左右键会「盲跳」到看不见的图，直接忽略
-    if (isTouchMobile.value && slideLandscape.value) return
     if (e.key === 'ArrowLeft') {
       e.preventDefault()
       slidePrev()
@@ -1256,9 +1201,24 @@ async function fetchRandomImages(onWaiting = null, waitMs = RANDOM_INDEX_WAIT_MS
   const deadline = Date.now() + waitMs
   while (Date.now() < deadline) {
     if (shouldAbort && shouldAbort()) return null
-    const res = await fetch(`${baseUrl}/api/random-images?limit=${RANDOM_BATCH_SIZE}`)
-    if (!res.ok) { checkAuthResp(res); return null }
-    const j = await res.json()
+    // 单次请求也设上限：换批只有 8 秒窗口，首启 90 秒内单次最多 12 秒。
+    // 连接挂起时不设超时会让调用方的 finally 永远不执行、状态机死锁。
+    const timeoutMs = Math.min(RANDOM_FETCH_TIMEOUT_MS, Math.max(1000, deadline - Date.now()))
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+    let j
+    try {
+      const res = await fetch(`${baseUrl}/api/random-images?limit=${RANDOM_BATCH_SIZE}`,
+        { signal: ctrl.signal })
+      if (!res.ok) { checkAuthResp(res); return null }
+      j = await res.json()
+    } catch (e) {
+      // 网络异常 / 主动 abort / 响应解析失败：直接判定本次取数失败，
+      // 由调用方 finally 复位 loading 标志，不留悬挂状态
+      return null
+    } finally {
+      clearTimeout(timer)
+    }
     if (j.code === 2) {
       // 索引还没建好：不是故障，继续等，但不超过 waitMs
       onWaiting?.()
@@ -1275,8 +1235,14 @@ async function fetchRandomImages(onWaiting = null, waitMs = RANDOM_INDEX_WAIT_MS
 
 // 首页随机幻灯片：点击后播放第一批（不影响预览里的顺序播放）
 async function startRandomSlide() {
-  if (randomSlideLoading.value) return
+  // 等索引期间再点一次按钮即取消（手机没有 ESC 键）
+  if (randomSlideLoading.value) {
+    randomSlideCancelled = true
+    return
+  }
   randomSlideLoading.value = true
+  randomSlideCancelled = false
+  slideSessionId++   // 作废旧会话里可能还在跑的换批请求
   randomSlideHint.value = ''
   let warming = false
   const startedAt = Date.now()
@@ -1293,10 +1259,11 @@ async function startRandomSlide() {
       // 用真实经过时间，别拿重试次数估算（每轮还有请求本身的耗时）
       randomSlideHint.value = `正在建立图片索引（${Math.round((Date.now() - startedAt) / 1000)}s）`
     }, RANDOM_INDEX_WAIT_MS,
-      () => !isLogin.value || (hadFullscreen && !slideFullscreenOwned))
-    // 登出或按 ESC 取消：等待循环已提前结束，静默退出，别弹错误框也别弹幻灯片
-    if (!isLogin.value || (hadFullscreen && !slideFullscreenOwned)) {
-      unlockPortrait()
+      () => randomSlideCancelled || !isLogin.value || (hadFullscreen && !slideFullscreenOwned))
+    // 登出 / 按 ESC 退全屏 / 点按钮取消：等待循环已提前结束，静默退出，
+    // 别弹错误框也别弹幻灯片；exitSlide() 负责把已请求的全屏退掉
+    if (randomSlideCancelled || !isLogin.value || (hadFullscreen && !slideFullscreenOwned)) {
+      exitSlide()
       return
     }
     if (list === null) {
@@ -1326,12 +1293,15 @@ async function startRandomSlide() {
 }
 
 // 每轮播完重新从全库抽一批，避免一直循环同一批图片
-async function reloadRandomBatch() {
+async function reloadRandomBatch(session) {
   if (randomBatchLoading.value) return false
   randomBatchLoading.value = true
   try {
-    // 换批用短窗口：失败就洗牌续播，不能让轮播卡在等索引上
-    const list = await fetchRandomImages(null, RANDOM_BATCH_WAIT_MS)
+    // 换批也要能取消：退出 / 登出后请求不该在后台跑满 8 秒再写回列表
+    const list = await fetchRandomImages(null, RANDOM_BATCH_WAIT_MS,
+      () => session !== slideSessionId || !slideShow.value)
+    // 会话已失效（退出、登出、另起一次幻灯片）：丢弃结果，别污染新界面
+    if (session !== slideSessionId || !slideShow.value) return false
     if (list && list.length) {
       slideList.value = list
       return true
@@ -1357,6 +1327,8 @@ function shuffleSlideList() {
 }
 
 function startSlideFromCurrent() {
+  // 另起一次顺序幻灯片，让上一次随机幻灯片的在途换批结果作废
+  slideSessionId++
   slideList.value = previewMediaList.filter(i => i.type === 'image')
   randomSlideMode.value = false
   if (slideList.value.length === 0) return alert('没有图片可以幻灯片')
@@ -1385,9 +1357,6 @@ async function openRootFullscreen() {
       console.warn("无法进入全屏，浏览器策略限制", e)
     }
   }
-  // 方向锁要求先处于全屏上下文，所以放在 requestFullscreen 之后。
-  // iOS 没有标准全屏也没有 lock，这里会静默跳过，由引导层兜底。
-  tryLockPortrait()
 }
 
 // 前缀 API 的老浏览器（旧 Safari / 旧 Edge）没有标准属性，必须一起判断
@@ -1399,10 +1368,12 @@ function currentFullscreenElement() {
 }
 
 function exitSlide() {
+  // 作废所有在途的换批请求，避免退出后结果回来覆盖新界面
+  slideSessionId++
+  slideBatchReloading = false
   clearTimeout(slideTimer.value)
   slideShow.value = false
   randomSlideMode.value = false
-  unlockPortrait()
   const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
   // 已经不在全屏时（用户按 ESC 退出）再调 exitFullscreen 一定 reject，要兜住
   if (exit && currentFullscreenElement()) {
@@ -1426,15 +1397,15 @@ function runSlide() {
   currentSlide.value = list[i]
   // 换批还没回来时不再另起计时器，等 slideNext 的 await 恢复后统一计时
   if (slideBatchReloading) return
-  // 移动端横屏时正显示「请竖持设备」引导层，不自动切图；
-  // 转回竖屏由 slideLandscape 的 watch 重新计时
-  if (isTouchMobile.value && slideLandscape.value) return
   slideTimer.value = setTimeout(() => {
     slideNext()
   }, clampSlideDelay(slideDelay.value) * 1000)
 }
 
 async function slideNext() {
+  // 换批 await 期间忽略新的翻页，避免两个流程交错写 slideList / slideIndex
+  if (slideBatchReloading) return
+  const session = slideSessionId
   slideIndex.value++
   if (slideIndex.value >= slideList.value.length) {
     if (!slideLoop.value) {
@@ -1445,18 +1416,22 @@ async function slideNext() {
       slideBatchReloading = true
       let ok = false
       try {
-        ok = await reloadRandomBatch()
+        ok = await reloadRandomBatch(session)
       } finally {
+        // 无条件复位：换批期间的并发翻页已被开头守卫挡掉，
+        // 若按会话判断，用户中途退出（会话已递增）会让标志永久卡 true
         slideBatchReloading = false
       }
-      if (!slideShow.value) return
+      if (session !== slideSessionId || !slideShow.value) return
       if (!ok) shuffleSlideList()
     }
     slideIndex.value = 0
   }
+  if (session !== slideSessionId || !slideShow.value) return
   runSlide()
 }
 function slidePrev() {
+  if (slideBatchReloading) return
   slideIndex.value--
   if (slideIndex.value < 0) {
     if (slideLoop.value) slideIndex.value = slideList.value.length - 1
@@ -1523,22 +1498,16 @@ async function doLogin() {
 // 登出 / 会话失效时统一复位。否则下一位用户登录后，上一位管理员的
 // 弹窗、用户列表、执行日志还会以残留 ref 的形式显示出来（跨账号泄露）。
 function resetUiState() {
-  // 幻灯片：停定时器、解锁方向、退全屏，再关界面
-  clearTimeout(slideTimer.value)
-  unlockPortrait()
-  const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
-  if (exit && currentFullscreenElement()) {
-    try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (e) { /* 忽略 */ }
-  }
-  slideShow.value = false
-  randomSlideMode.value = false
-  slideFullscreenOwned = false
+  // 复用退出流程：停定时器、退全屏、关界面、递增会话令牌作废旧请求，
+  // 不再重复实现一遍 exitFullscreen 的前缀判断
+  exitSlide()
   slideBatchReloading = false
   slideList.value = []
   currentSlide.value = {}
   slideIndex.value = 0
   randomSlideLoading.value = false
   randomSlideHint.value = ''
+  randomSlideCancelled = true
 
   previewShow.value = false
   previewItem.value = null
@@ -1880,26 +1849,11 @@ function onFullscreenChange(){
     return
   }
   if (slideFullscreenOwned && slideShow.value) exitSlide()
-  // 等索引期间按 ESC 退全屏时 slideShow 还是 false，上面不会走 exitSlide，
-  // 方向锁必须在这里解掉，否则设备被留在竖屏直到刷新页面。
-  // 反过来：幻灯片里的视频退出全屏时 slideShow 仍为 true，不能解锁，
-  // 幻灯片还在播，方向锁要继续生效。
-  if (!slideShow.value) unlockPortrait()
   slideFullscreenOwned = false
 }
 
 onMounted(() => {
   checkLoginStatus()
-  detectTouchMobile()
-  orientationMQ = window.matchMedia ? window.matchMedia('(orientation: landscape)') : null
-  syncSlideOrientation()
-  if (orientationMQ) {
-    if (orientationMQ.addEventListener) {
-      orientationMQ.addEventListener('change', syncSlideOrientation)
-    } else if (orientationMQ.addListener) {
-      orientationMQ.addListener(syncSlideOrientation)
-    }
-  }
   document.addEventListener('keydown', handleKeydown)
   window.addEventListener('resize', onWindowResize)
   window.addEventListener('popstate', onPopState)
@@ -1913,14 +1867,6 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true
-  if (orientationMQ) {
-    if (orientationMQ.removeEventListener) {
-      orientationMQ.removeEventListener('change', syncSlideOrientation)
-    } else if (orientationMQ.removeListener) {
-      orientationMQ.removeListener(syncSlideOrientation)
-    }
-  }
-  unlockPortrait()  // 组件卸载时也别把用户设备留在锁定的竖屏
   document.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('popstate', onPopState)
@@ -2793,15 +2739,29 @@ input[type="checkbox"] {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* 成对对称：上下取同一个最大值、左右取同一个最大值。
+     iPhone 竖屏 top(≈47px) 与 bottom(≈34px) 不相等，若分别取会让内容盒
+     中心偏移、图片不在视口正中；成对取值既避开安全区又保持精确居中。 */
+  padding-top: max(12px, env(safe-area-inset-top), env(safe-area-inset-bottom));
+  padding-bottom: max(12px, env(safe-area-inset-top), env(safe-area-inset-bottom));
+  padding-left: max(12px, env(safe-area-inset-left), env(safe-area-inset-right));
+  padding-right: max(12px, env(safe-area-inset-left), env(safe-area-inset-right));
 }
+/* 按当前视口等比铺满，不预设任何方向；横屏宽图、竖屏长图都能完整显示 */
 .slide-content img,
-.slide-content video { max-width: 98vw; max-height: 98vh; object-fit: contain }
+.slide-content video {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+}
 .slide-name {
   position: absolute;
-  bottom: 64px;
+  bottom: max(56px, calc(env(safe-area-inset-bottom) + 44px));
   left: 0;
   right: 0;
-  padding: 0 24px;
+  padding: 0 16px;
   text-align: center;
   color: rgba(255, 255, 255, .86);
   font-size: 13px;
@@ -2809,8 +2769,8 @@ input[type="checkbox"] {
 }
 .slide-exit-btn {
   position: absolute;
-  top: 16px;
-  right: 16px;
+  top: max(16px, env(safe-area-inset-top));
+  right: max(16px, env(safe-area-inset-right));
   padding: 8px 14px;
   background: rgba(20, 24, 32, .7);
   border: 1px solid rgba(255, 255, 255, .2);
@@ -2842,52 +2802,8 @@ input[type="checkbox"] {
 }
 .slide-prev-btn:hover,
 .slide-next-btn:hover { background: rgba(91, 130, 247, .8) }
-.slide-prev-btn { left: 20px }
-.slide-next-btn { right: 20px }
-
-/* 触屏移动设备横屏引导层：系统方向锁不可用时提示竖持，期间轮播已暂停 */
-.slide-rotate-hint {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  padding: 24px;
-  padding-top: max(24px, env(safe-area-inset-top));
-  padding-bottom: max(24px, env(safe-area-inset-bottom));
-  /* 横屏时刘海/圆角落在左右两侧，这两边才是主要危险区 */
-  padding-left: max(24px, env(safe-area-inset-left));
-  padding-right: max(24px, env(safe-area-inset-right));
-  background: #000;
-  color: var(--text);
-  text-align: center;
-}
-.rotate-phone {
-  width: 58px;
-  height: 58px;
-  color: var(--accent-2);
-  animation: rotate-nudge 2.2s ease-in-out infinite;
-}
-@keyframes rotate-nudge {
-  0%, 40% { transform: rotate(90deg) }
-  60%, 100% { transform: rotate(0deg) }
-}
-.rotate-title { font-size: 17px; font-weight: 500; letter-spacing: .02em }
-.rotate-sub { font-size: 12px; color: var(--muted); line-height: 1.6 }
-.rotate-exit {
-  margin-top: 10px;
-  padding: 9px 20px;
-  background: rgba(31, 35, 43, .9);
-  border: 1px solid var(--border-strong);
-  color: var(--text);
-  border-radius: 9px;
-  font-size: 12px;
-  cursor: pointer;
-}
-.rotate-exit:hover { background: var(--accent-soft) }
+.slide-prev-btn { left: max(12px, env(safe-area-inset-left)) }
+.slide-next-btn { right: max(12px, env(safe-area-inset-right)) }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 900px) {
@@ -2929,6 +2845,23 @@ input[type="checkbox"] {
   .close-btn { top: 8px; right: 8px; width: 30px; height: 30px; font-size: 18px }
   .log-time { min-width: 0 }
   .log-item { gap: 8px; padding: 9px 12px }
+}
+/* 手机/平板横屏时可用高度很窄：控件收紧、文件名贴底，把画面尽量让给媒体。
+   pointer:coarse 限定触屏设备，桌面把窗口拖矮不会误命中；放在所有响应式
+   规则之后，避免被 max-width:480px 里的 44px / left:8px 反向覆盖。
+   四边都用长写，不能用 padding 简写把上面的安全区避让重置掉。 */
+@media (orientation: landscape) and (max-height: 560px) and (pointer: coarse) {
+  .slide-content {
+    padding-top: max(6px, env(safe-area-inset-top), env(safe-area-inset-bottom));
+    padding-bottom: max(6px, env(safe-area-inset-top), env(safe-area-inset-bottom));
+    padding-left: max(6px, env(safe-area-inset-left), env(safe-area-inset-right));
+    padding-right: max(6px, env(safe-area-inset-left), env(safe-area-inset-right));
+  }
+  .slide-prev-btn, .slide-next-btn { width: 38px; height: 38px; font-size: 22px }
+  .slide-prev-btn { left: max(8px, env(safe-area-inset-left)) }
+  .slide-next-btn { right: max(8px, env(safe-area-inset-right)) }
+  .slide-exit-btn { padding: 6px 10px; font-size: 11px }
+  .slide-name { bottom: max(6px, env(safe-area-inset-bottom)); font-size: 11px }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important }
