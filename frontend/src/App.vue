@@ -18,7 +18,9 @@
       </div>
       <div class="login-error" v-if="loginErr">{{loginErr}}</div>
       <div class="login-btn-group">
-        <button @click="doLogin" class="btn primary">登录</button>
+        <button @click="doLogin" class="btn primary" :disabled="loginLockRemaining > 0">
+          {{ loginLockRemaining > 0 ? '已锁定 ' + formatLockClock(loginLockRemaining) : '登录' }}
+        </button>
       </div>
     </div>
   </div>
@@ -291,6 +293,32 @@
               </div>
             </div>
           </div>
+
+          <!-- 登录锁定：按「账号 + 来源 IP」两个维度查看与一键解锁 -->
+          <div class="guard-section">
+            <div class="guard-head">
+              <div class="guard-title">登录锁定 <span class="guard-count">{{ guardList.length }}</span></div>
+              <div class="guard-actions">
+                <button class="btn btn-sm" @click="loadLoginGuard()">刷新</button>
+                <button class="btn btn-sm" @click="unlockAllGuard" :disabled="!guardList.length">全部解锁</button>
+              </div>
+            </div>
+            <div class="guard-hint">按「账号 + 来源 IP」分别锁定：别人从自己设备输错，不会锁住你的设备。IP 维度限制该来源对所有账号的尝试。</div>
+            <div class="msg-tip">{{ guardMsg }}</div>
+            <div v-if="!guardList.length" class="guard-empty">当前没有失败或锁定记录</div>
+            <div v-else class="guard-table">
+              <div class="guard-row guard-row-head">
+                <div>账号 / 范围</div><div>来源 IP</div><div>失败</div><div>剩余锁定</div><div>操作</div>
+              </div>
+              <div v-for="(g, gi) in guardList" :key="gi" class="guard-row">
+                <div>{{ g.kind === 'ip' ? '全部账号（IP 维度）' : g.username }}</div>
+                <div class="guard-ip">{{ g.ip }}</div>
+                <div>{{ g.fails }}</div>
+                <div :class="{'guard-locked': g.locked}">{{ g.locked ? formatGuardLeft(g.left) : '—' }}</div>
+                <div><button class="btn btn-sm" @click="unlockGuard(g)">解锁</button></div>
+              </div>
+            </div>
+          </div>
         </div>
         <!-- 新增/编辑表单视图 -->
         <div v-if="umView === 'form'" class="um-content-wrap">
@@ -415,6 +443,39 @@ const avatarInitial = computed(() => {
 const loginForm = ref({username:'', password:''})
 const loginErr = ref('')
 
+// 登录失败阶梯锁定：后端 429 带 retry_after，前端倒计时并禁用登录按钮。
+// 倒计时只在本机显示，真正的锁定判定在后端（刷新页面后点一次即可恢复倒计时）
+const loginLockRemaining = ref(0)
+let loginLockDeadline = 0
+let loginLockTimer = null
+
+function formatLockClock(sec) {
+  const s = Math.max(0, Math.ceil(sec))
+  const m = Math.floor(s / 60)
+  return m > 0 ? `${m}:${String(s % 60).padStart(2, '0')}` : `${s} 秒`
+}
+function stopLoginLock() {
+  if (loginLockTimer) clearInterval(loginLockTimer)
+  loginLockTimer = null
+  loginLockDeadline = 0
+  loginLockRemaining.value = 0
+}
+function startLoginLock(seconds) {
+  if (loginLockTimer) clearInterval(loginLockTimer)
+  const secs = Math.max(1, Math.ceil(Number(seconds) || 0))
+  loginLockDeadline = Date.now() + secs * 1000
+  loginLockRemaining.value = secs
+  loginLockTimer = setInterval(() => {
+    const left = Math.ceil((loginLockDeadline - Date.now()) / 1000)
+    if (left <= 0) {
+      stopLoginLock()
+      loginErr.value = '锁定已解除，可以重新登录'
+      return
+    }
+    loginLockRemaining.value = left
+  }, 1000)
+}
+
 // 用户下拉菜单
 const showUserDrop = ref(false)
 // 修改密码弹窗
@@ -440,6 +501,9 @@ const umDelConfirm = ref({
   show:false,
   user:null
 })
+// 登录锁定：管理员查看与一键解锁
+const guardList = ref([])
+const guardMsg = ref('')
 
 const mediaList = ref([])
 const breadcrumbList = ref([])
@@ -490,6 +554,8 @@ function clampSlideDelay(v) {
 // 执行日志：事件中文标签与告警态（仅用于展示，不改变日志数据）
 const LOG_ACTION_LABELS = {
   login: '登录',
+  login_locked: '登录锁定',
+  login_unlock: '解除锁定',
   logout: '退出登录',
   change_password: '修改密码',
   user_rename: '重命名用户',
@@ -506,7 +572,7 @@ function logActionLabel(action) {
 }
 function isWarnLog(log) {
   const action = log.action || ''
-  if (['user_delete', 'logs_clear', 'cache_stop'].includes(action)) return true
+  if (['user_delete', 'logs_clear', 'cache_stop', 'login_locked', 'login_unlock'].includes(action)) return true
   if (action === 'cache_result' && /失败|错误|异常/.test(log.detail || '')) return true
   return false
 }
@@ -531,8 +597,11 @@ const displayList = computed(() => {
 
 const previewShow = ref(false)
 const previewItem = ref(null)
-let previewMediaList = []
-let previewCurrentIndex = 0
+// 必须用 ref：这两个值直接参与模板（箭头 disabled、第 n / 共 m 张）。
+// 用普通变量时只能靠 previewItem 变化顺带触发重渲染，一旦哪天只改下标
+// 就会「数据变了、界面不动」，属于埋雷
+const previewMediaList = ref([])
+const previewCurrentIndex = ref(0)
 const imgRotateDeg = ref(0)
 
 const settingShow = ref(false)
@@ -618,7 +687,13 @@ function getCardLayout(boxWidth) {
  */
 function layoutWaterfall(){
   const list = displayList.value
-  if(!waterfallBoxRef.value || !list.length) return
+  if(!waterfallBoxRef.value) return
+  // 目录被清空 / 搜索无结果时要撤掉上一次写死的高度，
+  // 否则空状态下面会挂着一条跟刚才列表一样高的空白滚动区
+  if(!list.length){
+    waterfallBoxRef.value.style.height = ''
+    return
+  }
   const boxWidth = waterfallBoxRef.value.clientWidth
   const { cardWidth, gap, colCount } = getCardLayout(boxWidth)
 
@@ -1058,8 +1133,8 @@ function handleCardClick(item) {
   if (item.type === 'folder') {
     changeDir(item.path)
   } else {
-    previewMediaList = displayList.value.filter(x => x.type !== 'folder')
-    previewCurrentIndex = previewMediaList.findIndex(x => x.id === item.id)
+    previewMediaList.value = displayList.value.filter(x => x.type !== 'folder')
+    previewCurrentIndex.value = previewMediaList.value.findIndex(x => x.id === item.id)
     previewItem.value = item
     resetRotate()
     previewShow.value = true
@@ -1068,17 +1143,17 @@ function handleCardClick(item) {
 }
 
 function prevMedia() {
-  if (previewCurrentIndex > 0) {
-    previewCurrentIndex -= 1
-    previewItem.value = previewMediaList[previewCurrentIndex]
+  if (previewCurrentIndex.value > 0) {
+    previewCurrentIndex.value -= 1
+    previewItem.value = previewMediaList.value[previewCurrentIndex.value]
     resetRotate()
   }
 }
 
 function nextMedia() {
-  if (previewCurrentIndex < previewMediaList.length - 1) {
-    previewCurrentIndex += 1
-    previewItem.value = previewMediaList[previewCurrentIndex]
+  if (previewCurrentIndex.value < previewMediaList.value.length - 1) {
+    previewCurrentIndex.value += 1
+    previewItem.value = previewMediaList.value[previewCurrentIndex.value]
     resetRotate()
   }
 }
@@ -1329,7 +1404,7 @@ function shuffleSlideList() {
 function startSlideFromCurrent() {
   // 另起一次顺序幻灯片，让上一次随机幻灯片的在途换批结果作废
   slideSessionId++
-  slideList.value = previewMediaList.filter(i => i.type === 'image')
+  slideList.value = previewMediaList.value.filter(i => i.type === 'image')
   randomSlideMode.value = false
   if (slideList.value.length === 0) return alert('没有图片可以幻灯片')
   const idx = slideList.value.findIndex(x => x.path === previewItem.value.path)
@@ -1454,8 +1529,8 @@ function onPreviewBoxClick(e) {
 function closePreview() {
   previewShow.value = false
   previewItem.value = null
-  previewMediaList = []
-  previewCurrentIndex = 0
+  previewMediaList.value = []
+  previewCurrentIndex.value = 0
   // 界面主动关闭时把预览占用的那条历史退掉；popstate 会负责清标志
   if (previewHistoryPushed) {
     window.history.back()
@@ -1477,6 +1552,7 @@ function onPopState(e) {
 
 // ========== 登录登出 ==========
 async function doLogin() {
+  if (loginLockRemaining.value > 0) return
   loginErr.value = ''
   try {
     const res = await fetch(`${baseUrl}/api/login`, {
@@ -1485,10 +1561,18 @@ async function doLogin() {
       body: JSON.stringify(loginForm.value)
     })
     const ret = await res.json()
-    if (!res.ok || ret.code !==0) {
-      loginErr.value = "账号或密码错误"
+    if (res.status === 429) {
+      // 阶梯锁定：detail 是 {msg, retry_after}，按钮上给实时倒计时
+      const d = (ret.detail && typeof ret.detail === 'object') ? ret.detail : {}
+      startLoginLock(d.retry_after)
+      loginErr.value = d.msg || '登录失败次数过多，请稍后再试'
       return
     }
+    if (!res.ok || ret.code !==0) {
+      loginErr.value = (typeof ret.detail === 'string' && ret.detail) || "账号或密码错误"
+      return
+    }
+    stopLoginLock()
     await checkLoginStatus()
   } catch(err) {
     loginErr.value = "网络异常"
@@ -1501,6 +1585,8 @@ function resetUiState() {
   // 复用退出流程：停定时器、退全屏、关界面、递增会话令牌作废旧请求，
   // 不再重复实现一遍 exitFullscreen 的前缀判断
   exitSlide()
+  stopLoginLock()
+  loginErr.value = ''
   slideBatchReloading = false
   slideList.value = []
   currentSlide.value = {}
@@ -1511,6 +1597,8 @@ function resetUiState() {
 
   previewShow.value = false
   previewItem.value = null
+  previewMediaList.value = []
+  previewCurrentIndex.value = 0
   previewHistoryPushed = false
 
   settingShow.value = false
@@ -1523,6 +1611,8 @@ function resetUiState() {
   editUser.value = null
   adminUserList.value = []
   dirOptions.value = []
+  guardList.value = []
+  guardMsg.value = ''
   logList.value = []
   cacheStats.value = { total: 0, cached: 0, uncached: 0, failed: 0,
                        failed_files: [], failed_files_truncated: false, last_finish_time: null }
@@ -1686,15 +1776,68 @@ async function submitChangePwd(){
 }
 
 // ========= 用户管理新版逻辑 =========
+function formatGuardLeft(sec) {
+  const s = Math.max(0, Math.ceil(Number(sec) || 0))
+  if (s >= 3600) return '1 小时'
+  if (s >= 60) return `${Math.ceil(s / 60)} 分钟`
+  return `${s} 秒`
+}
+
+async function loadLoginGuard(quiet = false) {
+  if (!quiet) guardMsg.value = ''
+  try {
+    const res = await fetch(`${baseUrl}/api/admin/login-guard`)
+    if (!res.ok) { checkAuthResp(res); return false }
+    const j = await res.json()
+    if (j.code === 0) {
+      guardList.value = j.list || []
+      return true
+    }
+  } catch (e) { /* 下面统一给提示 */ }
+  if (!quiet) guardMsg.value = '读取登录锁定状态失败'
+  return false
+}
+
+async function unlockGuard(item) {
+  // item 为 null 表示「全部解锁」；否则按记录类型精确解锁
+  const body = item
+    ? { scope: item.kind === 'ip' ? 'ip' : 'account',
+        username: item.username || null, ip: item.ip }
+    : { all: true }
+  try {
+    const res = await fetch(`${baseUrl}/api/admin/login-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    if (!res.ok) { checkAuthResp(res); guardMsg.value = '解锁失败'; return }
+    const j = await res.json()
+    const msg = `已解除 ${j.removed || 0} 条记录`
+    // 刷新失败要如实说出来，否则提示说「已解除」但列表还是旧的
+    const refreshed = await loadLoginGuard(true)
+    guardMsg.value = refreshed ? msg : `${msg}，但列表刷新失败，请点「刷新」`
+  } catch (e) {
+    guardMsg.value = '网络异常，解锁未完成'
+  }
+}
+
+function unlockAllGuard() {
+  if (!guardList.value.length) return
+  if (!confirm('确认解除全部账号与来源 IP 的登录锁定？')) return
+  unlockGuard(null)
+}
+
 async function openUserManageModal(){
   showUserDrop.value = false
   userManageModal.value = true
   umView.value = 'list'
   editUser.value = null
   adminMsg.value = ""
+  guardMsg.value = ""
   umDelConfirm.value.show = false
   await reloadDirOptions()
   await reloadAdminUserList()
+  await loadLoginGuard()
 }
 function closeUserManageModal(){
   userManageModal.value = false
@@ -1760,7 +1903,13 @@ async function triggerRename(){
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({old_username:oldU, new_username:newTrim})
     })
-    if (!res.ok) { checkAuthResp(res); return }
+    if (!res.ok) {
+      // 400 里是具体的校验原因（用户名非法、新名已存在），401/403 才走鉴权复位
+      if (res.status === 401 || res.status === 403) checkAuthResp(res)
+      const j = await res.json().catch(() => ({}))
+      adminMsg.value = j.detail || `修改失败（${res.status}）`
+      return
+    }
     const json = await res.json()
     if(json.code===0){
       adminMsg.value = "用户名修改成功"
@@ -1797,7 +1946,14 @@ async function submitUmForm(){
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify(body)
     })
-    if (!res.ok) { checkAuthResp(res); return }
+    if (!res.ok) {
+      // 校验失败（用户名不合法 / 目录越界 / 密码超长 / 不许取消最后一个管理员）
+      // 都是 400，原因在 detail 里。不显示出来的话，点「保存」就是毫无反应
+      if (res.status === 401 || res.status === 403) checkAuthResp(res)
+      const j = await res.json().catch(() => ({}))
+      adminMsg.value = j.detail || `保存失败（${res.status}）`
+      return
+    }
     const json = await res.json()
     if(json.code===0){
       adminMsg.value = json.msg || "保存成功"
@@ -1819,12 +1975,26 @@ async function doInnerDelete(){
   const uname = umDelConfirm.value.user.username
   try{
     const res = await fetch(`/api/admin/user/${encodeURIComponent(uname)}`,{method:"DELETE"})
-    if (!res.ok) { checkAuthResp(res); umDelConfirm.value.show = false; return }
+    if (!res.ok) {
+      // 列表视图没有 msg-tip，400/404 的原因（例如「至少保留一名管理员」）
+      // 只能用 alert 才看得见，否则确认框一关就像什么都没发生
+      if (res.status === 401 || res.status === 403) checkAuthResp(res)
+      const j = await res.json().catch(() => ({}))
+      umDelConfirm.value.show = false
+      alert("❌" + (j.detail || `删除失败（${res.status}）`))
+      return
+    }
     const json = await res.json()
     if(json.code===0){
       await reloadAdminUserList()
+    }else{
+      umDelConfirm.value.show = false
+      alert("❌" + (json.detail || json.msg || "删除失败"))
+      return
     }
-  }catch(e){}
+  }catch(e){
+    alert("❌网络异常，删除未完成")
+  }
   umDelConfirm.value.show = false
 }
 
@@ -1880,6 +2050,7 @@ onUnmounted(() => {
   clearTimeout(resizeTimer)
   clearTimeout(imageLoadTimer)
   clearTimeout(closeBtnPosTimer)
+  stopLoginLock()
 })
 </script>
 
@@ -1887,14 +2058,9 @@ onUnmounted(() => {
 /* ==========================================================
    UI 主题：A 克制精致
    仅调整视觉层，不改变任何交互逻辑与瀑布流布局计算
-   设计变量统一定义在 src/style.css 的 :root
+   设计变量与全局 reset 统一定义在 src/style.css（main.js 已引入），
+   这里不再重复一份 scoped 的 * 规则
    ========================================================== */
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-  -webkit-tap-highlight-color: transparent;
-}
 
 /* ---------- 初始化 / 登录 ---------- */
 .init-loading-mask {
@@ -2702,6 +2868,30 @@ input[type="checkbox"] {
 }
 .msg-tip { color: #ffd77a; font-size: 12px; min-height: 20px }
 
+/* 登录锁定（用户管理弹窗内） */
+.guard-section { margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--border) }
+.guard-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap }
+.guard-title { font-size: 14px; font-weight: 500; color: var(--text) }
+.guard-count {
+  display: inline-block; min-width: 18px; padding: 1px 6px; margin-left: 4px;
+  border-radius: 10px; background: var(--surface-3); color: var(--text-2);
+  font-size: 11px; text-align: center;
+}
+.guard-actions { display: flex; gap: 8px }
+.guard-hint { font-size: 12px; color: var(--muted); line-height: 1.6; margin-top: 8px }
+.guard-empty { font-size: 12px; color: var(--muted); padding: 14px 0 }
+.guard-table { border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden }
+.guard-row {
+  display: grid;
+  grid-template-columns: 1.4fr 1.3fr .5fr 1fr 70px;
+  gap: 8px; padding: 9px 12px; align-items: center;
+  border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-2);
+}
+.guard-row:last-child { border-bottom: none }
+.guard-row-head { background: var(--surface-2); color: var(--muted); font-weight: 500 }
+.guard-ip { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all }
+.guard-locked { color: var(--danger) }
+
 .inner-confirm-mask {
   position: absolute;
   inset: 0;
@@ -2828,6 +3018,7 @@ input[type="checkbox"] {
   .card-name { display: none }
   .um-table-head,
   .um-table-row { grid-template-columns: 90px 70px 1fr 110px; font-size: 12px; padding: 8px }
+  .guard-row { grid-template-columns: 1.2fr 1fr .4fr .8fr 58px; font-size: 11px; padding: 8px 6px; gap: 4px }
   .preview-image-area { padding: 12px 12px 8px }
   .arrow-btn { width: 38px; height: 38px; font-size: 20px }
   .arrow-left { left: 6px }
@@ -2841,7 +3032,16 @@ input[type="checkbox"] {
   .slide-prev-btn { left: 8px; width: 44px; height: 44px }
   .slide-next-btn { right: 8px; width: 44px; height: 44px }
   .preview-mask { padding: 0 }
-  .preview-box { width: 100vw; height: 100vh; max-width: 100vw; max-height: 100vh }
+  /* 100dvh 跟随 iOS Safari 地址栏收放后的可视高度；旧浏览器不认这个单位，
+     整条声明被丢弃时会自动回落到上一行的 100vh，不会丢样式 */
+  .preview-box {
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    max-width: 100vw;
+    max-height: 100vh;
+    max-height: 100dvh;
+  }
   .close-btn { top: 8px; right: 8px; width: 30px; height: 30px; font-size: 18px }
   .log-time { min-width: 0 }
   .log-item { gap: 8px; padding: 9px 12px }

@@ -12,6 +12,13 @@ services:
       CONFIG_PATH: /config
       CACHE_PATH: /cache
       SLIDE_DEFAULT_DELAY: 3
+      # 挂在反向代理后面时才开（会读 X-Forwarded-For；该头客户端可伪造，
+      # 必须先在代理层清洗，否则登录锁定的来源 IP 能被绕过）
+      # TRUST_PROXY_HEADERS: 1
+      # 多台设备共用同一个出口 IP 时，可调高登录失败限速阈值/窗口
+      # LOGIN_IP_FAIL_THRESHOLD: 20
+      # LOGIN_IP_WINDOW_SEC: 600
+      # LOGIN_IP_LOCK_SEC: 300
     volumes:
       # ========= 修改这里为你NAS真实媒体目录路径 =========
       - ./media:/media:ro

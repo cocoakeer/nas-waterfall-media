@@ -414,11 +414,13 @@ def _collect_media_names(parent: Path):
 
 
 def _media_mount_ready(media_root: Path, mountinfo_path: str = "/proc/self/mountinfo") -> bool:
-    """判断媒体根是否确实挂载生效，用于区分「媒体库真清空」与「挂载未就绪」。
+    """判断媒体根**自身或其祖先**是否确实是挂载点。
 
-    Linux 容器里 /proc/self/mountinfo 第 5 列是挂载点；同时匹配媒体根
-    及其祖先目录（不含 /），兼容 MEDIA_ROOT 配到子目录的情况。
+    Linux 容器里 /proc/self/mountinfo 第 5 列是挂载点；不含 "/"，
+    否则容器根挂载会让判定恒真、失去保护作用。
     非 Linux 或读不到信息时返回 False，保持保守跳过。
+    只用于「媒体根为空时是否允许清理缓存」这类高风险判定，语义刻意收紧；
+    后台就绪判定请用 media_has_child_mount() 一并考虑子目录挂载。
     """
     try:
         # 同时保留原始路径与符号链接解析后的路径（/tmp、软链接挂载都适用）
@@ -439,6 +441,33 @@ def _media_mount_ready(media_root: Path, mountinfo_path: str = "/proc/self/mount
                     continue
                 mount_point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), head[4])
                 if mount_point.rstrip("/") in candidates:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def media_has_child_mount(media_root: Path,
+                          mountinfo_path: str = "/proc/self/mountinfo") -> bool:
+    """媒体根**下面**是否存在挂载点（多个 volume 分别挂子目录的部署方式）。
+
+    compose 里写多行 `- /vol1/1000/照片:/media/照片:ro` 时，/media 本身
+    只是镜像自带/自动创建的空目录，不是挂载点，_media_mount_ready() 会
+    判 False。若后台只认那一个判定，会把这种部署永久当成「NAS 没挂上」：
+    图片索引不建（随机幻灯片一直「准备中」）、目录角标不刷新。
+
+    只用于后台「挂载是否就绪」判定。孤儿缓存清理仍只认 _media_mount_ready()，
+    这样多 volume 掉线导致 /media 变空时依旧保守跳过，不会误删缓存。
+    """
+    prefix = str(media_root).rstrip("/") + "/"
+    try:
+        with open(mountinfo_path, "r", encoding="utf-8") as f:
+            for line in f:
+                head = line.split(" - ", 1)[0].split()
+                if len(head) < 5:
+                    continue
+                mount_point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), head[4])
+                if mount_point.rstrip("/").startswith(prefix):
                     return True
     except OSError:
         return False

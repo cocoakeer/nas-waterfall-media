@@ -6,9 +6,10 @@
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
 
-    <!-- 只申请联网。不读存储、不读位置、不读通讯录，媒体文件全部留在 NAS 上 -->
+    <!-- 只申请联网。不读存储、不读位置、不读通讯录，媒体文件全部留在 NAS 上。
+         ACCESS_NETWORK_STATE 本应用从未查询过网络状态（WebView 不需要它），
+         不申请等于少一项可被滥用的权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:allowBackup="false"

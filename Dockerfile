@@ -1,5 +1,6 @@
 # ========== 阶段1：前端打包（node构建） ==========
-FROM node:20-alpine AS frontend-builder
+# node:20 已于 2026-04 结束维护（不再有安全补丁），构建阶段升到 22 LTS
+FROM node:22-alpine AS frontend-builder
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci

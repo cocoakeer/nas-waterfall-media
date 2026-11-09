@@ -29,11 +29,16 @@ from .cover import (
     is_cache_fresh,
     cleanup_orphan_thumbs,
     _media_mount_ready,
+    media_has_child_mount,
     get_video_duration,
     load_duration_cache,
     save_duration_cache,
 )
 from .config import load_settings, save_settings, CONFIG_PATH
+from .login_guard import (
+    check_locked, record_failure, record_success,
+    snapshot as guard_snapshot, unlock as guard_unlock,
+)
 
 # ========== 配置读取 适配compose CONFIG_PATH / CACHE_PATH ==========
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media")
@@ -77,6 +82,31 @@ class AdminUserForm(BaseModel):
 class UserRenameForm(BaseModel):
     old_username: str
     new_username: str
+
+class LoginUnlockForm(BaseModel):
+    # scope=account 按(账号, IP)解锁；scope=ip 解锁该来源 IP（含其下所有账号记录）
+    scope: Optional[str] = None
+    username: Optional[str] = None
+    ip: Optional[str] = None
+    all: bool = False
+
+
+_TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "") == "1"
+
+
+def client_ip(request: Request) -> str:
+    """登录锁定用的来源 IP。
+
+    默认只认 TCP 对端：compose 是 network_mode: host，拿到的就是设备真实内网 IP。
+    只有确实挂在可信反向代理后面，才用 TRUST_PROXY_HEADERS=1 去读
+    X-Forwarded-For——该头客户端可伪造，无条件信任等于让攻击者随便换 IP 绕过锁定。
+    """
+    ip = request.client.host if request.client else ""
+    if _TRUST_PROXY_HEADERS:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            ip = xff.split(",")[0].strip()
+    return ip or "unknown"
 
 
 def _valid_password(pw: str) -> bool:
@@ -133,9 +163,17 @@ def load_users() -> List[UserItem]:
         _last_good_users = list(out)
         return out
     except Exception as exc:
-        # 不覆盖损坏文件，保留现场供人工排查；也不重新生成默认密码
-        print(f"[CONFIG] users.json 读取失败（{exc}），沿用上次成功加载的用户配置")
-        return list(_last_good_users) if _last_good_users else _default_users()
+        # 不覆盖损坏文件，保留现场供人工排查
+        if _last_good_users:
+            print(f"[CONFIG] users.json 读取失败（{exc}），沿用上次成功加载的用户配置")
+            return list(_last_good_users)
+        # 文件存在但读不出来、又没有可用的上次快照时，绝不能回落到默认账号：
+        # _default_users() 会让 admin/admin123 变成有效口令，等于在配置损坏
+        # （磁盘故障、手工改坏）时把整个服务敞开。这里直接返回空列表，
+        # 所有请求 401，并打印修复指引，由管理员修好文件后重启。
+        print(f"[CONFIG] users.json 读取失败（{exc}）且没有可用的用户快照："
+              f"已拒绝全部登录。请修复或删除 {USER_CONFIG_PATH} 后重启服务")
+        return []
 
 def save_users(user_list: List[UserItem]):
     data = [u.model_dump() for u in user_list]
@@ -444,14 +482,21 @@ def add_log(operator: str, action: str, detail: str = ""):
         except Exception:
             return
         if _log_line_count > _LOG_MAX_LINES:
+            # 原子替换：直接以 "w" 打开会把文件先清空，进程若在写回前退出，
+            # 整份执行日志（审计记录）就没了
+            tmp = _LOG_FILE.with_name(_LOG_FILE.name + ".tmp")
             try:
                 with open(_LOG_FILE, "r", encoding="utf-8") as f:
                     lines = deque(f, maxlen=_LOG_MAX_LINES)
-                with open(_LOG_FILE, "w", encoding="utf-8") as f:
+                with open(tmp, "w", encoding="utf-8") as f:
                     f.writelines(lines)
+                os.replace(tmp, _LOG_FILE)
                 _log_line_count = len(lines)
             except Exception:
-                pass
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def read_logs(limit: int = 200) -> List[dict]:
@@ -697,15 +742,35 @@ app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIST / "assets"), check
 
 # ========== 登录登出接口 ==========
 @app.post("/api/login")
-def login(form: LoginForm, resp: Response):
+def login(form: LoginForm, resp: Response, request: Request):
     reload_users()
     user = next((u for u in users if u.username == form.username), None)
     if not user:
+        # 不存在的账号不建锁定条目：否则用随机用户名就能把锁定表撑大
         raise HTTPException(status_code=401, detail="账号或密码错误")
-    if not _valid_password(form.password):
+    ip = client_ip(request)
+    hit = check_locked(user.username, ip)
+    if hit:
+        # 锁定期间连密码正确性都不验证，既省 bcrypt 也不泄露信息
+        raise HTTPException(status_code=429, detail={
+            "msg": hit["msg"], "retry_after": hit["seconds"],
+        })
+    ok = False
+    if _valid_password(form.password):
+        try:
+            ok = bcrypt.checkpw(form.password.encode(), user.password_hash.encode())
+        except (ValueError, TypeError):
+            # users.json 里的 hash 被手工改坏时不能让登录接口变成 500
+            ok = False
+    if not ok:
+        hit = record_failure(user.username, ip)
+        if hit:
+            add_log(user.username, "login_locked", hit["log"])
+            raise HTTPException(status_code=429, detail={
+                "msg": hit["msg"], "retry_after": hit["seconds"],
+            })
         raise HTTPException(status_code=401, detail="账号或密码错误")
-    if not bcrypt.checkpw(form.password.encode(), user.password_hash.encode()):
-        raise HTTPException(status_code=401, detail="账号或密码错误")
+    record_success(user.username, ip)
     _purge_expired_sessions()
     sid = str(uuid.uuid4())
     with _session_lock:
@@ -883,6 +948,19 @@ def admin_del_user(username: str, _admin: UserItem = Depends(require_admin)):
                 sessions.pop(k, None)
     add_log(_admin.username, "user_delete", f"删除用户 {username}")
     return {"code":0,"msg":"已删除"}
+
+## 管理员查看登录锁定状态（账号+IP 两个维度）
+@app.get("/api/admin/login-guard")
+def admin_get_login_guard(_admin: UserItem = Depends(require_admin)):
+    return {"code": 0, "list": guard_snapshot()}
+
+## 管理员一键解除登录锁定，免得被锁时还要 SSH 上 NAS 删文件
+@app.post("/api/admin/login-unlock")
+def admin_unlock_login(form: LoginUnlockForm, _admin: UserItem = Depends(require_admin)):
+    n = guard_unlock(scope=form.scope, username=form.username,
+                     ip=form.ip, all_records=form.all)
+    add_log(_admin.username, "login_unlock", f"解除登录锁定 {n} 条")
+    return {"code": 0, "removed": n}
 
 # ========== 随机幻灯片：全库图片索引（后台维护，点击路径只读） ==========
 # 用户点击时只读内存索引，绝不触发全库扫描。索引按目录分组维护：
@@ -1613,13 +1691,20 @@ def _removed_are_real(removed: list, sample: int = 12) -> bool:
 def _media_root_ready(mountinfo_path: str = "/proc/self/mountinfo") -> bool:
     """校验前先体检 /media：挂载是否生效、媒体根是否可访问。
 
-    Linux 容器里 /media 是 bind mount，挂载没生效时它只是镜像自带的空目录，
-    此时逐目录 stat 会把全库判成「已删除」。非 Linux（本地开发）无此概念，
-    mountinfo 不存在就跳过挂载检测，只确认媒体根可访问。
-    mountinfo_path 可注入，便于验证挂载判定的真实链路。
+    Linux 容器里媒体库靠 bind mount 进来：单根部署时 /media 本身是挂载点，
+    多根部署时每个根目录挂在 /media 的子目录上，两种形态都认。挂载没生效时
+    /media 只是镜像自带的空目录，逐目录 stat 会把全库判成「已删除」。
+    非 Linux（本地开发）无此概念，mountinfo 不存在就跳过挂载检测，
+    只确认媒体根可访问。mountinfo_path 可注入，便于验证真实链路。
     """
-    if Path(mountinfo_path).is_file() and not _media_mount_ready(REAL_BASE, mountinfo_path):
-        return False
+    if Path(mountinfo_path).is_file():
+        # 两种合法的挂载形态：
+        #   1) 单个 volume 直接挂 /media（或挂到它的祖先）——_media_mount_ready
+        #   2) 多个 volume 分别挂 /media/照片、/media/视频……这时 /media
+        #      本身不是挂载点，只看 1) 会永久误判成掉线，图片索引/角标全停摆
+        if not (_media_mount_ready(REAL_BASE, mountinfo_path)
+                or media_has_child_mount(REAL_BASE, mountinfo_path)):
+            return False
     try:
         os.stat(REAL_BASE)
         return True
@@ -1821,8 +1906,14 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
 
     items = []
     # scandir 复用目录项缓存：is_dir()/stat() 不再重复发起系统调用（NAS 上收益明显）
-    with os.scandir(work_path) as it:
-        entries = sorted(it, key=lambda e: e.name.lower())
+    try:
+        with os.scandir(work_path) as it:
+            entries = sorted(it, key=lambda e: e.name.lower())
+    except OSError as exc:
+        # 目录存在但读不出来（NAS 权限、挂载抖动、ESTALE）：返回空列表而不是 500。
+        # 抛 500 会让整页报错，用户连「返回上级」的入口都没有
+        print(f"[LIST] 目录读取失败：{work_path}（{exc}）")
+        return {"list": [], "breadcrumb": breadcrumb}
     # 每个条目只 stat 一次，结果同时供「mtime 变化检测」和列表字段使用
     stat_cache = {}
     for entry in entries:
@@ -1852,6 +1943,11 @@ def api_list(dir: str = "", user: UserItem = Depends(get_current_user)):
         removed = expected_dirs - actual_dirs
         if changed or removed:
             stats = _refresh_folder_subtrees(changed, removed, work_path, dir_mtime)
+            # 刷新期间快照可能被 invalidate_folder_stats() 清空（缓存任务刚结束）。
+            # 此时若仍按「快照已就绪」继续，每个文件夹都会退化到
+            # _folder_info_uncached → 各自 os.walk 一遍子树，比不刷新更慢，
+            # 所以重新判定一次，未就绪就按「角标暂显 0」处理。
+            stats_ready = bool(stats and stats.get("counts"))
 
     def get_folder_info(folder_abs: Path):
         if not stats_ready:
