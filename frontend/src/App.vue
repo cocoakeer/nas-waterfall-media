@@ -183,11 +183,13 @@
     </div>
 
     <!-- 预览弹窗 -->
-    <div v-if="previewShow" class="preview-mask" @click.self="closePreview">
+    <div v-if="previewShow" class="preview-mask" @click.self="onPreviewMaskClick" @wheel="stopOverlayWheel">
       <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick">
         <button class="close-btn" ref="closeBtnRef" :style="closeBtnStyle" @click="closePreview">×</button>
-        <button class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
-        <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
+        <!-- 浏览器/手机端视频预览不显示左右切换箭头：方向键已改为快进/后退。
+             TV 用遥控器切媒体，必须保留这对按钮 -->
+        <button v-if="previewItem.type === 'image' || isTvMode" class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
+        <button v-if="previewItem.type === 'image' || isTvMode" class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
         <div class="preview-image-area"
              @touchstart="onTouchStart"
              @touchmove="onTouchMove"
@@ -416,7 +418,7 @@
       </div>
     </div>
     <!-- 幻灯片全屏渲染层 -->
-    <div v-if="slideShow" class="slide-root">
+    <div v-if="slideShow" class="slide-root" @wheel="stopOverlayWheel">
       <div class="slide-content"
            @touchstart="onTouchStart"
            @touchmove="onTouchMove"
@@ -431,10 +433,10 @@
       </div>
     </div>
 
-    <!-- 视频横滑快进/后退：拖动时预览目标时间，松手才真正 seek -->
-    <div v-if="seekHud.show && !isTvMode" class="seek-hud">
+    <!-- 视频操作提示：横滑预览、键盘快进、音量调节共用这一块 -->
+    <div v-if="seekHud.show" class="seek-hud">
       <div class="seek-delta">{{ seekHud.deltaText }}</div>
-      <div class="seek-time">{{ formatTime(seekHud.target) }} / {{ formatTime(seekHud.duration) }}</div>
+      <div class="seek-time">{{ seekHud.sub }}</div>
     </div>
   </div>
 </template>
@@ -1198,6 +1200,8 @@ function nextMedia() {
 // 由客户端把滑动比例回传给 window.__albumVideoSeekRatio，两边共用同一套公式。
 const SEEK_MAX_SPAN = 300      // 一整屏最多跳 5 分钟，长视频不会一滑半小时
 const SEEK_MIN_DX = 12         // 小于这个位移当成点击，不接管
+const KEY_SEEK_STEP = 5        // 键盘左右键每次快进/后退 5 秒
+const KEY_VOLUME_STEP = 0.1    // 键盘上下键每次调 10% 音量
 let touchStartX = 0
 let touchStartY = 0
 /** 本次手势是否从有效的单指触摸开始：多指/触摸取消都不该再触发切图或 seek */
@@ -1209,7 +1213,7 @@ let seekBaseTime = 0
 let seekDuration = 0
 let seekActive = false
 let seekHudTimer = null
-const seekHud = ref({ show: false, deltaText: '', target: 0, duration: 0 })
+const seekHud = ref({ show: false, deltaText: '', sub: '', target: 0, duration: 0 })
 
 function formatTime(sec) {
   const s = Math.max(0, Math.floor(Number(sec) || 0))
@@ -1252,11 +1256,13 @@ function seekVideoBy(delta, v = getActiveVideo(), base = null) {
 
 function showSeekHud(info) {
   if (!info) return
+  // 默认显示「±N 秒 + 目标/总时长」；键盘调音量时传入 deltaText/sub 覆盖两行
   seekHud.value = {
     show: true,
-    deltaText: (info.delta >= 0 ? '+' : '−') + Math.round(Math.abs(info.delta)) + 's',
-    target: info.target,
-    duration: info.duration
+    deltaText: info.deltaText || ((info.delta >= 0 ? '+' : '−') + Math.round(Math.abs(info.delta)) + 's'),
+    sub: info.sub || (formatTime(info.target) + ' / ' + formatTime(info.duration)),
+    target: info.target || 0,
+    duration: info.duration || 0
   }
   clearTimeout(seekHudTimer)
   seekHudTimer = setTimeout(hideSeekHud, 1500)
@@ -1273,6 +1279,34 @@ function resetSeekGesture() {
   seekActive = false
   seekDuration = 0
   seekBaseTime = 0
+}
+
+/** 键盘左右键：固定 5 秒快进/后退，复用横滑那套 seek 与 HUD */
+function keySeekVideo(delta) {
+  const info = seekVideoBy(delta)
+  if (info) showSeekHud(info)
+}
+
+/** 键盘上下键：每次 10% 音量；只读 volume 的平台给出提示而不是静默失败 */
+function adjustVideoVolume(delta) {
+  const v = getActiveVideo()
+  if (!v) return
+  let base = 1
+  try { if (typeof v.volume === 'number') base = v.volume } catch (e) { /* 用默认值 */ }
+  // 四舍五入到十分位，避免 0.1+0.2 这类浮点累积
+  const next = Math.min(1, Math.max(0, Math.round((base + delta) * 10) / 10))
+  if (delta > 0 && v.muted) {
+    // 自动播放被浏览器策略拦截时会降级为静音，按增大音量应顺带恢复声音
+    try { v.muted = false } catch (e) { /* 忽略 */ }
+  }
+  let applied = false
+  try {
+    v.volume = next
+    applied = Math.abs((typeof v.volume === 'number' ? v.volume : base) - next) < 0.02
+  } catch (e) { applied = false }
+  showSeekHud(applied
+    ? { deltaText: '音量 ' + Math.round(next * 100) + '%', sub: '↑ 增大 · ↓ 减小' }
+    : { deltaText: '音量', sub: '当前浏览器不支持程序调节音量' })
 }
 
 /** 原生视频全屏时由客户端回传滑动比例，返回给 HUD 展示的文本 */
@@ -1373,6 +1407,31 @@ function handleKeydown(e) {
     randomSlideCancelled = true
     return
   }
+  // 搜索框/下拉框里方向键要留给移动光标、切换选项
+  const ae = typeof document !== 'undefined' ? document.activeElement : null
+  if (ae && (['INPUT', 'SELECT', 'TEXTAREA'].includes(ae.tagName) || ae.isContentEditable)) return
+  if (!slideShow.value && !previewShow.value) return
+
+  const video = getActiveVideo()
+  // 浏览器/手机端：只要当前渲染的是 <video>，方向键就归视频管（左右快进/后退、
+  // 上下调音量）。这里不能再用时长判定，否则视频刚打开、元数据还没就绪时
+  // 左右键会退回切图逻辑——箭头已隐藏、点空白也不退出，却能莫名切到下个媒体。
+  // 时长无效时 seekVideoBy 会静默返回，不会误操作。TV 是遥控器，仍保持左右切媒体
+  if (video && !isTvMode) {
+    switch (e.key) {
+      case 'ArrowLeft':  e.preventDefault(); keySeekVideo(-KEY_SEEK_STEP); break
+      case 'ArrowRight': e.preventDefault(); keySeekVideo(KEY_SEEK_STEP); break
+      case 'ArrowUp':    e.preventDefault(); adjustVideoVolume(KEY_VOLUME_STEP); break
+      case 'ArrowDown':  e.preventDefault(); adjustVideoVolume(-KEY_VOLUME_STEP); break
+      case 'Escape':
+        e.preventDefault()
+        if (slideShow.value) exitSlide()
+        else closePreview()
+        break
+    }
+    return
+  }
+
   if (slideShow.value) {
     if (e.key === 'Escape') {
       e.preventDefault()
@@ -1388,7 +1447,6 @@ function handleKeydown(e) {
     }
     return
   }
-  if (!previewShow.value) return
   switch (e.key) {
     case 'ArrowLeft':
       e.preventDefault()
@@ -1404,6 +1462,34 @@ function handleKeydown(e) {
       break
   }
 }
+
+// ========= 遮罩层打开时锁住底层页面滚动 =========
+// 预览、幻灯片和各种弹窗都是 position:fixed 覆盖层，鼠标滚轮默认仍会带动
+// 底层 body 滚动。锁 body + html 的 overflow，弹窗内部自己的滚动容器不受影响。
+const overlayOpen = computed(() =>
+  previewShow.value || slideShow.value || settingShow.value ||
+  changePwdModal.value || userManageModal.value || logModal.value || failedFilesModal.value
+)
+
+function lockPageScroll(locked) {
+  // watch 带 immediate，初始化时就会跑一次；非浏览器环境直接跳过
+  if (typeof document === 'undefined' || !document.body) return
+  const val = locked ? 'hidden' : ''
+  document.body.style.overflow = val
+  document.documentElement.style.overflow = val
+}
+
+/** 预览/幻灯片层：内容没超高时滚轮一律拦下，避免某些 WebView 忽略 body 的
+ *  overflow 时把滚动传到底层。遮罩自身内容超高（小屏长弹窗）则放行让它自己滚，
+ *  此时 overscroll-behavior: contain 仍会切断滚动链。
+ *  其他弹窗（日志列表等）刻意不加这个，保留它们自己的滚动。 */
+function stopOverlayWheel(e) {
+  const box = e.currentTarget
+  if (box && box.scrollHeight > box.clientHeight) return
+  if (e.cancelable) e.preventDefault()
+}
+
+watch(overlayOpen, lockPageScroll, { immediate: true })
 
 // ========= TV 遥控器导航 =========
 // 瀑布流卡片是绝对定位、行优先排布，浏览器默认的焦点顺序不可靠。
@@ -1793,10 +1879,25 @@ function slidePrev() {
 }
 
 // 预览：除媒体本身和交互控件外，点击任意空白区域都退出
+// 视频预览时点周围空白不退出：播放中误触不该打断；退出走 × / Esc / 返回键。
+// 图片预览保持原来「点图片外区域退出」的行为不变
+function isVideoPreview() {
+  return !!(previewItem.value && previewItem.value.type !== 'image')
+}
+
+function onPreviewMaskClick() {
+  // 和 onPreviewBoxClick 一样要有手势兜底：图片横滑切张后，
+  // 合成 click 若落在遮罩上且 touchend 的 preventDefault 没拦住，不该误关预览
+  if (Date.now() < suppressPreviewClickUntil) return
+  if (isVideoPreview()) return
+  closePreview()
+}
+
 function onPreviewBoxClick(e) {
   // 视频横滑结束后浏览器仍可能合成 click（touchend 的 preventDefault 不是绝对可靠），
   // 这段时间内忽略「点空白退出」，避免刚快进完预览就被关掉
   if (Date.now() < suppressPreviewClickUntil) return
+  if (isVideoPreview()) return
   const t = e.target
   if (!t) return
   // 点图片/视频本体（含视频原生控制条）不退出
@@ -2327,6 +2428,7 @@ onMounted(() => {
 onUnmounted(() => {
   disposed = true
   clearTimeout(seekHudTimer)
+  lockPageScroll(false)
   delete window.__albumVideoSeekRatio
   if (tvNavHandler) document.removeEventListener('keydown', tvNavHandler, true)
   if (isTvMode) document.documentElement.classList.remove('tv-mode')
@@ -2888,9 +2990,17 @@ input[type="checkbox"] {
   backdrop-filter: blur(6px);
   z-index: 99;
   display: flex;
+  /* 旧浏览器不认 safe center 时回退到普通 center，不能只写新语法
+     （整条声明被丢弃会退化成 stretch，把弹窗拉满全屏） */
   align-items: center;
   justify-content: center;
+  /* 新浏览器：内容超高时退化为起始对齐，避免居中把上半截顶出可视区且滚不到 */
+  align-items: safe center;
+  justify-content: safe center;
   padding: 18px;
+  /* 遮罩自己承担滚动，配合 contain 切断向底层页面的滚动链 */
+  overflow-y: auto;
+  overscroll-behavior: contain;
   animation: maskIn .2s ease;
 }
 .preview-box {
@@ -3214,6 +3324,7 @@ input[type="checkbox"] {
   display: flex;
   align-items: center;
   justify-content: center;
+  overscroll-behavior: contain;
 }
 .slide-content {
   position: relative;
