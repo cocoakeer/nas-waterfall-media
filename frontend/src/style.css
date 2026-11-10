@@ -59,3 +59,10 @@ button {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--muted);
 }
+
+/* 桌面浏览器：藏掉视频自带的全屏按钮。Chromium 认 controlslist=nofullscreen，
+   Safari 不认，只能靠这条 WebKit 私有伪元素兜底。
+   手机/电视的 WebView 没有 html.desktop-web 这个类，原生全屏行为不受影响 */
+html.desktop-web video::-webkit-media-controls-fullscreen-button {
+  display: none;
+}

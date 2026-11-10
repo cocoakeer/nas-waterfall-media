@@ -51,8 +51,8 @@ import android.widget.Toast;
  *      manifest 里声明 configChanges，旋转时不重建 Activity，WebView 不重载、
  *      轮播不中断；横竖屏布局由网页端 CSS 媒体查询处理
  *   5. 返回键交给网页 history（与浏览器里「后退只关预览」一致）。
- *      幻灯片界面没有自己的历史记录，此时按返回键会触发目录级 popstate，
- *      不会直接关掉幻灯片；退出请用界面上的「退出全屏」按钮
+ *      幻灯片没有自己的历史记录，按返回键会走目录级 popstate，此时网页端
+ *      会先退出幻灯片再对齐目录，所以返回键同样是「先关掉最上层的界面」
  *   6. HTML5 视频全屏由 onShowCustomView / onHideCustomView 接管：
  *      WebView 会把视频 View 交给宿主，挂到一个全屏黑色容器里。
  *      全程不调用 setRequestedOrientation，横竖屏跟随设备与系统方向设置；
@@ -327,13 +327,16 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
         // 快进/后退提示叠在视频之上：后 addView 的 View 在 z 序最上层。
-        // 网页只回传「+75 秒」这样一行短文本，字号与内边距都跟网页端保持同一量级
+        // 文案、配色、圆角、字号都跟网页端那行提示对齐，全屏与内联看起来是一个东西
         fullscreenHud = new TextView(this);
         fullscreenHud.setTextColor(Color.WHITE);
         fullscreenHud.setTextSize(18f);
         fullscreenHud.setGravity(Gravity.CENTER);
-        fullscreenHud.setBackgroundColor(Color.parseColor("#CC0E1014"));
-        fullscreenHud.setPadding(dp(18), dp(9), dp(18), dp(9));
+        GradientDrawable hudBg = new GradientDrawable();
+        hudBg.setCornerRadius(dp(10));
+        hudBg.setColor(Color.parseColor("#CC0E1014"));
+        fullscreenHud.setBackground(hudBg);
+        fullscreenHud.setPadding(dp(20), dp(10), dp(20), dp(10));
         fullscreenHud.setVisibility(View.GONE);
         fullscreenContainer.addView(fullscreenHud, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,

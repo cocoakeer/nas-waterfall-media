@@ -50,6 +50,10 @@ import android.widget.TextView;
  *   2. 连接中 / 失败全部用原生大字状态页，不露出浏览器错误页
  *   3. 视频原生全屏（onShowCustomView），方向不锁死
  *   4. 返回键：退出全屏 → 回配置页 → 网页后退 → 退出确认对话框
+ *      预览与幻灯片都压在网页历史里，返回键会先关掉它们（遥控器没有 Esc）
+ *   5. 播放视频的按键分工全在网页端（tv-mode）：左右快进/后退 10 秒、
+ *      上下切上一个/下一个、OK 播放/暂停，只显示加减秒数的提示按十英尺放大；
+ *      预览底部还会写一行键位提示——遥控器没有可点的按钮，不写就只能靠猜
  *
  * 刻意不使用 AndroidX Leanback，也不引用任何 R.* 资源 ID：构建链是
  * aapt2 → javac → d8，没有生成 R.java，所有 drawable 都在代码里构造。
@@ -84,8 +88,10 @@ public class MainActivity extends Activity {
             + "if(window.MutationObserver)new MutationObserver(mark)"
             + ".observe(document.body,{childList:true,subtree:true});"
             + "document.addEventListener('keydown',function(e){"
-            // div/span 上的 OK 键不会自动触发 click，旧服务端同样要显式补
+            // div/span 上的 OK 键不会自动触发 click，旧服务端同样要显式补。
+            // 预览/幻灯片打开时焦点还留在背后的卡片上，此时再点一次会把预览重开一遍
             + "if(e.key==='Enter'||e.key===' '||e.key==='Spacebar'){"
+            + "if(document.querySelector('.preview-mask,.slide-root'))return;"
             + "var h=document.activeElement;"
             + "if(h&&h.classList&&(h.classList.contains('media-card')||"
             + "h.classList.contains('breadcrumb-item'))){e.preventDefault();h.click();}"

@@ -182,19 +182,17 @@
       </div>
     </div>
 
-    <!-- 预览弹窗 -->
-    <div v-if="previewShow" class="preview-mask" @click.self="onPreviewMaskClick" @wheel="stopOverlayWheel">
+    <!-- 预览弹窗。手势挂在整个预览层上：视频、画面留白、底部按钮栏，
+         任意位置左右滑快进、上下滑调音量都要生效（以前只在视频区域里才响应） -->
+    <div v-if="previewShow" class="preview-mask" @click.self="onPreviewMaskClick" @wheel="stopOverlayWheel"
+         @touchstart="onTouchStart" @touchmove="onTouchMove" @touchend="onTouchEnd" @touchcancel="onTouchCancel">
       <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick">
         <button class="close-btn" ref="closeBtnRef" :style="closeBtnStyle" @click="closePreview">×</button>
-        <!-- 浏览器/手机端视频预览不显示左右切换箭头：方向键已改为快进/后退。
-             TV 用遥控器切媒体，必须保留这对按钮 -->
-        <button v-if="previewItem.type === 'image' || isTvMode" class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
-        <button v-if="previewItem.type === 'image' || isTvMode" class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
-        <div class="preview-image-area"
-             @touchstart="onTouchStart"
-             @touchmove="onTouchMove"
-             @touchend="onTouchEnd"
-             @touchcancel="onTouchCancel">
+        <!-- 视频预览不显示左右切换箭头：方向键已改为快进/后退（浏览器、手机、
+             电视都一样，TV 切下一个视频改用上下键），箭头只留给图片 -->
+        <button v-if="previewItem.type === 'image'" class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
+        <button v-if="previewItem.type === 'image'" class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
+        <div class="preview-image-area">
           <img
             v-if="previewItem.type === 'image'"
             ref="previewMediaRef"
@@ -209,8 +207,11 @@
             controls
             autoplay
             playsinline
+            :controlslist="isDesktopWeb ? 'nofullscreen' : null"
             :src="getSrcUrl(previewItem.path)"
             @loadedmetadata="onPreviewMediaReady"
+            @play="onVideoPlayback(false, $event)"
+            @pause="onVideoPlayback(true, $event)"
           ></video>
         </div>
         <div class="preview-footer">
@@ -222,7 +223,26 @@
             <button @click="resetRotate">重置旋转</button>
             <button @click="startSlideFromCurrent">从此处开始幻灯片</button>
           </div>
+          <!-- 桌面浏览器：原生控制条那个全屏按钮会把 <video> 本体送去全屏，
+               网页的提示层会被关在全屏子树之外；这里换成让整个预览层全屏 -->
+          <div v-else-if="isDesktopWeb" class="img-action-bar">
+            <button @click="toggleVideoPlay">{{ previewPaused ? '播放' : '暂停' }}</button>
+            <button @click="togglePreviewFullscreen">{{ isPreviewFullscreen ? '退出全屏' : '全屏' }}</button>
+          </div>
+          <!-- 电视只有遥控器，没有可点的按钮：把键位直接写在画面上，
+               否则「左右快进、上下切换、OK 暂停」全靠猜 -->
+          <p v-if="isTvMode" class="tv-key-hint">
+            <template v-if="previewItem.type === 'image'">
+              方向键 切换上一个 / 下一个　·　返回键 退出
+            </template>
+            <template v-else>
+              {{ previewPaused ? '已暂停' : '播放中' }}　·　OK {{ previewPaused ? '继续播放' : '暂停' }}　·　◀ ▶ 快进 / 后退 10 秒　·　▲ ▼ 切换
+            </template>
+          </p>
         </div>
+        <!-- 快进/音量/播放提示放在预览层内部：桌面浏览器把预览层放全屏时，
+             只有这个子树里的元素才会被渲染出来 -->
+        <div v-if="seekHud.show" class="seek-hud">{{ seekHud.deltaText }}</div>
       </div>
     </div>
     <!-- 幻灯片设置弹窗 -->
@@ -425,7 +445,8 @@
            @touchend="onTouchEnd"
            @touchcancel="onTouchCancel">
         <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
-        <video v-else ref="slideVideoRef" controls autoplay muted playsinline :src="getSrcUrl(currentSlide.path)"></video>
+        <video v-else ref="slideVideoRef" controls autoplay muted playsinline :src="getSrcUrl(currentSlide.path)"
+               @play="onVideoPlayback(false, $event)" @pause="onVideoPlayback(true, $event)"></video>
         <div class="slide-name">{{ currentSlide.name }}</div>
         <button class="slide-exit-btn" @click="exitSlide">退出全屏</button>
         <button class="slide-prev-btn" @click="slidePrev">‹</button>
@@ -433,16 +454,10 @@
       </div>
     </div>
 
-    <!-- 视频操作提示：横滑快进、纵滑音量、键盘快进共用这一块。
-         快进/后退只报「加减多少秒」，落点看视频自己的进度条；
-         音量没有原生提示，才额外带一行说明和一条音量条 -->
-    <div v-if="seekHud.show" class="seek-hud" :class="'hud-' + seekHud.mode">
-      <div class="seek-delta">{{ seekHud.deltaText }}</div>
-      <template v-if="seekHud.mode === 'volume'">
-        <div class="seek-time">{{ seekHud.sub }}</div>
-        <div class="seek-bar"><div class="seek-bar-fill" :style="{width: (seekHud.progress * 100) + '%'}"></div></div>
-      </template>
-    </div>
+    <!-- 视频操作提示：横滑快进、键盘快进、音量、播放/暂停共用这一块。
+         预览打开时这份由 .preview-box 内的那份渲染（全屏时也能看见），
+         这里只负责幻灯片等其余场景 -->
+    <div v-if="seekHud.show && !previewShow" class="seek-hud">{{ seekHud.deltaText }}</div>
   </div>
 </template>
 
@@ -453,6 +468,10 @@ const baseUrl = ''
 // TV 客户端的 WebView 在 UA 里加了 WaterfallAlbumTV 标记；
 // 浏览器与手机 App 检测不到，所有 TV 逻辑都不会生效
 const isTvMode = typeof navigator !== 'undefined' && /WaterfallAlbumTV/.test(navigator.userAgent)
+// 桌面浏览器（不带触摸的电脑端）：只有它需要用「预览层全屏」代替视频本体全屏。
+// 手机 App 与电视 App 的 WebView 都带 Android/iPhone 标记，行为保持原样
+const isDesktopWeb = typeof navigator !== 'undefined'
+  && !/Android|iPhone|iPad|iPod|Mobile|WaterfallAlbumTV/i.test(navigator.userAgent)
 // 初始化加载标记：修复刷新闪现登录页
 const initLoading = ref(true)
 const isLogin = ref(false)
@@ -625,6 +644,8 @@ const previewItem = ref(null)
 const previewMediaList = ref([])
 const previewCurrentIndex = ref(0)
 const imgRotateDeg = ref(0)
+/** 预览里的视频是否暂停着：桌面端「播放/暂停」按钮的文案靠它 */
+const previewPaused = ref(false)
 
 const settingShow = ref(false)
 const slideDelay = ref(3)
@@ -860,6 +881,7 @@ function onPreviewMediaReady() {
     v.muted = false
     videoMutedFallback = false
   }
+  previewPaused.value = false
   const p = v.play()
   if (p && typeof p.catch === 'function') {
     p.catch(() => {
@@ -890,7 +912,9 @@ function resetRotate() {
   scheduleCloseBtnPos()
 }
 function openOriginal() {
-  window.open(getSrcUrl(previewItem.value.path), '_blank')
+  // noopener：新标签页不该拿得到本页的 window.opener（反向 tabnabbing），
+  // 这里打开的虽然是同源图片，顺手关上这个口子没有代价
+  window.open(getSrcUrl(previewItem.value.path), '_blank', 'noopener')
 }
 
 // 用「一次请求完成后再排下一次」代替 setInterval：NAS 响应慢于 800ms 时
@@ -1176,6 +1200,7 @@ function handleCardClick(item) {
   } else {
     previewMediaList.value = displayList.value.filter(x => x.type !== 'folder')
     previewCurrentIndex.value = previewMediaList.value.findIndex(x => x.id === item.id)
+    muteVideoPlaybackHint()   // 打开预览时的自动播放不弹「播放」
     previewItem.value = item
     resetRotate()
     previewShow.value = true
@@ -1185,6 +1210,7 @@ function handleCardClick(item) {
 
 function prevMedia() {
   if (previewCurrentIndex.value > 0) {
+    muteVideoPlaybackHint()   // 换片会连带触发 pause/play，别弹「已暂停」
     previewCurrentIndex.value -= 1
     previewItem.value = previewMediaList.value[previewCurrentIndex.value]
     resetRotate()
@@ -1193,6 +1219,7 @@ function prevMedia() {
 
 function nextMedia() {
   if (previewCurrentIndex.value < previewMediaList.value.length - 1) {
+    muteVideoPlaybackHint()   // 同上：换片时的 pause/play 不提示
     previewCurrentIndex.value += 1
     previewItem.value = previewMediaList.value[previewCurrentIndex.value]
     resetRotate()
@@ -1205,8 +1232,11 @@ function nextMedia() {
 // 预览区域内的 touchmove 一律拦默认行为，纵向滑动不会再带到底层页面。
 // 原生视频全屏时 WebView 收不到触摸，由客户端回传两轴比例给
 // __albumVideoGestureStart / __albumVideoGestureUpdate，公式共用这一份。
-const SEEK_MAX_SPAN = 300      // 一整屏最多跳 5 分钟，长视频不会一滑半小时
+// 一屏最多 2 分钟：手机 400px 宽约 0.3 秒/像素，能卡到具体某一秒；
+// 长片要跳远就多滑几次，每次松手后从新位置继续
+const SEEK_MAX_SPAN = 120
 const GESTURE_MIN_DIST = 6     // 6px 即触发，小幅滑动也能立刻看到反馈
+const NATIVE_BAR_HEIGHT = 56   // 视频底部留给原生控制条的高度（拖进度条用）
 const VOL_FULL_SPAN = 0.9      // 纵向滑一屏高度约改 90% 音量，逐像素连续调节
 const KEY_SEEK_STEP = 10       // 键盘左右键每次快进/后退 10 秒
 const KEY_VOLUME_STEP = 0.02   // 键盘上下键每次调 2% 音量
@@ -1221,13 +1251,14 @@ let seekBaseTime = 0
 let seekBaseVolume = 0
 let seekDuration = 0
 let seekActive = false
+/** 起点落在原生控制条上：这一次完全不拦默认行为，让浏览器自己拖进度条 */
+let touchNativeBar = false
 /** 一次手势只锁定一个轴：'h' 快进后退 / 'v' 音量，避免斜滑时两种操作互相打架 */
 let gestureAxis = null
-/** 是否允许拦截 touchmove 默认行为；落在视频底部控制条上时必须放行 */
-let touchBlockScroll = false
 let seekHudTimer = null
-/** mode: 'seek' 只显示加减秒数 / 'volume' 带音量条 */
-const seekHud = ref({ show: false, mode: 'seek', deltaText: '', sub: '', progress: 0 })
+/** 一行提示：快进/后退报秒数、音量报百分比、播放/暂停报状态。
+ *  与手机客户端原生全屏那行提示保持同一套文案与视觉，方便一眼对上 */
+const seekHud = ref({ show: false, deltaText: '' })
 
 function getActiveVideo() {
   const v = slideShow.value ? slideVideoRef.value : previewMediaRef.value
@@ -1261,8 +1292,8 @@ function seekVideoBy(delta, v = getActiveVideo(), base = null) {
 }
 
 /** 统一的 HUD 出口：所有提示都走这里，保证只有一份倒计时 */
-function showHud(next) {
-  seekHud.value = { show: true, mode: 'seek', deltaText: '', sub: '', progress: 0, ...next }
+function showHud(text) {
+  seekHud.value = { show: true, deltaText: String(text || '') }
   clearTimeout(seekHudTimer)
   seekHudTimer = setTimeout(hideSeekHud, 1500)
 }
@@ -1276,7 +1307,7 @@ function formatDelta(delta) {
 
 /** 快进/后退：只显示加减秒数，落点交给视频自己的进度条 */
 function showSeekHud(delta) {
-  showHud({ mode: 'seek', deltaText: formatDelta(delta) })
+  showHud(formatDelta(delta))
 }
 
 function hideSeekHud() {
@@ -1288,11 +1319,11 @@ function hideSeekHud() {
 function resetSeekGesture() {
   seekVideoEl = null
   seekActive = false
+  touchNativeBar = false
   gestureAxis = null
   seekDuration = 0
   seekBaseTime = 0
   seekBaseVolume = 0
-  touchBlockScroll = false
 }
 
 /** 键盘左右键：固定 10 秒快进/后退，复用横滑那套 seek 与 HUD */
@@ -1317,9 +1348,7 @@ function applyVolume(v, wanted) {
 }
 
 function showVolumeHud(value, applied) {
-  showHud(applied
-    ? { mode: 'volume', deltaText: '音量 ' + Math.round(value * 100) + '%', sub: '↑ 增大 · ↓ 减小', progress: value }
-    : { mode: 'volume', deltaText: '音量', sub: '当前浏览器不支持程序调节音量', progress: 0 })
+  showHud(applied ? '音量 ' + Math.round(value * 100) + '%' : '音量不可调')
 }
 
 /** 键盘上下键：每次 2% 音量 */
@@ -1330,6 +1359,51 @@ function adjustVideoVolume(delta) {
   try { if (typeof v.volume === 'number') base = v.volume } catch (e) { /* 用默认值 */ }
   const r = applyVolume(v, base + delta)
   showVolumeHud(r.value, r.applied)
+}
+
+/** 播放 / 暂停当前视频。这里也直接给一次提示：事件是异步派发的，
+ *  遥控器/键盘按下去要立刻有反馈，点原生控制条那条路径由 play/pause 事件兜住 */
+function toggleVideoPlay() {
+  const v = getActiveVideo()
+  if (!v) return
+  if (v.paused) {
+    const p = v.play()
+    if (p && typeof p.catch === 'function') p.catch(() => {})
+    previewPaused.value = false
+    showHud('播放')
+  } else {
+    try { v.pause() } catch (e) { /* 忽略 */ }
+    previewPaused.value = true
+    showHud('已暂停')
+  }
+}
+
+/** 记住「刚刚是不是我们提示过暂停」，避免自动播放一打开就弹一个「播放」 */
+let videoPausedHintShown = false
+/** 换片 / 打开预览时浏览器会顺带发 pause+play，这段时间内不弹提示，免得刷屏 */
+let videoHintMutedUntil = 0
+
+function muteVideoPlaybackHint() {
+  videoHintMutedUntil = Date.now() + 500
+  videoPausedHintShown = false
+}
+
+/** <video> 的 play / pause 事件：暂停给提示，恢复播放只在「从暂停里点起来」时提示。
+ *  自动播放、切片换源那种 pause→play 连击不该刷屏 */
+function onVideoPlayback(paused, ev) {
+  previewPaused.value = paused
+  if (Date.now() < videoHintMutedUntil) return
+  // 播到结尾也会派发 pause：这时候说「已暂停」不对，而且紧接着的「播放」也不该弹
+  const ended = !!(paused && ev && ev.target && ev.target.ended)
+  if (paused) {
+    videoPausedHintShown = !ended
+    showHud(ended ? '播放结束' : '已暂停')
+    return
+  }
+  if (videoPausedHintShown) {
+    videoPausedHintShown = false
+    showHud('播放')
+  }
 }
 
 /** 纵向手势：按屏幕高度连续改音量（上滑增大），实时生效不需要等松手 */
@@ -1390,13 +1464,14 @@ function onTouchStart(e) {
   touchStartY = e.touches[0].clientY
   const v = getActiveVideo()
   const dur = videoDuration(v)
-  // 图片预览、或视频元数据还没就绪时，纵向滑动同样不该带到底层页面
-  touchBlockScroll = true
+  // 视频元数据还没就绪、或是图片预览时，也要拦住纵向滑动，别把滚动传到底层页面
   if (!v || !dur) return
-  // 底部留给原生控制条的进度条拖动：这里连 touchmove 的默认行为都不能拦
+  // 只有最底下 56px 那条留给原生控制条：那一条里点能跳、拖也能拖，其余位置
+  // （画面、留白、底部按钮栏）全部接管手势
   const r = v.getBoundingClientRect()
-  if (r.height && touchStartY > r.bottom - Math.max(56, r.height * 0.15)) {
-    touchBlockScroll = false
+  const barH = Math.min(NATIVE_BAR_HEIGHT, r.height * 0.25)
+  if (r.height && touchStartY > r.bottom - barH) {
+    touchNativeBar = true
     return
   }
   seekVideoEl = v
@@ -1409,9 +1484,9 @@ function onTouchMove(e) {
   if (!touchTracking) return
   // 中途按下第二根手指（缩放等）直接作废本次手势，否则抬手时会误切图/误快进
   if (e.touches.length !== 1) { onTouchCancel(); return }
-  // 预览区域内拦掉默认行为：纵向滑动绝不能把滚动传到底层页面。
-  // 只有手指落在视频底部控制条上（touchBlockScroll=false）时放行，保住原生进度条
-  if (touchBlockScroll && e.cancelable) e.preventDefault()
+  // 预览层里拦掉默认行为（纵向滑动绝不能把滚动传到底层页面）；
+  // 起点在控制条上的那次手势除外，否则进度条拖不动
+  if (!touchNativeBar && e.cancelable) e.preventDefault()
   if (!seekVideoEl) return
   const dx = e.touches[0].clientX - touchStartX
   const dy = e.touches[0].clientY - touchStartY
@@ -1500,6 +1575,13 @@ function handleKeydown(e) {
       case 'ArrowRight': e.preventDefault(); keySeekVideo(KEY_SEEK_STEP); break
       case 'ArrowUp':    e.preventDefault(); adjustVideoVolume(KEY_VOLUME_STEP); break
       case 'ArrowDown':  e.preventDefault(); adjustVideoVolume(-KEY_VOLUME_STEP); break
+      case ' ': case 'Spacebar':
+        // 空格播放/暂停（网页里最顺手的那个键）。焦点在按钮上时让按钮自己响应，
+        // 否则用户想按空格点「关闭」反而把视频切了
+        if (ae && ae.tagName === 'BUTTON') break
+        e.preventDefault()
+        toggleVideoPlay()
+        break
       case 'Escape':
         e.preventDefault()
         if (slideShow.value) exitSlide()
@@ -1524,6 +1606,33 @@ function handleKeydown(e) {
     }
     return
   }
+
+  // TV 预览：遥控器只有方向 + OK，重新分工。
+  // 视频：左右快进/后退 10 秒（复用手机那套步进与秒数 HUD）、上下切上一个/下一个、
+  //       OK 播放/暂停。图片：方向键一律切张，保持原来的习惯。
+  // 电视音量由电视遥控器 / HDMI-CEC 管，这里不抢音量键；
+  // 幻灯片（slideShow）仍用左右翻页，不受这段影响。
+  if (isTvMode && previewShow.value) {
+    if (video) {
+      switch (e.key) {
+        case 'ArrowLeft':   e.preventDefault(); keySeekVideo(-KEY_SEEK_STEP); return
+        case 'ArrowRight':  e.preventDefault(); keySeekVideo(KEY_SEEK_STEP); return
+        case 'ArrowUp':     e.preventDefault(); prevMedia(); return
+        case 'ArrowDown':   e.preventDefault(); nextMedia(); return
+        case 'Enter': case ' ':
+          e.preventDefault(); toggleVideoPlay(); return
+        case 'Escape':      e.preventDefault(); closePreview(); return
+      }
+      return
+    }
+    switch (e.key) {
+      case 'ArrowLeft': case 'ArrowUp':    e.preventDefault(); prevMedia(); return
+      case 'ArrowRight': case 'ArrowDown': e.preventDefault(); nextMedia(); return
+      case 'Escape':                       e.preventDefault(); closePreview(); return
+    }
+    return
+  }
+
   switch (e.key) {
     case 'ArrowLeft':
       e.preventDefault()
@@ -1582,8 +1691,11 @@ function installTvNavigation() {
   document.documentElement.classList.add('tv-mode')
   tvNavHandler = (e) => {
     // 卡片和面包屑是 div/span + tabindex，浏览器默认 Enter 激活只对 button/a 生效，
-    // 电视遥控器的 OK 键落上去不会触发 click，这里显式补上
+    // 电视遥控器的 OK 键落上去不会触发 click，这里显式补上。
+    // 但预览/幻灯片/弹窗打开时 OK 另有用途（视频播放/暂停），而且焦点还留在
+    // 背后的卡片上——此时再点一次等于把预览重开一遍、还多压一条历史
     if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+      if (overlayOpen.value) return
       const hit = document.activeElement
       if (hit && hit.classList && (hit.classList.contains('media-card') ||
           hit.classList.contains('breadcrumb-item'))) {
@@ -1886,8 +1998,10 @@ function exitSlide() {
   // 作废所有在途的换批请求，避免退出后结果回来覆盖新界面
   slideSessionId++
   slideBatchReloading = false
-  // 同上：幻灯片里滑过快进后退出，别把秒数提示留在列表页
+  // 幻灯片里滑过快进后退出，别把秒数提示留在列表页；
+  // 幻灯片里的视频被卸载时补发的 pause 也要压掉
   onTouchCancel()
+  muteVideoPlaybackHint()
   clearTimeout(slideTimer.value)
   slideShow.value = false
   randomSlideMode.value = false
@@ -1911,6 +2025,8 @@ function runSlide() {
   // 换批 await 期间 slideIndex 可能等于 list.length，钳住避免 currentSlide=undefined
   const i = Math.min(Math.max(slideIndex.value, 0), list.length - 1)
   slideIndex.value = i
+  // 从视频切到下一条时，被换掉的 <video> 会补一个 pause；那不是用户按的暂停
+  muteVideoPlaybackHint()
   currentSlide.value = list[i]
   // 换批还没回来时不再另起计时器，等 slideNext 的 await 恢复后统一计时
   if (slideBatchReloading) return
@@ -1988,8 +2104,17 @@ function onPreviewBoxClick(e) {
 
 function closePreview() {
   // 手势状态与 HUD 一起清掉：刚滑完快进就按 Esc/返回时，
-  // 那行「+75 秒」会飘在已关闭的列表上等 1.5 秒才消失
+  // 那行「+75 秒」会飘在已关闭的列表上等 1.5 秒才消失。
+  // 视频被卸载时浏览器还会补一个 pause 事件，也要一并压掉
   onTouchCancel()
+  muteVideoPlaybackHint()
+  // 预览层正被放全屏时先退出来，否则关掉预览后可能留一块黑屏
+  if (previewBoxRef.value && currentFullscreenElement() === previewBoxRef.value) {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen
+    if (exit) {
+      try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (e) { /* 忽略 */ }
+    }
+  }
   previewShow.value = false
   previewItem.value = null
   previewMediaList.value = []
@@ -2005,6 +2130,16 @@ function onPopState(e) {
   if (previewHistoryPushed) {
     previewHistoryPushed = false
     if (previewShow.value) closePreview()
+    return
+  }
+  // 幻灯片没有自己的历史记录：手机/电视的返回键（安卓 back 走 web.goBack）
+  // 会落到目录级 popstate 上。这里先关幻灯片——电视遥控器没有 Esc，界面上那个
+  // 「退出全屏」按钮也点不到，不处理就成了死胡同——再把界面与刚退到的
+  // 那条目录历史对齐（同目录时不动列表，避免白白重载一次）
+  if (slideShow.value) {
+    exitSlide()
+    const backDir = e.state?.dir ?? getDirFromUrl()
+    if (backDir !== currentDir.value) loadMedia(backDir, false)
     return
   }
   // 前进到预览那条历史时不做无谓的目录重载（预览本身不重新打开）
@@ -2474,12 +2609,37 @@ function onClickOutsideDrop(e){
   }
 }
 
+/** 预览层是否处于全屏（桌面浏览器用的是「预览层全屏」，不是视频本体全屏）。
+ *  按钮文案与提示层能不能看见都依赖它 */
+const isPreviewFullscreen = ref(false)
+
+function togglePreviewFullscreen() {
+  const box = previewBoxRef.value
+  if (!box) return
+  if (currentFullscreenElement() === box) {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen
+    if (exit) {
+      try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (e) { /* 忽略 */ }
+    }
+    return
+  }
+  const req = box.requestFullscreen || box.webkitRequestFullscreen
+  if (!req) return
+  try {
+    const p = req.call(box)
+    if (p && typeof p.catch === 'function') p.catch(() => {})
+  } catch (e) { /* 用户手势过期等，忽略 */ }
+}
+
 function onFullscreenChange(){
   // APK 接管 HTML5 视频原生全屏时（onShowCustomView），文档全屏可能同时退出、
   // fullscreenElement 变成 null；此时别把正在播放的幻灯片误关掉。
   // 浏览器里没有这个变量，undefined 为假，行为不变
   if (window.__albumVideoFullscreen) return
   const el = currentFullscreenElement()
+  isPreviewFullscreen.value = !!el && el === previewBoxRef.value
+  // 预览层尺寸变了，右上角那个关闭按钮要重新贴到画面边缘
+  if (previewShow.value) updateCloseBtnPos()
   if (el === document.documentElement) {
     // 整个页面进了全屏，说明是我们（或用户）要的幻灯片全屏
     slideFullscreenOwned = true
@@ -2495,6 +2655,9 @@ function onFullscreenChange(){
 }
 
 onMounted(() => {
+  // 桌面浏览器打个标记：Safari 不认 controlslist，靠它在全局样式里
+  // 把视频自带的那个全屏按钮藏掉（手机/电视的 WebView 没有这个类，行为不变）
+  if (isDesktopWeb) document.documentElement.classList.add('desktop-web')
   // 原生视频全屏时 WebView 收不到触摸事件，客户端回调这组接口；
   // 第一个是旧版 APK 的兼容入口，后两个是新的双轴手势接口
   window.__albumVideoSeekRatio = seekByRatioFromNative
@@ -2517,6 +2680,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true
+  if (isDesktopWeb) document.documentElement.classList.remove('desktop-web')
   clearTimeout(seekHudTimer)
   lockPageScroll(false)
   delete window.__albumVideoSeekRatio
@@ -3167,6 +3331,18 @@ input[type="checkbox"] {
   object-fit: contain;
   animation: mediaIn .24s ease;
 }
+/* 桌面浏览器的「预览层全屏」：铺满屏幕并给个底色，
+   提示层与关闭按钮都在这个子树里，所以全屏时照样看得见 */
+.preview-box:fullscreen,
+.preview-box:-webkit-full-screen {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  background: #000;
+}
+.preview-box:fullscreen .preview-image-area,
+.preview-box:-webkit-full-screen .preview-image-area { padding: 0 }
 .preview-footer {
   flex-shrink: 0;
   padding: 10px 16px 14px;
@@ -3593,6 +3769,14 @@ input[type="checkbox"] {
   outline-offset: 3px;
 }
 .tv-mode .preview-name { font-size: 18px }
+/* 遥控器没有可点的按钮，键位只能写在画面上（十英尺外也要看得清） */
+.tv-key-hint {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.5;
+  color: #AAB1BD;
+  text-align: center;
+}
 .tv-mode .img-action-bar button { font-size: 17px; padding: 12px 20px }
 .tv-mode .close-btn { width: 52px; height: 52px; font-size: 28px }
 .tv-mode .arrow-btn { width: 64px; height: 64px; font-size: 32px }
@@ -3600,9 +3784,12 @@ input[type="checkbox"] {
 .tv-mode .slide-next-btn { width: 64px; height: 64px; font-size: 34px }
 .tv-mode .slide-exit-btn { padding: 12px 22px; font-size: 17px }
 .tv-mode .slide-name { font-size: 18px }
+/* 十英尺界面：18px 在沙发上根本看不清，整体放大 */
+.tv-mode .seek-hud { padding: 16px 34px; border-radius: 14px; font-size: 38px }
 .tv-setup-btn { border-color: var(--accent) }
 
-/* ---------- 视频横滑快进 / 后退的进度提示 ---------- */
+/* ---------- 视频操作提示：快进/后退、音量、播放/暂停共用一行 ----------
+   视觉与手机客户端原生全屏那行提示对齐：深色半透明底 + 白字，单行居中 */
 .seek-hud {
   position: fixed;
   left: 50%;
@@ -3610,43 +3797,16 @@ input[type="checkbox"] {
   transform: translate(-50%, -50%);
   z-index: 99999;
   pointer-events: none;
-  min-width: 150px;
-  padding: 10px 18px;
-  border-radius: 12px;
+  padding: 10px 20px;
+  border-radius: 10px;
   text-align: center;
-  background: rgba(12, 14, 18, .86);
-  border: 1px solid rgba(255, 255, 255, .12);
-  color: #E9ECF1;
-}
-/* 快进/后退只有一行「+10 秒」，内边距再收一点更像胶囊而不是卡片 */
-.seek-hud.hud-seek {
-  min-width: 0;
-  padding: 8px 18px;
-}
-.seek-hud .seek-delta {
-  font-size: 20px;
+  background: rgba(14, 16, 20, .8);
+  color: #fff;
+  font-size: 18px;
   font-weight: 500;
-  color: #9EB9FF;
+  line-height: 1.3;
+  white-space: nowrap;
   font-variant-numeric: tabular-nums;
-}
-.seek-hud .seek-time {
-  margin-top: 3px;
-  font-size: 12px;
-  color: #AAB1BD;
-  font-variant-numeric: tabular-nums;
-}
-.seek-hud .seek-bar {
-  margin-top: 8px;
-  height: 4px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, .16);
-  overflow: hidden;
-}
-.seek-hud .seek-bar-fill {
-  height: 100%;
-  border-radius: 3px;
-  background: #9EB9FF;
-  transition: width .08s linear;
 }
 
 @media (prefers-reduced-motion: reduce) {
