@@ -207,14 +207,19 @@
             controls
             autoplay
             playsinline
-            :controlslist="isDesktopWeb ? 'nofullscreen' : null"
             :src="getSrcUrl(previewItem.path)"
             @loadedmetadata="onPreviewMediaReady"
             @play="onVideoPlayback(false, $event)"
             @pause="onVideoPlayback(true, $event)"
           ></video>
+          <!-- 暂停时画面中间给一个大按钮：底部的操作条已经去掉了，
+               不给提示会让人以为卡住；点画面任意处或点它都能继续 -->
+          <button v-if="showPauseOverlay" class="pause-overlay" aria-label="继续播放"
+                  @click.stop="toggleVideoPlay">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          </button>
         </div>
-        <div class="preview-footer">
+        <div class="preview-footer" :class="{'footer-compact': previewItem.type !== 'image' && !isTvMode}">
           <div class="preview-name">{{ previewItem.name }} ({{ previewCurrentIndex + 1 }} / {{ previewMediaList.length }})</div>
           <div v-if="previewItem.type === 'image'" class="img-action-bar">
             <button @click="openOriginal">查看原图</button>
@@ -222,12 +227,6 @@
             <button @click="rotateRight">↻ 右旋90°</button>
             <button @click="resetRotate">重置旋转</button>
             <button @click="startSlideFromCurrent">从此处开始幻灯片</button>
-          </div>
-          <!-- 桌面浏览器：原生控制条那个全屏按钮会把 <video> 本体送去全屏，
-               网页的提示层会被关在全屏子树之外；这里换成让整个预览层全屏 -->
-          <div v-else-if="isDesktopWeb" class="img-action-bar">
-            <button @click="toggleVideoPlay">{{ previewPaused ? '播放' : '暂停' }}</button>
-            <button @click="togglePreviewFullscreen">{{ isPreviewFullscreen ? '退出全屏' : '全屏' }}</button>
           </div>
           <!-- 电视只有遥控器，没有可点的按钮：把键位直接写在画面上，
                否则「左右快进、上下切换、OK 暂停」全靠猜 -->
@@ -240,9 +239,6 @@
             </template>
           </p>
         </div>
-        <!-- 快进/音量/播放提示放在预览层内部：桌面浏览器把预览层放全屏时，
-             只有这个子树里的元素才会被渲染出来 -->
-        <div v-if="seekHud.show" class="seek-hud">{{ seekHud.deltaText }}</div>
       </div>
     </div>
     <!-- 幻灯片设置弹窗 -->
@@ -455,9 +451,8 @@
     </div>
 
     <!-- 视频操作提示：横滑快进、键盘快进、音量、播放/暂停共用这一块。
-         预览打开时这份由 .preview-box 内的那份渲染（全屏时也能看见），
-         这里只负责幻灯片等其余场景 -->
-    <div v-if="seekHud.show && !previewShow" class="seek-hud">{{ seekHud.deltaText }}</div>
+         fixed + 极高的 z-index，预览、幻灯片、列表页都盖得住 -->
+    <div v-if="seekHud.show" class="seek-hud">{{ seekHud.deltaText }}</div>
   </div>
 </template>
 
@@ -468,10 +463,6 @@ const baseUrl = ''
 // TV 客户端的 WebView 在 UA 里加了 WaterfallAlbumTV 标记；
 // 浏览器与手机 App 检测不到，所有 TV 逻辑都不会生效
 const isTvMode = typeof navigator !== 'undefined' && /WaterfallAlbumTV/.test(navigator.userAgent)
-// 桌面浏览器（不带触摸的电脑端）：只有它需要用「预览层全屏」代替视频本体全屏。
-// 手机 App 与电视 App 的 WebView 都带 Android/iPhone 标记，行为保持原样
-const isDesktopWeb = typeof navigator !== 'undefined'
-  && !/Android|iPhone|iPad|iPod|Mobile|WaterfallAlbumTV/i.test(navigator.userAgent)
 // 初始化加载标记：修复刷新闪现登录页
 const initLoading = ref(true)
 const isLogin = ref(false)
@@ -644,8 +635,12 @@ const previewItem = ref(null)
 const previewMediaList = ref([])
 const previewCurrentIndex = ref(0)
 const imgRotateDeg = ref(0)
-/** 预览里的视频是否暂停着：桌面端「播放/暂停」按钮的文案靠它 */
+/** 预览里的视频是否暂停着：画面中间那个大按钮与电视端的键位提示都靠它 */
 const previewPaused = ref(false)
+/** 暂停时的居中播放按钮：只给视频、只在预览里显示 */
+const showPauseOverlay = computed(() =>
+  previewShow.value && previewPaused.value && !!previewItem.value &&
+  previewItem.value.type !== 'image')
 
 const settingShow = ref(false)
 const slideDelay = ref(3)
@@ -1260,6 +1255,22 @@ let seekHudTimer = null
  *  与手机客户端原生全屏那行提示保持同一套文案与视觉，方便一眼对上 */
 const seekHud = ref({ show: false, deltaText: '' })
 
+/** 点是否落在视频画面上（画面外的黑边、底部名字栏都不算） */
+function onVideoSurface(x, y, v) {
+  if (!v) return false
+  const r = v.getBoundingClientRect()
+  if (!r.width || !r.height) return false
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+}
+
+/** 触摸/点击是否落在视频底部的原生控制条上（那一条要整个让给浏览器） */
+function inNativeBar(clientY, v) {
+  if (!v) return false
+  const r = v.getBoundingClientRect()
+  if (!r.height) return false
+  return clientY > r.bottom - Math.min(NATIVE_BAR_HEIGHT, r.height * 0.25)
+}
+
 function getActiveVideo() {
   const v = slideShow.value ? slideVideoRef.value : previewMediaRef.value
   return v && v.tagName === 'VIDEO' ? v : null
@@ -1359,6 +1370,27 @@ function adjustVideoVolume(delta) {
   try { if (typeof v.volume === 'number') base = v.volume } catch (e) { /* 用默认值 */ }
   const r = applyVolume(v, base + delta)
   showVolumeHud(r.value, r.applied)
+}
+
+/** 点一下画面 → 切播放/暂停。触摸抬起和 click 都会走到这里：
+ *  安卓 WebView 里可能只派发触摸、浏览器里两个都来，所以 350ms 内只认一次。
+ *  浏览器自己也可能已经切过了，因此延迟 100ms 比一次状态再决定补不补，
+ *  否则一次点击会切两下（等于没反应）。 */
+let toggleRequest = null   // { v, at, timer }
+
+function requestVideoToggle(v) {
+  if (!v) return
+  const now = Date.now()
+  if (toggleRequest && toggleRequest.v === v && now - toggleRequest.at < 350) return
+  if (toggleRequest) clearTimeout(toggleRequest.timer)
+  const before = v.paused
+  const timer = setTimeout(() => {
+    toggleRequest = null
+    // 这 100ms 里可能已经换片或关了预览：不能对旧元素补刀
+    if (!previewShow.value || getActiveVideo() !== v) return
+    if (v.paused === before) toggleVideoPlay()
+  }, 100)
+  toggleRequest = { v, at: now, timer }
 }
 
 /** 播放 / 暂停当前视频。这里也直接给一次提示：事件是异步派发的，
@@ -1468,9 +1500,7 @@ function onTouchStart(e) {
   if (!v || !dur) return
   // 只有最底下 56px 那条留给原生控制条：那一条里点能跳、拖也能拖，其余位置
   // （画面、留白、底部按钮栏）全部接管手势
-  const r = v.getBoundingClientRect()
-  const barH = Math.min(NATIVE_BAR_HEIGHT, r.height * 0.25)
-  if (r.height && touchStartY > r.bottom - barH) {
+  if (inNativeBar(touchStartY, v)) {
     touchNativeBar = true
     return
   }
@@ -1517,6 +1547,9 @@ function onTouchEnd(e) {
   touchTracking = false
   const dx = e.changedTouches[0].clientX - touchStartX
   const dy = e.changedTouches[0].clientY - touchStartY
+  // resetSeekGesture 会清掉这两个，先留一份
+  const startedInBar = touchNativeBar
+  const startY = touchStartY
   if (seekActive) {
     // 阻止合成 click，否则 .preview-box 会把它当成「点空白退出预览」
     if (e.cancelable) e.preventDefault()
@@ -1536,6 +1569,17 @@ function onTouchEnd(e) {
     return
   }
   resetSeekGesture()
+  // 点一下画面（没滑动、也不在原生控制条上）＝ 播放/暂停。
+  // 安卓 WebView 里点视频不一定派发 click，这里也走一遍，两路一起由
+  // requestVideoToggle 去重，保证一次点按只切一次
+  if (!startedInBar && Math.abs(dx) <= GESTURE_MIN_DIST && Math.abs(dy) <= GESTURE_MIN_DIST) {
+    const onButton = e.target && typeof e.target.closest === 'function' && e.target.closest('button')
+    const tapVideo = previewShow.value && !slideShow.value ? getActiveVideo() : null
+    if (!onButton && tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
+        && !inNativeBar(startY, tapVideo)) {
+      requestVideoToggle(tapVideo)
+    }
+  }
   // 图片：水平滑动切上一张/下一张。只在真的切了张时才拦合成 click
   // （原来没拦，切完可能顺带把预览关掉）。视频若时长未知、或手指落在
   // 底部控制条上，这里必须放行，否则拖不动原生进度条、点不亮控制条
@@ -2092,7 +2136,17 @@ function onPreviewBoxClick(e) {
   // 视频横滑结束后浏览器仍可能合成 click（touchend 的 preventDefault 不是绝对可靠），
   // 这段时间内忽略「点空白退出」，避免刚快进完预览就被关掉
   if (Date.now() < suppressPreviewClickUntil) return
-  if (isVideoPreview()) return
+  if (isVideoPreview()) {
+    // 视频预览：点画面就是播放/暂停。底部那一条（原生控制条）和浏览器原生全屏
+    // 里都不接管，否则会和自带按钮互相打架、一次点击切两下
+    const t = e.target
+    const v = getActiveVideo()
+    if (t && t.tagName === 'VIDEO' && v && !inNativeBar(e.clientY, v)
+        && currentFullscreenElement() !== v) {
+      requestVideoToggle(v)
+    }
+    return
+  }
   const t = e.target
   if (!t) return
   // 点图片/视频本体（含视频原生控制条）不退出
@@ -2108,6 +2162,7 @@ function closePreview() {
   // 视频被卸载时浏览器还会补一个 pause 事件，也要一并压掉
   onTouchCancel()
   muteVideoPlaybackHint()
+  if (toggleRequest) { clearTimeout(toggleRequest.timer); toggleRequest = null }
   // 预览层正被放全屏时先退出来，否则关掉预览后可能留一块黑屏
   if (previewBoxRef.value && currentFullscreenElement() === previewBoxRef.value) {
     const exit = document.exitFullscreen || document.webkitExitFullscreen
@@ -2609,36 +2664,13 @@ function onClickOutsideDrop(e){
   }
 }
 
-/** 预览层是否处于全屏（桌面浏览器用的是「预览层全屏」，不是视频本体全屏）。
- *  按钮文案与提示层能不能看见都依赖它 */
-const isPreviewFullscreen = ref(false)
-
-function togglePreviewFullscreen() {
-  const box = previewBoxRef.value
-  if (!box) return
-  if (currentFullscreenElement() === box) {
-    const exit = document.exitFullscreen || document.webkitExitFullscreen
-    if (exit) {
-      try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (e) { /* 忽略 */ }
-    }
-    return
-  }
-  const req = box.requestFullscreen || box.webkitRequestFullscreen
-  if (!req) return
-  try {
-    const p = req.call(box)
-    if (p && typeof p.catch === 'function') p.catch(() => {})
-  } catch (e) { /* 用户手势过期等，忽略 */ }
-}
-
 function onFullscreenChange(){
   // APK 接管 HTML5 视频原生全屏时（onShowCustomView），文档全屏可能同时退出、
   // fullscreenElement 变成 null；此时别把正在播放的幻灯片误关掉。
   // 浏览器里没有这个变量，undefined 为假，行为不变
   if (window.__albumVideoFullscreen) return
   const el = currentFullscreenElement()
-  isPreviewFullscreen.value = !!el && el === previewBoxRef.value
-  // 预览层尺寸变了，右上角那个关闭按钮要重新贴到画面边缘
+  // 全屏切换后画面尺寸变了，右上角那个关闭按钮要重新贴到边缘
   if (previewShow.value) updateCloseBtnPos()
   if (el === document.documentElement) {
     // 整个页面进了全屏，说明是我们（或用户）要的幻灯片全屏
@@ -2655,9 +2687,6 @@ function onFullscreenChange(){
 }
 
 onMounted(() => {
-  // 桌面浏览器打个标记：Safari 不认 controlslist，靠它在全局样式里
-  // 把视频自带的那个全屏按钮藏掉（手机/电视的 WebView 没有这个类，行为不变）
-  if (isDesktopWeb) document.documentElement.classList.add('desktop-web')
   // 原生视频全屏时 WebView 收不到触摸事件，客户端回调这组接口；
   // 第一个是旧版 APK 的兼容入口，后两个是新的双轴手势接口
   window.__albumVideoSeekRatio = seekByRatioFromNative
@@ -2680,7 +2709,6 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true
-  if (isDesktopWeb) document.documentElement.classList.remove('desktop-web')
   clearTimeout(seekHudTimer)
   lockPageScroll(false)
   delete window.__albumVideoSeekRatio
@@ -3316,6 +3344,7 @@ input[type="checkbox"] {
 .arrow-left { left: 10px }
 .arrow-right { right: 10px }
 .preview-image-area {
+  position: relative;   /* 暂停按钮的定位参照：贴在画面正中，不被页脚拉偏 */
   flex: 1;
   min-height: 0;
   display: flex;
@@ -3331,18 +3360,30 @@ input[type="checkbox"] {
   object-fit: contain;
   animation: mediaIn .24s ease;
 }
-/* 桌面浏览器的「预览层全屏」：铺满屏幕并给个底色，
-   提示层与关闭按钮都在这个子树里，所以全屏时照样看得见 */
-.preview-box:fullscreen,
-.preview-box:-webkit-full-screen {
-  width: 100%;
-  height: 100%;
-  max-width: none;
-  max-height: none;
-  background: #000;
+/* 视频预览：底部只留文件名那一行，把画面高度还给视频 */
+.preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
+/* 暂停时画面中间的播放按钮：点它或点画面任意处继续 */
+.pause-overlay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 76px;
+  height: 76px;
+  padding: 0;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 12, 18, .62);
+  border: 1px solid rgba(255, 255, 255, .22);
+  color: #fff;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background .15s ease, transform .12s ease;
 }
-.preview-box:fullscreen .preview-image-area,
-.preview-box:-webkit-full-screen .preview-image-area { padding: 0 }
+.pause-overlay:hover { background: rgba(10, 12, 18, .78); transform: translate(-50%, -50%) scale(1.04) }
+.pause-overlay svg { width: 34px; height: 34px; margin-left: 3px }
 .preview-footer {
   flex-shrink: 0;
   padding: 10px 16px 14px;
@@ -3770,6 +3811,8 @@ input[type="checkbox"] {
 }
 .tv-mode .preview-name { font-size: 18px }
 /* 遥控器没有可点的按钮，键位只能写在画面上（十英尺外也要看得清） */
+.tv-mode .pause-overlay { width: 120px; height: 120px }
+.tv-mode .pause-overlay svg { width: 54px; height: 54px }
 .tv-key-hint {
   margin: 0;
   font-size: 18px;
