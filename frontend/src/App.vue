@@ -150,7 +150,7 @@
             :class="{loaded: item._loaded}"
             @load="onImageLoaded(item)"
           />
-          <div v-else-if="item.type === 'video'" class="video-wrap">
+          <div v-else-if="item.type === 'video'">
             <img
               :src="getThumbUrl(item.path)"
               alt=""
@@ -164,10 +164,10 @@
             </div>
           </div>
           <!-- 角标 -->
-          <div v-if="item.type === 'folder'" class="card-badge badge-count">
+          <div v-if="item.type === 'folder'" class="card-badge">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>{{ item.count }}
           </div>
-          <div v-else-if="item.type === 'video' && item.duration" class="card-badge badge-duration">
+          <div v-else-if="item.type === 'video' && item.duration" class="card-badge">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>{{ formatDuration(item.duration) }}
           </div>
           <!-- hover 元信息 -->
@@ -281,19 +281,19 @@
           </div>
           <div class="um-table">
             <div class="um-table-head">
-              <div class="col-uname">用户名</div>
-              <div class="col-role">角色</div>
-              <div class="col-dir">允许目录</div>
-              <div class="col-op">操作</div>
+              <div>用户名</div>
+              <div>角色</div>
+              <div>允许目录</div>
+              <div>操作</div>
             </div>
             <div class="um-table-row" v-for="u in adminUserList" :key="u.username">
-              <div class="col-uname">{{u.username}}</div>
-              <div class="col-role">
+              <div>{{u.username}}</div>
+              <div>
                 <span v-if="u.is_admin" class="tag-admin">管理员</span>
                 <span v-else class="tag-user">普通用户</span>
               </div>
-              <div class="col-dir">{{u.allow_dirs.join("; ")}}</div>
-              <div class="col-op">
+              <div>{{u.allow_dirs.join("; ")}}</div>
+              <div>
                 <button class="btn btn-sm" @click="switchToEditForm(u)">编辑</button>
                 <button class="btn btn-sm btn-danger" @click="openDelConfirm(u)">删除</button>
               </div>
@@ -433,10 +433,15 @@
       </div>
     </div>
 
-    <!-- 视频操作提示：横滑预览、键盘快进、音量调节共用这一块 -->
-    <div v-if="seekHud.show" class="seek-hud">
+    <!-- 视频操作提示：横滑快进、纵滑音量、键盘快进共用这一块。
+         快进/后退只报「加减多少秒」，落点看视频自己的进度条；
+         音量没有原生提示，才额外带一行说明和一条音量条 -->
+    <div v-if="seekHud.show" class="seek-hud" :class="'hud-' + seekHud.mode">
       <div class="seek-delta">{{ seekHud.deltaText }}</div>
-      <div class="seek-time">{{ seekHud.sub }}</div>
+      <template v-if="seekHud.mode === 'volume'">
+        <div class="seek-time">{{ seekHud.sub }}</div>
+        <div class="seek-bar"><div class="seek-bar-fill" :style="{width: (seekHud.progress * 100) + '%'}"></div></div>
+      </template>
     </div>
   </div>
 </template>
@@ -1194,14 +1199,17 @@ function nextMedia() {
   }
 }
 
-// ========= 移动端滑动：图片切张 / 视频快进后退 =========
-// 图片沿用「左滑下一张」。视频改为横拖预览目标时间、松手才 seek，
-// 避免拖动中反复解码卡顿。原生视频全屏时 WebView 收不到触摸事件，
-// 由客户端把滑动比例回传给 window.__albumVideoSeekRatio，两边共用同一套公式。
+// ========= 移动端滑动：图片切张 / 视频快进后退 / 视频音量 =========
+// 图片沿用「左滑下一张」。视频第一次移动超过 6px 即锁定方向：横向按秒预览
+// 目标进度、松手才 seek（避免拖动中反复解码卡顿）；纵向逐像素实时调音量。
+// 预览区域内的 touchmove 一律拦默认行为，纵向滑动不会再带到底层页面。
+// 原生视频全屏时 WebView 收不到触摸，由客户端回传两轴比例给
+// __albumVideoGestureStart / __albumVideoGestureUpdate，公式共用这一份。
 const SEEK_MAX_SPAN = 300      // 一整屏最多跳 5 分钟，长视频不会一滑半小时
-const SEEK_MIN_DX = 12         // 小于这个位移当成点击，不接管
-const KEY_SEEK_STEP = 5        // 键盘左右键每次快进/后退 5 秒
-const KEY_VOLUME_STEP = 0.1    // 键盘上下键每次调 10% 音量
+const GESTURE_MIN_DIST = 6     // 6px 即触发，小幅滑动也能立刻看到反馈
+const VOL_FULL_SPAN = 0.9      // 纵向滑一屏高度约改 90% 音量，逐像素连续调节
+const KEY_SEEK_STEP = 10       // 键盘左右键每次快进/后退 10 秒
+const KEY_VOLUME_STEP = 0.02   // 键盘上下键每次调 2% 音量
 let touchStartX = 0
 let touchStartY = 0
 /** 本次手势是否从有效的单指触摸开始：多指/触摸取消都不该再触发切图或 seek */
@@ -1210,18 +1218,16 @@ let touchTracking = false
 let suppressPreviewClickUntil = 0
 let seekVideoEl = null
 let seekBaseTime = 0
+let seekBaseVolume = 0
 let seekDuration = 0
 let seekActive = false
+/** 一次手势只锁定一个轴：'h' 快进后退 / 'v' 音量，避免斜滑时两种操作互相打架 */
+let gestureAxis = null
+/** 是否允许拦截 touchmove 默认行为；落在视频底部控制条上时必须放行 */
+let touchBlockScroll = false
 let seekHudTimer = null
-const seekHud = ref({ show: false, deltaText: '', sub: '', target: 0, duration: 0 })
-
-function formatTime(sec) {
-  const s = Math.max(0, Math.floor(Number(sec) || 0))
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const ss = String(s % 60).padStart(2, '0')
-  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`
-}
+/** mode: 'seek' 只显示加减秒数 / 'volume' 带音量条 */
+const seekHud = ref({ show: false, mode: 'seek', deltaText: '', sub: '', progress: 0 })
 
 function getActiveVideo() {
   const v = slideShow.value ? slideVideoRef.value : previewMediaRef.value
@@ -1242,30 +1248,35 @@ function clampSeekTime(base, delta, dur) {
   return Math.min(Math.max(0, base + delta), Math.max(0, dur - 0.1))
 }
 
+/** 真正执行 seek，返回实际落点相对起点的秒数差；视频不可 seek 时返回 null */
 function seekVideoBy(delta, v = getActiveVideo(), base = null) {
   const dur = videoDuration(v)
   if (!v || !dur) return null
-  const before = v.currentTime || 0
   // 内联手势传按下时的时间：拖动期间视频还在播放，若用当前 currentTime，
   // 松手落点会比 HUD 预览的目标时间多出这几秒。原生全屏不传 base，用当前值
-  const from = base === null ? before : base
+  const from = base === null ? (v.currentTime || 0) : base
   const target = clampSeekTime(from, delta, dur)
   try { v.currentTime = target } catch (e) { return null }
-  return { delta: target - from, target, duration: dur }
+  return target - from
 }
 
-function showSeekHud(info) {
-  if (!info) return
-  // 默认显示「±N 秒 + 目标/总时长」；键盘调音量时传入 deltaText/sub 覆盖两行
-  seekHud.value = {
-    show: true,
-    deltaText: info.deltaText || ((info.delta >= 0 ? '+' : '−') + Math.round(Math.abs(info.delta)) + 's'),
-    sub: info.sub || (formatTime(info.target) + ' / ' + formatTime(info.duration)),
-    target: info.target || 0,
-    duration: info.duration || 0
-  }
+/** 统一的 HUD 出口：所有提示都走这里，保证只有一份倒计时 */
+function showHud(next) {
+  seekHud.value = { show: true, mode: 'seek', deltaText: '', sub: '', progress: 0, ...next }
   clearTimeout(seekHudTimer)
   seekHudTimer = setTimeout(hideSeekHud, 1500)
+}
+
+/** 加减秒数的文本，前端大字与原生全屏 HUD 共用。符号取自原始位移，
+ *  这样拖回起点附近时仍显示「−0 秒」而不是忽然变成正向 */
+function formatDelta(delta) {
+  const raw = Number(delta) || 0
+  return (raw < 0 ? '−' : '+') + Math.round(Math.abs(raw)) + ' 秒'
+}
+
+/** 快进/后退：只显示加减秒数，落点交给视频自己的进度条 */
+function showSeekHud(delta) {
+  showHud({ mode: 'seek', deltaText: formatDelta(delta) })
 }
 
 function hideSeekHud() {
@@ -1277,47 +1288,98 @@ function hideSeekHud() {
 function resetSeekGesture() {
   seekVideoEl = null
   seekActive = false
+  gestureAxis = null
   seekDuration = 0
   seekBaseTime = 0
+  seekBaseVolume = 0
+  touchBlockScroll = false
 }
 
-/** 键盘左右键：固定 5 秒快进/后退，复用横滑那套 seek 与 HUD */
+/** 键盘左右键：固定 10 秒快进/后退，复用横滑那套 seek 与 HUD */
 function keySeekVideo(delta) {
-  const info = seekVideoBy(delta)
-  if (info) showSeekHud(info)
+  const applied = seekVideoBy(delta)
+  if (applied !== null) showSeekHud(applied)
 }
 
-/** 键盘上下键：每次 10% 音量；只读 volume 的平台给出提示而不是静默失败 */
-function adjustVideoVolume(delta) {
-  const v = getActiveVideo()
-  if (!v) return
-  let base = 1
-  try { if (typeof v.volume === 'number') base = v.volume } catch (e) { /* 用默认值 */ }
-  // 四舍五入到十分位，避免 0.1+0.2 这类浮点累积
-  const next = Math.min(1, Math.max(0, Math.round((base + delta) * 10) / 10))
-  if (delta > 0 && v.muted) {
-    // 自动播放被浏览器策略拦截时会降级为静音，按增大音量应顺带恢复声音
+/** 写音量：精确到 1%（键盘 2% 步进、纵向手势逐像素都用它），并读回确认是否生效 */
+function applyVolume(v, wanted) {
+  const next = Math.min(1, Math.max(0, Math.round(wanted * 100) / 100))
+  if (next > 0 && v.muted) {
+    // 自动播放被浏览器策略拦截时会降级为静音，调大音量应顺带恢复声音
     try { v.muted = false } catch (e) { /* 忽略 */ }
   }
   let applied = false
   try {
     v.volume = next
-    applied = Math.abs((typeof v.volume === 'number' ? v.volume : base) - next) < 0.02
+    applied = Math.abs((typeof v.volume === 'number' ? v.volume : next) - next) < 0.005
   } catch (e) { applied = false }
-  showSeekHud(applied
-    ? { deltaText: '音量 ' + Math.round(next * 100) + '%', sub: '↑ 增大 · ↓ 减小' }
-    : { deltaText: '音量', sub: '当前浏览器不支持程序调节音量' })
+  return { applied, value: next }
 }
 
-/** 原生视频全屏时由客户端回传滑动比例，返回给 HUD 展示的文本 */
-function seekByRatioFromNative(ratio) {
+function showVolumeHud(value, applied) {
+  showHud(applied
+    ? { mode: 'volume', deltaText: '音量 ' + Math.round(value * 100) + '%', sub: '↑ 增大 · ↓ 减小', progress: value }
+    : { mode: 'volume', deltaText: '音量', sub: '当前浏览器不支持程序调节音量', progress: 0 })
+}
+
+/** 键盘上下键：每次 2% 音量 */
+function adjustVideoVolume(delta) {
+  const v = getActiveVideo()
+  if (!v) return
+  let base = 1
+  try { if (typeof v.volume === 'number') base = v.volume } catch (e) { /* 用默认值 */ }
+  const r = applyVolume(v, base + delta)
+  showVolumeHud(r.value, r.applied)
+}
+
+/** 纵向手势：按屏幕高度连续改音量（上滑增大），实时生效不需要等松手 */
+function gestureVolume(dy) {
+  if (!seekVideoEl) return
+  const h = window.innerHeight || 1
+  const r = applyVolume(seekVideoEl, seekBaseVolume - (dy / h) * VOL_FULL_SPAN)
+  showVolumeHud(r.value, r.applied)
+}
+
+// ========= 原生视频全屏：WebView 收不到触摸，由客户端回传两个轴的比例 =========
+// 位移→秒、位移→音量两套公式都只在下面定义一次，内联手势与全屏手势共用
+let nativeGesture = null
+
+function nativeGestureStart() {
   const v = getActiveVideo()
   const dur = videoDuration(v)
-  if (!v || !dur || !Number.isFinite(ratio)) return ''
-  const info = seekVideoBy(ratioToSeconds(ratio, dur), v)
-  if (!info) return ''
-  return (info.delta >= 0 ? '+' : '−') + Math.round(Math.abs(info.delta))
-    + 's   ' + formatTime(info.target) + ' / ' + formatTime(info.duration)
+  if (!v || !dur) { nativeGesture = null; return '' }
+  let vol = 1
+  try { if (typeof v.volume === 'number') vol = v.volume } catch (e) { /* 用默认值 */ }
+  nativeGesture = { v, dur, baseTime: v.currentTime || 0, baseVolume: vol }
+  return ''
+}
+
+/** commit=false 只预览秒级进度（横向）/实时改音量（纵向）；commit=true 才真正 seek */
+function nativeGestureUpdate(dxRatio, dyRatio, commit) {
+  // DOWN 的 start 是异步投递的，万一 MOVE 先到，这里自动补一次基准
+  if (!nativeGesture) nativeGestureStart()
+  const g = nativeGesture
+  if (!g || !Number.isFinite(dxRatio) || !Number.isFinite(dyRatio)) return ''
+  if (Math.abs(dxRatio) >= Math.abs(dyRatio)) {
+    let delta = clampSeekTime(g.baseTime, ratioToSeconds(dxRatio, g.dur), g.dur) - g.baseTime
+    if (commit) {
+      const applied = seekVideoBy(delta, g.v, g.baseTime)
+      if (applied === null) return ''
+      delta = applied
+    }
+    showSeekHud(delta)
+    return formatDelta(delta)
+  }
+  const r = applyVolume(g.v, g.baseVolume - dyRatio * VOL_FULL_SPAN)
+  showVolumeHud(r.value, r.applied)
+  return '音量 ' + Math.round(r.value * 100) + '%'
+}
+
+/** 兼容旧版 APK：只传横向比例时按「开始 → 立即提交」处理 */
+function seekByRatioFromNative(ratio) {
+  if (!Number.isFinite(ratio)) return ''
+  nativeGestureStart()
+  return nativeGestureUpdate(ratio, 0, true)
 }
 
 function onTouchStart(e) {
@@ -1328,33 +1390,45 @@ function onTouchStart(e) {
   touchStartY = e.touches[0].clientY
   const v = getActiveVideo()
   const dur = videoDuration(v)
+  // 图片预览、或视频元数据还没就绪时，纵向滑动同样不该带到底层页面
+  touchBlockScroll = true
   if (!v || !dur) return
-  // 底部留给原生控制条的进度条拖动，别和它抢手势
+  // 底部留给原生控制条的进度条拖动：这里连 touchmove 的默认行为都不能拦
   const r = v.getBoundingClientRect()
-  if (r.height && touchStartY > r.bottom - Math.max(56, r.height * 0.15)) return
+  if (r.height && touchStartY > r.bottom - Math.max(56, r.height * 0.15)) {
+    touchBlockScroll = false
+    return
+  }
   seekVideoEl = v
   seekDuration = dur
   seekBaseTime = v.currentTime || 0
+  try { seekBaseVolume = typeof v.volume === 'number' ? v.volume : 1 } catch (err) { seekBaseVolume = 1 }
 }
 
 function onTouchMove(e) {
   if (!touchTracking) return
   // 中途按下第二根手指（缩放等）直接作废本次手势，否则抬手时会误切图/误快进
   if (e.touches.length !== 1) { onTouchCancel(); return }
+  // 预览区域内拦掉默认行为：纵向滑动绝不能把滚动传到底层页面。
+  // 只有手指落在视频底部控制条上（touchBlockScroll=false）时放行，保住原生进度条
+  if (touchBlockScroll && e.cancelable) e.preventDefault()
   if (!seekVideoEl) return
   const dx = e.touches[0].clientX - touchStartX
   const dy = e.touches[0].clientY - touchStartY
-  if (Math.abs(dx) < SEEK_MIN_DX || Math.abs(dx) <= Math.abs(dy) * 1.2) {
-    // 滑出去又滑回来时别把上一次的预览时间留在屏幕上
-    if (seekActive) hideSeekHud()
+  const ax = Math.abs(dx)
+  const ay = Math.abs(dy)
+  // 6px 即锁定方向，之后整次手势只走一个轴，斜滑不会在快进和音量之间来回跳
+  if (!gestureAxis) {
+    if (Math.max(ax, ay) < GESTURE_MIN_DIST) return
+    gestureAxis = ax > ay * 1.1 ? 'h' : 'v'
+  }
+  seekActive = true
+  if (gestureAxis === 'v') {
+    gestureVolume(dy)
     return
   }
-  // 确认是横向拖动后才阻止默认行为：不影响单击显示控制条、纵向滚动
-  if (e.cancelable) e.preventDefault()
-  seekActive = true
   const ratio = dx / (window.innerWidth || 1)
-  const target = clampSeekTime(seekBaseTime, ratioToSeconds(ratio, seekDuration), seekDuration)
-  showSeekHud({ delta: target - seekBaseTime, target, duration: seekDuration })
+  showSeekHud(clampSeekTime(seekBaseTime, ratioToSeconds(ratio, seekDuration), seekDuration) - seekBaseTime)
 }
 
 function onTouchCancel() {
@@ -1372,11 +1446,14 @@ function onTouchEnd(e) {
     // 阻止合成 click，否则 .preview-box 会把它当成「点空白退出预览」
     if (e.cancelable) e.preventDefault()
     suppressPreviewClickUntil = Date.now() + 400
-    if (Math.abs(dx) >= SEEK_MIN_DX && Math.abs(dx) > Math.abs(dy) * 1.2) {
+    if (gestureAxis === 'h' && Math.abs(dx) >= GESTURE_MIN_DIST) {
       const ratio = dx / (window.innerWidth || 1)
-      const info = seekVideoBy(ratioToSeconds(ratio, seekDuration), seekVideoEl, seekBaseTime)
-      if (info) showSeekHud(info)
+      const applied = seekVideoBy(ratioToSeconds(ratio, seekDuration), seekVideoEl, seekBaseTime)
+      if (applied !== null) showSeekHud(applied)
       else hideSeekHud()
+    } else if (gestureAxis === 'v') {
+      // 音量在 move 中已实时生效，用抬手位置再确认一次即可
+      gestureVolume(dy)
     } else {
       hideSeekHud()
     }
@@ -1809,6 +1886,8 @@ function exitSlide() {
   // 作废所有在途的换批请求，避免退出后结果回来覆盖新界面
   slideSessionId++
   slideBatchReloading = false
+  // 同上：幻灯片里滑过快进后退出，别把秒数提示留在列表页
+  onTouchCancel()
   clearTimeout(slideTimer.value)
   slideShow.value = false
   randomSlideMode.value = false
@@ -1908,6 +1987,9 @@ function onPreviewBoxClick(e) {
 }
 
 function closePreview() {
+  // 手势状态与 HUD 一起清掉：刚滑完快进就按 Esc/返回时，
+  // 那行「+75 秒」会飘在已关闭的列表上等 1.5 秒才消失
+  onTouchCancel()
   previewShow.value = false
   previewItem.value = null
   previewMediaList.value = []
@@ -2317,9 +2399,12 @@ async function submitUmForm(){
     adminMsg.value = "至少勾选一个允许访问目录"
     return
   }
+  // 密码只在「全空白」时当成不修改（编辑留空），绝不能 trim 后再提交：
+  // 否则管理员设定 "pass " 会被悄悄存成 "pass"，用户按自己输的密码永远登录不上
+  const pwd = umForm.value.password
   const body = {
     username: username,
-    password: umForm.value.password.trim() || null,
+    password: pwd.trim() === '' ? null : pwd,
     allow_dirs: umForm.value.allow_dirs,
     is_admin: umForm.value.is_admin
   }
@@ -2410,11 +2495,16 @@ function onFullscreenChange(){
 }
 
 onMounted(() => {
-  // 原生视频全屏时 WebView 收不到触摸事件，客户端会回调这个接口
+  // 原生视频全屏时 WebView 收不到触摸事件，客户端回调这组接口；
+  // 第一个是旧版 APK 的兼容入口，后两个是新的双轴手势接口
   window.__albumVideoSeekRatio = seekByRatioFromNative
+  window.__albumVideoGestureStart = nativeGestureStart
+  window.__albumVideoGestureUpdate = nativeGestureUpdate
   installTvNavigation()
   checkLoginStatus()
-  document.addEventListener('keydown', handleKeydown)
+  // 捕获阶段：浏览器原生视频控件在 Fullscreen API 下会吞掉方向键，
+  // 挂在冒泡阶段的监听收不到，全屏时就无法快进/调音量
+  document.addEventListener('keydown', handleKeydown, true)
   window.addEventListener('resize', onWindowResize)
   window.addEventListener('popstate', onPopState)
   document.addEventListener("click", onClickOutsideDrop)
@@ -2430,9 +2520,11 @@ onUnmounted(() => {
   clearTimeout(seekHudTimer)
   lockPageScroll(false)
   delete window.__albumVideoSeekRatio
+  delete window.__albumVideoGestureStart
+  delete window.__albumVideoGestureUpdate
   if (tvNavHandler) document.removeEventListener('keydown', tvNavHandler, true)
   if (isTvMode) document.documentElement.classList.remove('tv-mode')
-  document.removeEventListener('keydown', handleKeydown)
+  document.removeEventListener('keydown', handleKeydown, true)
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('popstate', onPopState)
   document.removeEventListener("click", onClickOutsideDrop)
@@ -3518,25 +3610,43 @@ input[type="checkbox"] {
   transform: translate(-50%, -50%);
   z-index: 99999;
   pointer-events: none;
-  min-width: 168px;
-  padding: 14px 22px;
+  min-width: 150px;
+  padding: 10px 18px;
   border-radius: 12px;
   text-align: center;
   background: rgba(12, 14, 18, .86);
   border: 1px solid rgba(255, 255, 255, .12);
   color: #E9ECF1;
 }
+/* 快进/后退只有一行「+10 秒」，内边距再收一点更像胶囊而不是卡片 */
+.seek-hud.hud-seek {
+  min-width: 0;
+  padding: 8px 18px;
+}
 .seek-hud .seek-delta {
-  font-size: 26px;
+  font-size: 20px;
   font-weight: 500;
   color: #9EB9FF;
   font-variant-numeric: tabular-nums;
 }
 .seek-hud .seek-time {
-  margin-top: 4px;
-  font-size: 13px;
+  margin-top: 3px;
+  font-size: 12px;
   color: #AAB1BD;
   font-variant-numeric: tabular-nums;
+}
+.seek-hud .seek-bar {
+  margin-top: 8px;
+  height: 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, .16);
+  overflow: hidden;
+}
+.seek-hud .seek-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: #9EB9FF;
+  transition: width .08s linear;
 }
 
 @media (prefers-reduced-motion: reduce) {

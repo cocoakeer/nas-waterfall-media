@@ -57,9 +57,11 @@ import android.widget.Toast;
  *      WebView 会把视频 View 交给宿主，挂到一个全屏黑色容器里。
  *      全程不调用 setRequestedOrientation，横竖屏跟随设备与系统方向设置；
  *      manifest 的 configChanges 保证旋转时不重建 Activity、播放不中断
- *   7. 视频横滑快进/后退：内联播放由网页端处理；进原生全屏后 WebView 收不到
- *      触摸事件，改由 dispatchTouchEvent 只观察不拦截，把滑动比例回传给网页
- *      的 __albumVideoSeekRatio，两边共用同一套位移→秒数公式，手感一致
+ *   7. 视频手势：内联播放由网页端处理；进原生全屏后 WebView 收不到触摸事件，
+ *      改由 dispatchTouchEvent 只观察不拦截，6px 即锁定横向（快进/后退）或
+ *      纵向（音量）一个轴，把两轴比例回传给 __albumVideoGestureStart /
+ *      __albumVideoGestureUpdate。位移→秒数、位移→音量公式只在网页端定义一份，
+ *      全屏与内联手感一致；MOVE 阶段节流实时回显秒数，UP 才真正 seek
  *
  * 不申请存储/定位/通讯录权限，不加载任何第三方 SDK。
  */
@@ -118,6 +120,9 @@ public class MainActivity extends Activity {
     private float seekDownX = 0f;
     private float seekDownY = 0f;
     private boolean seekTracking = false;
+    /** 0 未定 / 1 横向快进后退 / 2 纵向音量，一次手势只锁一个轴 */
+    private int seekAxis = 0;
+    private long lastGesturePreviewAt = 0L;
     /** 作废上一次全屏遗留的 HUD 定时回调，别让它把新一次全屏的提示提前隐藏 */
     private int hudSeq = 0;
 
@@ -321,13 +326,14 @@ public class MainActivity extends Activity {
         rootLayout.addView(fullscreenContainer, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
-        // 快进/后退提示叠在视频之上：后 addView 的 View 在 z 序最上层
+        // 快进/后退提示叠在视频之上：后 addView 的 View 在 z 序最上层。
+        // 网页只回传「+75 秒」这样一行短文本，字号与内边距都跟网页端保持同一量级
         fullscreenHud = new TextView(this);
         fullscreenHud.setTextColor(Color.WHITE);
-        fullscreenHud.setTextSize(19f);
+        fullscreenHud.setTextSize(18f);
         fullscreenHud.setGravity(Gravity.CENTER);
         fullscreenHud.setBackgroundColor(Color.parseColor("#CC0E1014"));
-        fullscreenHud.setPadding(dp(22), dp(14), dp(22), dp(14));
+        fullscreenHud.setPadding(dp(18), dp(9), dp(18), dp(9));
         fullscreenHud.setVisibility(View.GONE);
         fullscreenContainer.addView(fullscreenHud, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -347,6 +353,7 @@ public class MainActivity extends Activity {
         }
         fullscreenHud = null;
         seekTracking = false;
+        seekAxis = 0;
         hudSeq++;
         WebChromeClient.CustomViewCallback cb = customViewCallback;
         customVideoView = null;
@@ -375,51 +382,73 @@ public class MainActivity extends Activity {
             if (!seekTracking) return;
             seekDownX = ev.getX();
             seekDownY = ev.getY();
+            seekAxis = 0;
+            lastGesturePreviewAt = 0L;
+            // 让网页记下按下时的时间与音量基准，后续只回传两轴比例
+            web.evaluateJavascript(
+                    "window.__albumVideoGestureStart && window.__albumVideoGestureStart()", null);
         } else if (action == MotionEvent.ACTION_MOVE) {
             if (!seekTracking) return;
             if (ev.getPointerCount() != 1) { cancelFullscreenSeek(); return; }
             float dx = ev.getX() - seekDownX;
             float dy = ev.getY() - seekDownY;
-            if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.2f) {
-                fullscreenHud.setText(dx > 0 ? "» 快进" : "« 后退");
-                fullscreenHud.setVisibility(View.VISIBLE);
-            } else {
-                hideFullscreenHud();
+            float ax = Math.abs(dx);
+            float ay = Math.abs(dy);
+            // 6px 即锁定方向，斜滑不会在快进和音量之间来回跳
+            if (seekAxis == 0) {
+                if (Math.max(ax, ay) < 6) return;
+                seekAxis = ax > ay * 1.1f ? 1 : 2;
             }
+            long now = System.currentTimeMillis();
+            if (now - lastGesturePreviewAt < 60) return;   // 节流，别每帧调一次 JS
+            lastGesturePreviewAt = now;
+            callGestureJs(seekAxis == 1 && w > 0 ? dx / w : 0f,
+                    seekAxis == 2 && h > 0 ? dy / h : 0f, false);
         } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
             if (!seekTracking) return;
             // 用抬手时的最终坐标，不能用中途某次 MOVE 的 x：滑出去又滑回来不该快进
             float dx = ev.getX() - seekDownX;
             float dy = ev.getY() - seekDownY;
-            boolean valid = action == MotionEvent.ACTION_UP && w > 0
-                    && Math.abs(dx) > 24 && Math.abs(dx) > Math.abs(dy) * 1.2f;
+            boolean valid = action == MotionEvent.ACTION_UP && seekAxis != 0
+                    && Math.max(Math.abs(dx), Math.abs(dy)) > 10;
             seekTracking = false;
             if (!valid) { hideFullscreenHud(); return; }
-            float ratio = dx / w;
-            web.evaluateJavascript(
-                    "window.__albumVideoSeekRatio && window.__albumVideoSeekRatio(" + ratio + ")",
-                    new ValueCallback<String>() {
-                        @Override
-                        public void onReceiveValue(String value) {
-                            String txt = value == null ? "" : value.trim();
-                            if (txt.length() >= 2 && txt.startsWith("\"") && txt.endsWith("\"")) {
-                                txt = txt.substring(1, txt.length() - 1).replace("\\\"", "\"");
-                            }
-                            if (txt.length() == 0 || "null".equals(txt) || fullscreenHud == null) {
-                                hideFullscreenHud();
-                                return;
-                            }
-                            fullscreenHud.setText(txt);
-                            fullscreenHud.setVisibility(View.VISIBLE);
-                            final int seq = ++hudSeq;
-                            fullscreenHud.postDelayed(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if (seq == hudSeq) hideFullscreenHud();
-                                }
-                            }, 1200);
-                        }
-                    });
+            callGestureJs(seekAxis == 1 && w > 0 ? dx / w : 0f,
+                    seekAxis == 2 && h > 0 ? dy / h : 0f, true);
+        }
+    }
+
+    /** 横向比例给快进、纵向比例给音量；公式只在前端定义一份 */
+    private void callGestureJs(float xr, float yr, boolean commit) {
+        web.evaluateJavascript(
+                "window.__albumVideoGestureUpdate && window.__albumVideoGestureUpdate("
+                        + xr + "," + yr + "," + (commit ? "true" : "false") + ")",
+                new ValueCallback<String>() {
+                    @Override public void onReceiveValue(String value) {
+                        applyFullscreenHudText(value, commit);
+                    }
+                });
+    }
+
+    /** MOVE 阶段实时更新秒数/音量，UP 阶段显示最终结果并延时收起 */
+    private void applyFullscreenHudText(String value, boolean commit) {
+        String txt = value == null ? "" : value.trim();
+        if (txt.length() >= 2 && txt.startsWith("\"") && txt.endsWith("\"")) {
+            txt = txt.substring(1, txt.length() - 1).replace("\\\"", "\"");
+        }
+        if (txt.length() == 0 || "null".equals(txt) || fullscreenHud == null) {
+            if (commit) hideFullscreenHud();
+            return;
+        }
+        fullscreenHud.setText(txt);
+        fullscreenHud.setVisibility(View.VISIBLE);
+        if (commit) {
+            final int seq = ++hudSeq;
+            fullscreenHud.postDelayed(new Runnable() {
+                @Override public void run() {
+                    if (seq == hudSeq) hideFullscreenHud();
+                }
+            }, 1200);
         }
     }
 
@@ -429,6 +458,7 @@ public class MainActivity extends Activity {
 
     private void cancelFullscreenSeek() {
         seekTracking = false;
+        seekAxis = 0;
         hideFullscreenHud();
     }
 
