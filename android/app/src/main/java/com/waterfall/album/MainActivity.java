@@ -15,6 +15,7 @@ import android.os.Bundle;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
@@ -56,6 +57,9 @@ import android.widget.Toast;
  *      WebView 会把视频 View 交给宿主，挂到一个全屏黑色容器里。
  *      全程不调用 setRequestedOrientation，横竖屏跟随设备与系统方向设置；
  *      manifest 的 configChanges 保证旋转时不重建 Activity、播放不中断
+ *   7. 视频横滑快进/后退：内联播放由网页端处理；进原生全屏后 WebView 收不到
+ *      触摸事件，改由 dispatchTouchEvent 只观察不拦截，把滑动比例回传给网页
+ *      的 __albumVideoSeekRatio，两边共用同一套位移→秒数公式，手感一致
  *
  * 不申请存储/定位/通讯录权限，不加载任何第三方 SDK。
  */
@@ -108,6 +112,14 @@ public class MainActivity extends Activity {
     private View customVideoView;
     private WebChromeClient.CustomViewCallback customViewCallback;
     private int savedSystemUiVisibility = 0;
+
+    /** 原生视频全屏下的横滑快进/后退：WebView 收不到触摸，只能由 Activity 观察 */
+    private TextView fullscreenHud;
+    private float seekDownX = 0f;
+    private float seekDownY = 0f;
+    private boolean seekTracking = false;
+    /** 作废上一次全屏遗留的 HUD 定时回调，别让它把新一次全屏的提示提前隐藏 */
+    private int hudSeq = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -309,6 +321,17 @@ public class MainActivity extends Activity {
         rootLayout.addView(fullscreenContainer, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
+        // 快进/后退提示叠在视频之上：后 addView 的 View 在 z 序最上层
+        fullscreenHud = new TextView(this);
+        fullscreenHud.setTextColor(Color.WHITE);
+        fullscreenHud.setTextSize(19f);
+        fullscreenHud.setGravity(Gravity.CENTER);
+        fullscreenHud.setBackgroundColor(Color.parseColor("#CC0E1014"));
+        fullscreenHud.setPadding(dp(22), dp(14), dp(22), dp(14));
+        fullscreenHud.setVisibility(View.GONE);
+        fullscreenContainer.addView(fullscreenHud, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
         hideSystemBars();
         setVideoFullscreenFlag(true);
     }
@@ -322,10 +345,91 @@ public class MainActivity extends Activity {
             rootLayout.removeView(fullscreenContainer);
             fullscreenContainer = null;
         }
+        fullscreenHud = null;
+        seekTracking = false;
+        hudSeq++;
         WebChromeClient.CustomViewCallback cb = customViewCallback;
         customVideoView = null;
         customViewCallback = null;
         if (cb != null) cb.onCustomViewHidden();
+    }
+
+    /**
+     * 只观察、不拦截：事件仍完整交给 super 分发，原生视频控制条和暂停/播放
+     * 都不受影响。全屏时把横滑比例回传给网页，由网页对 &lt;video&gt; 做 seek。
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (customVideoView != null) trackFullscreenSeek(ev);
+        return super.dispatchTouchEvent(ev);
+    }
+
+    private void trackFullscreenSeek(MotionEvent ev) {
+        if (fullscreenContainer == null || fullscreenHud == null || web == null) return;
+        int action = ev.getActionMasked();
+        int w = fullscreenContainer.getWidth();
+        int h = fullscreenContainer.getHeight();
+        if (action == MotionEvent.ACTION_DOWN) {
+            // 底部留给原生控制条的进度条，避免一次滑动触发两次 seek
+            seekTracking = ev.getPointerCount() == 1 && ev.getY() < h * 0.82f;
+            if (!seekTracking) return;
+            seekDownX = ev.getX();
+            seekDownY = ev.getY();
+        } else if (action == MotionEvent.ACTION_MOVE) {
+            if (!seekTracking) return;
+            if (ev.getPointerCount() != 1) { cancelFullscreenSeek(); return; }
+            float dx = ev.getX() - seekDownX;
+            float dy = ev.getY() - seekDownY;
+            if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.2f) {
+                fullscreenHud.setText(dx > 0 ? "» 快进" : "« 后退");
+                fullscreenHud.setVisibility(View.VISIBLE);
+            } else {
+                hideFullscreenHud();
+            }
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            if (!seekTracking) return;
+            // 用抬手时的最终坐标，不能用中途某次 MOVE 的 x：滑出去又滑回来不该快进
+            float dx = ev.getX() - seekDownX;
+            float dy = ev.getY() - seekDownY;
+            boolean valid = action == MotionEvent.ACTION_UP && w > 0
+                    && Math.abs(dx) > 24 && Math.abs(dx) > Math.abs(dy) * 1.2f;
+            seekTracking = false;
+            if (!valid) { hideFullscreenHud(); return; }
+            float ratio = dx / w;
+            web.evaluateJavascript(
+                    "window.__albumVideoSeekRatio && window.__albumVideoSeekRatio(" + ratio + ")",
+                    new ValueCallback<String>() {
+                        @Override
+                        public void onReceiveValue(String value) {
+                            String txt = value == null ? "" : value.trim();
+                            if (txt.length() >= 2 && txt.startsWith("\"") && txt.endsWith("\"")) {
+                                txt = txt.substring(1, txt.length() - 1).replace("\\\"", "\"");
+                            }
+                            if (txt.length() == 0 || "null".equals(txt) || fullscreenHud == null) {
+                                hideFullscreenHud();
+                                return;
+                            }
+                            fullscreenHud.setText(txt);
+                            fullscreenHud.setVisibility(View.VISIBLE);
+                            final int seq = ++hudSeq;
+                            fullscreenHud.postDelayed(new Runnable() {
+                                @Override
+                                public void run() {
+                                    if (seq == hudSeq) hideFullscreenHud();
+                                }
+                            }, 1200);
+                        }
+                    });
+        }
+    }
+
+    private void hideFullscreenHud() {
+        if (fullscreenHud != null) fullscreenHud.setVisibility(View.GONE);
+    }
+
+    private void cancelFullscreenSeek() {
+        seekTracking = false;
+        hideFullscreenHud();
     }
 
     /** 告诉网页「现在是原生视频全屏」，避免全屏事件把幻灯片误关掉。 */

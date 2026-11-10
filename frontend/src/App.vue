@@ -190,7 +190,9 @@
         <button class="arrow-btn arrow-right" @click.stop="nextMedia" :disabled="previewCurrentIndex >= previewMediaList.length - 1">›</button>
         <div class="preview-image-area"
              @touchstart="onTouchStart"
-             @touchend="onTouchEnd">
+             @touchmove="onTouchMove"
+             @touchend="onTouchEnd"
+             @touchcancel="onTouchCancel">
           <img
             v-if="previewItem.type === 'image'"
             ref="previewMediaRef"
@@ -417,14 +419,22 @@
     <div v-if="slideShow" class="slide-root">
       <div class="slide-content"
            @touchstart="onTouchStart"
-           @touchend="onTouchEnd">
+           @touchmove="onTouchMove"
+           @touchend="onTouchEnd"
+           @touchcancel="onTouchCancel">
         <img v-if="currentSlide.type==='image'" :src="getSrcUrl(currentSlide.path)" alt="" />
-        <video v-else controls autoplay muted playsinline :src="getSrcUrl(currentSlide.path)"></video>
+        <video v-else ref="slideVideoRef" controls autoplay muted playsinline :src="getSrcUrl(currentSlide.path)"></video>
         <div class="slide-name">{{ currentSlide.name }}</div>
         <button class="slide-exit-btn" @click="exitSlide">退出全屏</button>
         <button class="slide-prev-btn" @click="slidePrev">‹</button>
         <button class="slide-next-btn" @click="slideNext">›</button>
       </div>
+    </div>
+
+    <!-- 视频横滑快进/后退：拖动时预览目标时间，松手才真正 seek -->
+    <div v-if="seekHud.show && !isTvMode" class="seek-hud">
+      <div class="seek-delta">{{ seekHud.deltaText }}</div>
+      <div class="seek-time">{{ formatTime(seekHud.target) }} / {{ formatTime(seekHud.duration) }}</div>
     </div>
   </div>
 </template>
@@ -801,6 +811,7 @@ const imgRotateStyle = computed(() => ({
 // 预览关闭按钮跟随图片实际显示区域的右上角；未测量到时回退到容器右上角（CSS 默认）
 const previewBoxRef = ref(null)
 const previewMediaRef = ref(null)
+const slideVideoRef = ref(null)
 const closeBtnRef = ref(null)
 const closeBtnStyle = ref({})
 
@@ -1181,30 +1192,176 @@ function nextMedia() {
   }
 }
 
-// ========= 移动端滑动切换图片 =========
+// ========= 移动端滑动：图片切张 / 视频快进后退 =========
+// 图片沿用「左滑下一张」。视频改为横拖预览目标时间、松手才 seek，
+// 避免拖动中反复解码卡顿。原生视频全屏时 WebView 收不到触摸事件，
+// 由客户端把滑动比例回传给 window.__albumVideoSeekRatio，两边共用同一套公式。
+const SEEK_MAX_SPAN = 300      // 一整屏最多跳 5 分钟，长视频不会一滑半小时
+const SEEK_MIN_DX = 12         // 小于这个位移当成点击，不接管
 let touchStartX = 0
 let touchStartY = 0
+/** 本次手势是否从有效的单指触摸开始：多指/触摸取消都不该再触发切图或 seek */
+let touchTracking = false
+/** 兜底：touchend 的 preventDefault 万一没拦住合成 click，短时间内忽略点空白退出 */
+let suppressPreviewClickUntil = 0
+let seekVideoEl = null
+let seekBaseTime = 0
+let seekDuration = 0
+let seekActive = false
+let seekHudTimer = null
+const seekHud = ref({ show: false, deltaText: '', target: 0, duration: 0 })
+
+function formatTime(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const ss = String(s % 60).padStart(2, '0')
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`
+}
+
+function getActiveVideo() {
+  const v = slideShow.value ? slideVideoRef.value : previewMediaRef.value
+  return v && v.tagName === 'VIDEO' ? v : null
+}
+
+function videoDuration(v) {
+  const d = v ? v.duration : NaN
+  return Number.isFinite(d) && d > 0 ? d : 0
+}
+
+/** 位移比例 → 秒。公式只在这里定义，前端手势与原生全屏共用，避免手感漂移 */
+function ratioToSeconds(ratio, dur) {
+  return ratio * Math.min(dur, SEEK_MAX_SPAN)
+}
+
+function clampSeekTime(base, delta, dur) {
+  return Math.min(Math.max(0, base + delta), Math.max(0, dur - 0.1))
+}
+
+function seekVideoBy(delta, v = getActiveVideo(), base = null) {
+  const dur = videoDuration(v)
+  if (!v || !dur) return null
+  const before = v.currentTime || 0
+  // 内联手势传按下时的时间：拖动期间视频还在播放，若用当前 currentTime，
+  // 松手落点会比 HUD 预览的目标时间多出这几秒。原生全屏不传 base，用当前值
+  const from = base === null ? before : base
+  const target = clampSeekTime(from, delta, dur)
+  try { v.currentTime = target } catch (e) { return null }
+  return { delta: target - from, target, duration: dur }
+}
+
+function showSeekHud(info) {
+  if (!info) return
+  seekHud.value = {
+    show: true,
+    deltaText: (info.delta >= 0 ? '+' : '−') + Math.round(Math.abs(info.delta)) + 's',
+    target: info.target,
+    duration: info.duration
+  }
+  clearTimeout(seekHudTimer)
+  seekHudTimer = setTimeout(hideSeekHud, 1500)
+}
+
+function hideSeekHud() {
+  clearTimeout(seekHudTimer)
+  seekHudTimer = null
+  seekHud.value.show = false
+}
+
+function resetSeekGesture() {
+  seekVideoEl = null
+  seekActive = false
+  seekDuration = 0
+  seekBaseTime = 0
+}
+
+/** 原生视频全屏时由客户端回传滑动比例，返回给 HUD 展示的文本 */
+function seekByRatioFromNative(ratio) {
+  const v = getActiveVideo()
+  const dur = videoDuration(v)
+  if (!v || !dur || !Number.isFinite(ratio)) return ''
+  const info = seekVideoBy(ratioToSeconds(ratio, dur), v)
+  if (!info) return ''
+  return (info.delta >= 0 ? '+' : '−') + Math.round(Math.abs(info.delta))
+    + 's   ' + formatTime(info.target) + ' / ' + formatTime(info.duration)
+}
 
 function onTouchStart(e) {
-  if (e.touches.length === 1) {
-    touchStartX = e.touches[0].clientX
-    touchStartY = e.touches[0].clientY
-  }
+  resetSeekGesture()
+  touchTracking = !isTvMode && e.touches.length === 1
+  if (!touchTracking) { hideSeekHud(); return }
+  touchStartX = e.touches[0].clientX
+  touchStartY = e.touches[0].clientY
+  const v = getActiveVideo()
+  const dur = videoDuration(v)
+  if (!v || !dur) return
+  // 底部留给原生控制条的进度条拖动，别和它抢手势
+  const r = v.getBoundingClientRect()
+  if (r.height && touchStartY > r.bottom - Math.max(56, r.height * 0.15)) return
+  seekVideoEl = v
+  seekDuration = dur
+  seekBaseTime = v.currentTime || 0
 }
+
+function onTouchMove(e) {
+  if (!touchTracking) return
+  // 中途按下第二根手指（缩放等）直接作废本次手势，否则抬手时会误切图/误快进
+  if (e.touches.length !== 1) { onTouchCancel(); return }
+  if (!seekVideoEl) return
+  const dx = e.touches[0].clientX - touchStartX
+  const dy = e.touches[0].clientY - touchStartY
+  if (Math.abs(dx) < SEEK_MIN_DX || Math.abs(dx) <= Math.abs(dy) * 1.2) {
+    // 滑出去又滑回来时别把上一次的预览时间留在屏幕上
+    if (seekActive) hideSeekHud()
+    return
+  }
+  // 确认是横向拖动后才阻止默认行为：不影响单击显示控制条、纵向滚动
+  if (e.cancelable) e.preventDefault()
+  seekActive = true
+  const ratio = dx / (window.innerWidth || 1)
+  const target = clampSeekTime(seekBaseTime, ratioToSeconds(ratio, seekDuration), seekDuration)
+  showSeekHud({ delta: target - seekBaseTime, target, duration: seekDuration })
+}
+
+function onTouchCancel() {
+  touchTracking = false
+  resetSeekGesture()
+  hideSeekHud()
+}
+
 function onTouchEnd(e) {
-  if (e.changedTouches.length !== 1) return
+  if (!touchTracking || e.changedTouches.length !== 1) { onTouchCancel(); return }
+  touchTracking = false
   const dx = e.changedTouches[0].clientX - touchStartX
   const dy = e.changedTouches[0].clientY - touchStartY
-  // 水平滑动为主，且位移超过阈值
+  if (seekActive) {
+    // 阻止合成 click，否则 .preview-box 会把它当成「点空白退出预览」
+    if (e.cancelable) e.preventDefault()
+    suppressPreviewClickUntil = Date.now() + 400
+    if (Math.abs(dx) >= SEEK_MIN_DX && Math.abs(dx) > Math.abs(dy) * 1.2) {
+      const ratio = dx / (window.innerWidth || 1)
+      const info = seekVideoBy(ratioToSeconds(ratio, seekDuration), seekVideoEl, seekBaseTime)
+      if (info) showSeekHud(info)
+      else hideSeekHud()
+    } else {
+      hideSeekHud()
+    }
+    resetSeekGesture()
+    return
+  }
+  resetSeekGesture()
+  // 图片：水平滑动切上一张/下一张。只在真的切了张时才拦合成 click
+  // （原来没拦，切完可能顺带把预览关掉）。视频若时长未知、或手指落在
+  // 底部控制条上，这里必须放行，否则拖不动原生进度条、点不亮控制条
   if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
-    if (slideShow.value) {
-      // 幻灯片：仅图片滑动，视频保留进度条拖动
-      if (currentSlide.value.type === 'image') {
-        dx < 0 ? slideNext() : slidePrev()
-      }
-    } else if (previewItem.value && previewItem.value.type === 'image') {
-      // 预览弹窗：仅图片滑动
-      dx < 0 ? nextMedia() : prevMedia()
+    const isImage = slideShow.value
+      ? currentSlide.value && currentSlide.value.type === 'image'
+      : previewItem.value && previewItem.value.type === 'image'
+    if (isImage) {
+      if (e.cancelable) e.preventDefault()
+      suppressPreviewClickUntil = Date.now() + 400
+      if (slideShow.value) dx < 0 ? slideNext() : slidePrev()
+      else dx < 0 ? nextMedia() : prevMedia()
     }
   }
 }
@@ -1637,6 +1794,9 @@ function slidePrev() {
 
 // 预览：除媒体本身和交互控件外，点击任意空白区域都退出
 function onPreviewBoxClick(e) {
+  // 视频横滑结束后浏览器仍可能合成 click（touchend 的 preventDefault 不是绝对可靠），
+  // 这段时间内忽略「点空白退出」，避免刚快进完预览就被关掉
+  if (Date.now() < suppressPreviewClickUntil) return
   const t = e.target
   if (!t) return
   // 点图片/视频本体（含视频原生控制条）不退出
@@ -1706,6 +1866,8 @@ function resetUiState() {
   // 不再重复实现一遍 exitFullscreen 的前缀判断
   exitSlide()
   stopLoginLock()
+  onTouchCancel()  // 复用：清 touchTracking / seek 状态 / HUD
+  suppressPreviewClickUntil = 0
   loginErr.value = ''
   slideBatchReloading = false
   slideList.value = []
@@ -2147,6 +2309,8 @@ function onFullscreenChange(){
 }
 
 onMounted(() => {
+  // 原生视频全屏时 WebView 收不到触摸事件，客户端会回调这个接口
+  window.__albumVideoSeekRatio = seekByRatioFromNative
   installTvNavigation()
   checkLoginStatus()
   document.addEventListener('keydown', handleKeydown)
@@ -2162,6 +2326,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true
+  clearTimeout(seekHudTimer)
+  delete window.__albumVideoSeekRatio
   if (tvNavHandler) document.removeEventListener('keydown', tvNavHandler, true)
   if (isTvMode) document.documentElement.classList.remove('tv-mode')
   document.removeEventListener('keydown', handleKeydown)
@@ -3232,6 +3398,35 @@ input[type="checkbox"] {
 .tv-mode .slide-exit-btn { padding: 12px 22px; font-size: 17px }
 .tv-mode .slide-name { font-size: 18px }
 .tv-setup-btn { border-color: var(--accent) }
+
+/* ---------- 视频横滑快进 / 后退的进度提示 ---------- */
+.seek-hud {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 99999;
+  pointer-events: none;
+  min-width: 168px;
+  padding: 14px 22px;
+  border-radius: 12px;
+  text-align: center;
+  background: rgba(12, 14, 18, .86);
+  border: 1px solid rgba(255, 255, 255, .12);
+  color: #E9ECF1;
+}
+.seek-hud .seek-delta {
+  font-size: 26px;
+  font-weight: 500;
+  color: #9EB9FF;
+  font-variant-numeric: tabular-nums;
+}
+.seek-hud .seek-time {
+  margin-top: 4px;
+  font-size: 13px;
+  color: #AAB1BD;
+  font-variant-numeric: tabular-nums;
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important }
