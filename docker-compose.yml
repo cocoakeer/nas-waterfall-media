@@ -12,11 +12,14 @@ services:
       CONFIG_PATH: /config
       CACHE_PATH: /cache
       SLIDE_DEFAULT_DELAY: 3
-      # 挂在反向代理后面时才开（会读 X-Forwarded-For；该头客户端可伪造，
-      # 必须先在代理层清洗，否则登录锁定的来源 IP 能被绕过）
-      # TRUST_PROXY_HEADERS: 1
-      # 多台设备共用同一个出口 IP 时，可调高登录失败限速阈值/窗口
-      # LOGIN_IP_FAIL_THRESHOLD: 20
+      # 下面四行写的都是当前默认值：保持注释与不配置完全等价，
+      # 只有要改策略时才取消注释并调整。默认值见 backend/main.py、backend/login_guard.py
+      # 挂在反向代理后面才设为 "1"（会读 X-Forwarded-For；该头客户端可伪造，
+      # 必须先在代理层清洗，否则攻击者能靠换请求头绕过来源 IP 锁定）。默认：关闭
+      # TRUST_PROXY_HEADERS: "0"
+      # IP 维度：600 秒窗口内累计失败 10 次 → 限制 300 秒。
+      # 多台设备共用一个出口 IP 时，可调高阈值
+      # LOGIN_IP_FAIL_THRESHOLD: 10
       # LOGIN_IP_WINDOW_SEC: 600
       # LOGIN_IP_LOCK_SEC: 300
     volumes:

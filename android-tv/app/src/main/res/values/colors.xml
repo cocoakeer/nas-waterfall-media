@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="window_bg">#FF0E1014</color>
+    <!-- mipmap-anydpi-v26/ic_launcher.xml 的自适应图标背景，删了 aapt2 link 会直接失败 -->
+    <color name="launcher_bg">#FF171A21</color>
+</resources>

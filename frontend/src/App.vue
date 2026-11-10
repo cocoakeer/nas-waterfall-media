@@ -88,13 +88,14 @@
         </div>
         <button @click="openSlideSetting" class="btn">幻灯片设置</button>
         <button @click="startRandomSlide" class="btn primary">{{ randomSlideLoading ? (randomSlideHint || '加载中…') + ' · 点此取消' : '随机幻灯片' }}</button>
+        <button v-if="isTvMode" class="btn tv-setup-btn" @click="openTvSetup">服务器地址</button>
       </div>
     </header>
     <div class="breadcrumb">
       <span @click="changeDir('')" class="breadcrumb-item" :class="{current: !breadcrumbList.length}">根目录</span>
       <span v-for="(item, idx) in breadcrumbList" :key="idx">
         <span class="separator">/</span>
-        <span @click="changeDir(item.path)" class="breadcrumb-item" :class="{current: idx === breadcrumbList.length - 1}">{{ item.name }}</span>
+        <span @click="changeDir(item.path)" class="breadcrumb-item" :tabindex="isTvMode ? 0 : undefined" :class="{current: idx === breadcrumbList.length - 1}">{{ item.name }}</span>
       </span>
     </div>
 
@@ -119,6 +120,7 @@
         v-for="item in displayList"
         :key="item.id"
         class="media-card"
+        :tabindex="isTvMode ? 0 : undefined"
         :style="{left: item._left + 'px', top: item._top + 'px'}"
         @click="handleCardClick(item)"
       >
@@ -431,6 +433,9 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 
 const baseUrl = ''
+// TV 客户端的 WebView 在 UA 里加了 WaterfallAlbumTV 标记；
+// 浏览器与手机 App 检测不到，所有 TV 逻辑都不会生效
+const isTvMode = typeof navigator !== 'undefined' && /WaterfallAlbumTV/.test(navigator.userAgent)
 // 初始化加载标记：修复刷新闪现登录页
 const initLoading = ref(true)
 const isLogin = ref(false)
@@ -667,7 +672,10 @@ let lastCardWidth = null
 function getCardLayout(boxWidth) {
   const gap = 12
   let colCount
-  if (boxWidth < 480) {
+  if (isTvMode) {
+    // 10-foot 界面：卡片更大、列数更少，1920 宽的电视约 5 列
+    colCount = Math.max(3, Math.min(6, Math.round((boxWidth + gap) / (360 + gap))))
+  } else if (boxWidth < 480) {
     colCount = 2
   } else if (boxWidth < 768) {
     colCount = 3
@@ -750,6 +758,21 @@ watch(displayList, async ()=>{
   cardHeightCache.clear()
   await nextTick()
   layoutWaterfall()
+  // 电视上没有鼠标，列表出来后必须主动给一张卡片焦点，否则遥控器无从下手。
+  // 焦点已在顶栏输入/按钮或某张卡片上时不动它，避免抢焦点
+  if (isTvMode && !previewShow.value && !slideShow.value && !settingShow.value &&
+      !userManageModal.value && !logModal.value && !changePwdModal.value &&
+      !failedFilesModal.value) {
+    const el = document.activeElement
+    const onCard = el && el.classList && el.classList.contains('media-card')
+    // 弹窗、搜索框、按钮正拿着焦点时不抢；只有焦点落在页面上才给首卡
+    const busy = el && (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(el.tagName)
+      || el.isContentEditable)
+    if (!onCard && !busy) {
+      const first = document.querySelector('.media-card')
+      if (first) first.focus({ preventScroll: true })
+    }
+  }
 })
 
 function onWindowResize(){
@@ -1223,6 +1246,103 @@ function handleKeydown(e) {
       closePreview()
       break
   }
+}
+
+// ========= TV 遥控器导航 =========
+// 瀑布流卡片是绝对定位、行优先排布，浏览器默认的焦点顺序不可靠。
+// 用 getBoundingClientRect 按「方向 + 距离」挑最近的一张卡片，
+// 只有 TV 模式才注册，手机/浏览器的方向键行为完全不变
+let tvNavHandler = null
+
+function installTvNavigation() {
+  if (!isTvMode) return
+  // TV 客户端在页面加载完也会注入一套兜底导航；谁先执行谁装，避免重复监听
+  if (window.__tvNavReady) return
+  window.__tvNavReady = true
+  document.documentElement.classList.add('tv-mode')
+  tvNavHandler = (e) => {
+    // 卡片和面包屑是 div/span + tabindex，浏览器默认 Enter 激活只对 button/a 生效，
+    // 电视遥控器的 OK 键落上去不会触发 click，这里显式补上
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+      const hit = document.activeElement
+      if (hit && hit.classList && (hit.classList.contains('media-card') ||
+          hit.classList.contains('breadcrumb-item'))) {
+        e.preventDefault()
+        hit.click()
+      }
+      return
+    }
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return
+    // 预览 / 幻灯片 / 弹窗里方向键另有用途（切图等），不接管
+    if (previewShow.value || slideShow.value || settingShow.value ||
+        userManageModal.value || logModal.value || changePwdModal.value ||
+        failedFilesModal.value) return
+    const cur = document.activeElement
+    // 搜索框要用左右键移光标、下拉框要用方向键换选项，此时不能把焦点抢到卡片
+    if (cur && (['INPUT', 'SELECT', 'TEXTAREA'].includes(cur.tagName) || cur.isContentEditable)) return
+    const cards = Array.from(document.querySelectorAll('.media-card'))
+    if (!cards.length) return
+    // 顶栏按钮与面包屑：左右在这些控件之间切，下键进卡片区。
+    // 没有这段，遥控器进了瀑布流就再也够不到「随机幻灯片」等顶栏功能
+    const bars = Array.from(document.querySelectorAll('.header-actions button, .breadcrumb-item'))
+    const bi = bars.indexOf(cur)
+    if (bi >= 0) {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        const nb = bars[bi + (e.key === 'ArrowRight' ? 1 : -1)]
+        if (nb) { nb.focus({ preventScroll: true }); e.preventDefault() }
+      } else if (e.key === 'ArrowDown') {
+        cards[0].focus({ preventScroll: true })
+        cards[0].scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+        e.preventDefault()
+      }
+      return
+    }
+    const idx = cards.indexOf(cur)
+    if (idx < 0) {
+      cards[0].focus({ preventScroll: true })
+      cards[0].scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+      e.preventDefault()
+      return
+    }
+    const r = cards[idx].getBoundingClientRect()
+    const cx = r.left + r.width / 2
+    const cy = r.top + r.height / 2
+    let best = -1
+    let bestScore = Infinity
+    cards.forEach((c, i) => {
+      if (i === idx) return
+      const t = c.getBoundingClientRect()
+      const dx = (t.left + t.width / 2) - cx
+      const dy = (t.top + t.height / 2) - cy
+      const horizontal = e.key === 'ArrowLeft' || e.key === 'ArrowRight'
+      const secondary = horizontal ? Math.abs(dy) : Math.abs(dx)
+      let primary = 0
+      if (e.key === 'ArrowRight' && dx > 4) primary = dx
+      else if (e.key === 'ArrowLeft' && dx < -4) primary = -dx
+      else if (e.key === 'ArrowDown' && dy > 4) primary = dy
+      else if (e.key === 'ArrowUp' && dy < -4) primary = -dy
+      else return
+      const score = primary + secondary * 2
+      if (score < bestScore) { bestScore = score; best = i }
+    })
+    if (best >= 0) {
+      cards[best].focus({ preventScroll: true })
+      cards[best].scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' })
+      e.preventDefault()
+    } else if (e.key === 'ArrowUp' && bars.length) {
+      // 第一排再往上把焦点交还顶栏按钮（而不是面包屑当前项），形成上下闭环
+      const headBtns = document.querySelectorAll('.header-actions button')
+      const target = headBtns.length ? headBtns[headBtns.length - 1] : bars[bars.length - 1]
+      target.focus({ preventScroll: true })
+      e.preventDefault()
+    }
+  }
+  document.addEventListener('keydown', tvNavHandler, true)
+}
+
+function openTvSetup() {
+  // TV 客户端在 shouldOverrideUrlLoading 里拦截这个自定义 scheme
+  window.location.href = 'waterfall-tv://setup'
 }
 
 async function loadSlideSettings() {
@@ -2007,6 +2127,10 @@ function onClickOutsideDrop(e){
 }
 
 function onFullscreenChange(){
+  // APK 接管 HTML5 视频原生全屏时（onShowCustomView），文档全屏可能同时退出、
+  // fullscreenElement 变成 null；此时别把正在播放的幻灯片误关掉。
+  // 浏览器里没有这个变量，undefined 为假，行为不变
+  if (window.__albumVideoFullscreen) return
   const el = currentFullscreenElement()
   if (el === document.documentElement) {
     // 整个页面进了全屏，说明是我们（或用户）要的幻灯片全屏
@@ -2023,6 +2147,7 @@ function onFullscreenChange(){
 }
 
 onMounted(() => {
+  installTvNavigation()
   checkLoginStatus()
   document.addEventListener('keydown', handleKeydown)
   window.addEventListener('resize', onWindowResize)
@@ -2037,6 +2162,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true
+  if (tvNavHandler) document.removeEventListener('keydown', tvNavHandler, true)
+  if (isTvMode) document.documentElement.classList.remove('tv-mode')
   document.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('popstate', onPopState)
@@ -3063,6 +3190,49 @@ input[type="checkbox"] {
   .slide-exit-btn { padding: 6px 10px; font-size: 11px }
   .slide-name { bottom: max(6px, env(safe-area-inset-bottom)); font-size: 11px }
 }
+/* ---------- TV：遥控器 / 10-foot 界面 ----------
+   html.tv-mode 由 TV 客户端判定 UA 后加上，浏览器与手机端不受影响 */
+/* tv-mode 挂在 <html> 上；scoped 样式必须让最后一个选择器落在组件内元素，
+   写成单独的 .tv-mode 会被编译成 .tv-mode[data-v-xxx] 而永远匹配不到 */
+.tv-mode .app-container { font-size: 18px }
+.tv-mode .header { padding: 18px 36px; gap: 16px }
+.tv-mode .app-title { font-size: 26px }
+.tv-mode .header-actions { gap: 14px }
+.tv-mode .search-box input { width: 280px; font-size: 18px; padding: 12px 34px 12px 42px }
+.tv-mode .search-icon { width: 18px; height: 18px; left: 14px }
+.tv-mode .sort-select { font-size: 18px; padding: 12px 34px 12px 16px }
+.tv-mode .btn { font-size: 18px; padding: 12px 22px }
+.tv-mode .breadcrumb { font-size: 18px; padding: 18px 36px 6px }
+.tv-mode .breadcrumb-item { padding: 8px 14px }
+.tv-mode .waterfall-wrap { width: calc(100% - 72px); margin: 20px 36px 40px }
+.tv-mode .card-name { font-size: 17px; padding: 12px 14px }
+.tv-mode .card-badge { font-size: 14px; padding: 6px 12px }
+.tv-mode .card-overlay-name { font-size: 16px }
+.tv-mode .media-card:focus,
+.tv-mode .media-card:focus-visible {
+  outline: 4px solid var(--accent);
+  outline-offset: 3px;
+  z-index: 20;
+  transform: translateY(-4px) scale(1.03);
+  box-shadow: 0 0 0 6px var(--accent-soft), var(--shadow);
+}
+.tv-mode .btn:focus-visible,
+.tv-mode .breadcrumb-item:focus-visible,
+.tv-mode .sort-select:focus-visible,
+.tv-mode .search-box input:focus-visible {
+  outline: 4px solid var(--accent);
+  outline-offset: 3px;
+}
+.tv-mode .preview-name { font-size: 18px }
+.tv-mode .img-action-bar button { font-size: 17px; padding: 12px 20px }
+.tv-mode .close-btn { width: 52px; height: 52px; font-size: 28px }
+.tv-mode .arrow-btn { width: 64px; height: 64px; font-size: 32px }
+.tv-mode .slide-prev-btn,
+.tv-mode .slide-next-btn { width: 64px; height: 64px; font-size: 34px }
+.tv-mode .slide-exit-btn { padding: 12px 22px; font-size: 17px }
+.tv-mode .slide-name { font-size: 18px }
+.tv-setup-btn { border-color: var(--accent) }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important }
 }

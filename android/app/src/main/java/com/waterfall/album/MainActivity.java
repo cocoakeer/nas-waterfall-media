@@ -5,6 +5,7 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -16,6 +17,8 @@ import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.webkit.CookieManager;
 import android.webkit.PermissionRequest;
 import android.webkit.SslErrorHandler;
@@ -49,6 +52,10 @@ import android.widget.Toast;
  *   5. 返回键交给网页 history（与浏览器里「后退只关预览」一致）。
  *      幻灯片界面没有自己的历史记录，此时按返回键会触发目录级 popstate，
  *      不会直接关掉幻灯片；退出请用界面上的「退出全屏」按钮
+ *   6. HTML5 视频全屏由 onShowCustomView / onHideCustomView 接管：
+ *      WebView 会把视频 View 交给宿主，挂到一个全屏黑色容器里。
+ *      全程不调用 setRequestedOrientation，横竖屏跟随设备与系统方向设置；
+ *      manifest 的 configChanges 保证旋转时不重建 Activity、播放不中断
  *
  * 不申请存储/定位/通讯录权限，不加载任何第三方 SDK。
  */
@@ -95,6 +102,13 @@ public class MainActivity extends Activity {
      */
     private int loadSeq = 0;
 
+    /** HTML5 <video> 原生全屏：WebView 把视频 View 交给宿主后的挂载点 */
+    private FrameLayout rootLayout;
+    private FrameLayout fullscreenContainer;
+    private View customVideoView;
+    private WebChromeClient.CustomViewCallback customViewCallback;
+    private int savedSystemUiVisibility = 0;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -115,6 +129,7 @@ public class MainActivity extends Activity {
 
     private void buildUi() {
         FrameLayout root = new FrameLayout(this);
+        rootLayout = root;
         root.setBackgroundColor(Color.parseColor("#0E1014"));
 
         web = new WebView(this);
@@ -243,7 +258,113 @@ public class MainActivity extends Activity {
                 // 相册用不到摄像头/麦克风，一律拒绝，不弹系统权限框
                 request.deny();
             }
+
+            @Override
+            public void onShowCustomView(View videoView,
+                                         WebChromeClient.CustomViewCallback callback) {
+                enterVideoFullscreen(videoView, callback);
+            }
+
+            @Override
+            public void onShowCustomView(View videoView, int requestedOrientation,
+                                         WebChromeClient.CustomViewCallback callback) {
+                // 页面常常在这里请求横屏，故意忽略：方向完全跟随设备/系统设置，
+                // 不调用 setRequestedOrientation，横屏竖屏都能全屏播放
+                enterVideoFullscreen(videoView, callback);
+            }
+
+            @Override
+            public void onHideCustomView() {
+                exitVideoFullscreen();
+            }
         });
+    }
+
+    /**
+     * 把 WebView 交出来的视频 View 挂成全屏。容器是 MATCH_PARENT 的黑色层，
+     * 旋转时系统自动重新测量，不需要重建 Activity 也不需要手动改方向。
+     * 不隐藏 WebView 本身，避免打断仍在进行的媒体播放。
+     */
+    private void enterVideoFullscreen(View videoView,
+                                      WebChromeClient.CustomViewCallback callback) {
+        if (customVideoView != null || videoView == null || rootLayout == null) {
+            if (callback != null) callback.onCustomViewHidden();
+            return;
+        }
+        customVideoView = videoView;
+        customViewCallback = callback;
+
+        fullscreenContainer = new FrameLayout(this);
+        fullscreenContainer.setBackgroundColor(Color.BLACK);
+        // 部分厂商的 WebView 交出来的视频 View 还挂在原父容器上，
+        // 直接 addView 会抛 IllegalStateException，必须先摘干净
+        if (videoView.getParent() instanceof ViewGroup) {
+            ((ViewGroup) videoView.getParent()).removeView(videoView);
+        }
+        // 拦住触摸，别让全屏容器空白处穿透到下面的网页
+        fullscreenContainer.setClickable(true);
+        fullscreenContainer.addView(videoView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+        rootLayout.addView(fullscreenContainer, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        hideSystemBars();
+        setVideoFullscreenFlag(true);
+    }
+
+    private void exitVideoFullscreen() {
+        if (customVideoView == null) return;
+        setVideoFullscreenFlag(false);
+        restoreSystemBars();
+        if (fullscreenContainer != null) {
+            fullscreenContainer.removeView(customVideoView);
+            rootLayout.removeView(fullscreenContainer);
+            fullscreenContainer = null;
+        }
+        WebChromeClient.CustomViewCallback cb = customViewCallback;
+        customVideoView = null;
+        customViewCallback = null;
+        if (cb != null) cb.onCustomViewHidden();
+    }
+
+    /** 告诉网页「现在是原生视频全屏」，避免全屏事件把幻灯片误关掉。 */
+    private void setVideoFullscreenFlag(boolean on) {
+        if (web == null) return;
+        web.evaluateJavascript(
+                "window.__albumVideoFullscreen=" + (on ? "true" : "false") + ";", null);
+    }
+
+    private void hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController c = getWindow().getInsetsController();
+            if (c != null) {
+                // 只做 hide/show，不改 systemBarsBehavior：
+                // 行为标志是全局的，退出全屏后残留会改变整个 App 的手势
+                c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+            }
+        } else {
+            View decor = getWindow().getDecorView();
+            savedSystemUiVisibility = decor.getSystemUiVisibility();
+            decor.setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        }
+    }
+
+    private void restoreSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController c = getWindow().getInsetsController();
+            if (c != null) {
+                c.show(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+            }
+        } else {
+            getWindow().getDecorView().setSystemUiVisibility(savedSystemUiVisibility);
+        }
     }
 
     /**
@@ -536,6 +657,11 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        // 原生视频全屏时先退出全屏，不要走网页后退，更不要弹出「再按一次退出」
+        if (customVideoView != null) {
+            exitVideoFullscreen();
+            return;
+        }
         // 状态页盖着的时候别把返回键喂给看不见的网页，直接走「再按一次退出」
         if (statusPanel == null || statusPanel.getVisibility() != View.VISIBLE) {
             // 网页端用 history.pushState 管理预览，goBack() 会触发 popstate 关掉预览，
@@ -555,6 +681,16 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // manifest 里声明了 configChanges，旋转不重建 Activity；
+        // 全屏视频容器主动请求一次重新测量，横竖屏切换后立刻铺满新尺寸
+        if (fullscreenContainer != null) fullscreenContainer.requestLayout();
+        // 配置变化会把状态栏重新显示出来，仍在视频全屏就再收一次
+        if (customVideoView != null) hideSystemBars();
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         if (web != null) web.onPause();
@@ -564,10 +700,14 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (web != null) web.onResume();
+        // 从后台切回来时系统可能把状态栏还回来了，仍在视频全屏就再收一次
+        if (customVideoView != null) hideSystemBars();
     }
 
     @Override
     protected void onDestroy() {
+        // 全屏中直接退出 Activity 时也要归还视频 View 并回调，避免媒体资源泄漏
+        if (customVideoView != null) exitVideoFullscreen();
         if (web != null) web.destroy();
         super.onDestroy();
     }

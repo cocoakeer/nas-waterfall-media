@@ -129,15 +129,18 @@ def load_guard():
         print(f"[LOGIN] 锁定状态读取失败（{exc}），本次从空状态开始")
 
 
-def _evict_oldest(mapping):
-    """状态表到上限时淘汰最老的一条。
+def _evict_oldest(mapping, now):
+    """状态表到上限时淘汰一条，优先淘汰没在锁定中的记录。
 
     load_guard() 载入时会截断，但运行时同样要限规模：开了 TRUST_PROXY_HEADERS
     又没在代理层清洗 X-Forwarded-For 时，伪造来源可以把状态文件越写越大。
+    不能单纯按「最老」淘汰，否则伪造来源会把正在生效的锁挤掉，等于自己解锁。
     """
     if not mapping:
         return
-    oldest = min(mapping, key=lambda k: mapping[k].get("window_start", 0))
+    unlocked = [k for k, v in mapping.items() if v.get("until", 0) <= now]
+    pool = unlocked if unlocked else list(mapping)
+    oldest = min(pool, key=lambda k: mapping[k].get("window_start", 0))
     mapping.pop(oldest, None)
 
 
@@ -196,7 +199,7 @@ def record_failure(username: str, ip: str):
         iprec = _ips.get(ip)
         if iprec is None:
             if len(_ips) >= _MAX_RECORDS:
-                _evict_oldest(_ips)
+                _evict_oldest(_ips, now)
             iprec = {"fails": 0, "until": 0.0, "window_start": now}
             _ips[ip] = iprec
         # 时钟回拨时 now < window_start，负数差值会让累计次数永远挂在旧窗口里
@@ -222,7 +225,7 @@ def record_failure(username: str, ip: str):
         arec = _accounts.get(key)
         if arec is None:
             if len(_accounts) >= _MAX_RECORDS:
-                _evict_oldest(_accounts)
+                _evict_oldest(_accounts, now)
             arec = {"username": username, "ip": ip, "fails": 0, "until": 0.0}
             _accounts[key] = arec
         arec["fails"] += 1

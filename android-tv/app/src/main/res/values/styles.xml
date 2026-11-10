@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 电视用全屏无 ActionBar 主题，界面全部交给 WebView；
+         不依赖 AndroidX Leanback，保持无 Gradle 的 aapt2/javac/d8 构建链路 -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_bg</item>
+        <item name="android:statusBarColor">@color/window_bg</item>
+        <item name="android:navigationBarColor">@color/window_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
