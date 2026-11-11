@@ -239,6 +239,9 @@
             </template>
           </p>
         </div>
+        <!-- 全屏元素换成 .preview-box 后，只有它子树里的 DOM 才会被渲染。
+             提示层必须放一份在这里，全屏时的快进/音量/播放提示才看得见 -->
+        <div v-if="seekHud.show" class="seek-hud">{{ seekHud.deltaText }}</div>
       </div>
     </div>
     <!-- 幻灯片设置弹窗 -->
@@ -450,9 +453,9 @@
       </div>
     </div>
 
-    <!-- 视频操作提示：横滑快进、键盘快进、音量、播放/暂停共用这一块。
-         fixed + 极高的 z-index，预览、幻灯片、列表页都盖得住 -->
-    <div v-if="seekHud.show" class="seek-hud">{{ seekHud.deltaText }}</div>
+    <!-- 幻灯片 / 列表页那份提示。预览打开时由 .preview-box 内那份负责，
+         两者互斥，不会同时出现两个（fixed + 极高 z-index 保证盖得住） -->
+    <div v-if="seekHud.show && !previewShow" class="seek-hud">{{ seekHud.deltaText }}</div>
   </div>
 </template>
 
@@ -1196,6 +1199,7 @@ function handleCardClick(item) {
     previewMediaList.value = displayList.value.filter(x => x.type !== 'folder')
     previewCurrentIndex.value = previewMediaList.value.findIndex(x => x.id === item.id)
     muteVideoPlaybackHint()   // 打开预览时的自动播放不弹「播放」
+    resetSurfaceTap()
     previewItem.value = item
     resetRotate()
     previewShow.value = true
@@ -1206,6 +1210,7 @@ function handleCardClick(item) {
 function prevMedia() {
   if (previewCurrentIndex.value > 0) {
     muteVideoPlaybackHint()   // 换片会连带触发 pause/play，别弹「已暂停」
+    resetSurfaceTap()         // 两段式点击从头算，别把新片的第一下当成第二下
     previewCurrentIndex.value -= 1
     previewItem.value = previewMediaList.value[previewCurrentIndex.value]
     resetRotate()
@@ -1215,6 +1220,7 @@ function prevMedia() {
 function nextMedia() {
   if (previewCurrentIndex.value < previewMediaList.value.length - 1) {
     muteVideoPlaybackHint()   // 同上：换片时的 pause/play 不提示
+    resetSurfaceTap()
     previewCurrentIndex.value += 1
     previewItem.value = previewMediaList.value[previewCurrentIndex.value]
     resetRotate()
@@ -1231,7 +1237,7 @@ function nextMedia() {
 // 长片要跳远就多滑几次，每次松手后从新位置继续
 const SEEK_MAX_SPAN = 120
 const GESTURE_MIN_DIST = 6     // 6px 即触发，小幅滑动也能立刻看到反馈
-const NATIVE_BAR_HEIGHT = 56   // 视频底部留给原生控制条的高度（拖进度条用）
+const NATIVE_BAR_HEIGHT = 36   // 只放行进度条最底下的一条，不占整条控制栏
 const VOL_FULL_SPAN = 0.9      // 纵向滑一屏高度约改 90% 音量，逐像素连续调节
 const KEY_SEEK_STEP = 10       // 键盘左右键每次快进/后退 10 秒
 const KEY_VOLUME_STEP = 0.02   // 键盘上下键每次调 2% 音量
@@ -1372,10 +1378,60 @@ function adjustVideoVolume(delta) {
   showVolumeHud(r.value, r.applied)
 }
 
-/** 点一下画面 → 切播放/暂停。触摸抬起和 click 都会走到这里：
- *  安卓 WebView 里可能只派发触摸、浏览器里两个都来，所以 350ms 内只认一次。
- *  浏览器自己也可能已经切过了，因此延迟 100ms 比一次状态再决定补不补，
- *  否则一次点击会切两下（等于没反应）。 */
+/** 点画面两次：第一次只让原生控制条/进度条出现，第二次才播放/暂停。
+ *  触摸抬起和 click 都可能派发，350ms 内只算一次；100ms 后检查浏览器
+ *  有没有自己动过播放状态：第一次动过就恢复回去，第二次动过就不重复切。 */
+let surfaceTap = { shown: false, until: 0, lastAt: 0 }
+let surfaceTapTimer = null
+
+function handleSurfaceTap(v) {
+  if (!v) return
+  const now = Date.now()
+  if (now - surfaceTap.lastAt < 350) return
+  surfaceTap.lastAt = now
+  const wantToggle = surfaceTap.shown && now <= surfaceTap.until
+  if (wantToggle) {
+    // 第二次点击是明确的暂停/继续，别让第一次点击的 500ms 静音窗口吞掉它的提示
+    videoHintMutedUntil = 0
+  } else {
+    // 第一次点击不暂停：有的浏览器仍会顺手发一个 pause，先压住这段时间，
+    // 否则中间那个播放按钮照样会闪一下
+    muteVideoPlaybackHint()
+  }
+  surfaceTap.shown = !wantToggle
+  surfaceTap.until = now + 3000
+  const before = v.paused
+  clearTimeout(surfaceTapTimer)
+  surfaceTapTimer = setTimeout(() => {
+    surfaceTapTimer = null
+    if (!previewShow.value || getActiveVideo() !== v) return
+    if (wantToggle) {
+      // 原生若已经顺手切过，也要让中间的按钮跟上当前状态（全屏里同样有效）
+      previewPaused.value = v.paused
+      requestVideoToggle(v)   // 第二次：正常切一次
+    } else if (v.paused !== before) {
+      // 第一次：个别浏览器点画面会顺手切播放，恢复它，只保留「出进度条」
+      if (before) { try { v.pause() } catch (err) { /* 忽略 */ } }
+      else { const p = v.play(); if (p && typeof p.catch === 'function') p.catch(() => {}) }
+      muteVideoPlaybackHint()
+    }
+  }, 100)
+}
+
+/** 打开/关闭预览、换片、退出幻灯片时把两段式点击与待定的切换整个归零。
+ *  否则换片后 3 秒内第一次点画面会被当成「第二次点击」直接暂停 */
+function resetSurfaceTap() {
+  clearTimeout(surfaceTapTimer)
+  surfaceTapTimer = null
+  surfaceTap.shown = false
+  surfaceTap.until = 0
+  surfaceTap.lastAt = 0
+  if (toggleRequest) { clearTimeout(toggleRequest.timer); toggleRequest = null }
+}
+
+/** 真正切一次播放/暂停。现在只由 handleSurfaceTap 的「第二次点击」调用，
+ *  触摸抬起与 click 两路的去重已经在那里做完。浏览器自己也可能已经切过了，
+ *  因此延迟 100ms 比一次状态再决定补不补，否则一次点击会切两下（等于没反应）。 */
 let toggleRequest = null   // { v, at, timer }
 
 function requestVideoToggle(v) {
@@ -1414,17 +1470,25 @@ function toggleVideoPlay() {
 let videoPausedHintShown = false
 /** 换片 / 打开预览时浏览器会顺带发 pause+play，这段时间内不弹提示，免得刷屏 */
 let videoHintMutedUntil = 0
+/** 状态更新只挡 seek 引发的那一对 pause→play 连击。窗口必须比提示窗口短：
+ *  否则用户在这半秒里点原生控制条暂停，中间按钮与 TV 键位提示会一直不更新 */
+let videoStateMutedUntil = 0
 
 function muteVideoPlaybackHint() {
-  videoHintMutedUntil = Date.now() + 500
+  const now = Date.now()
+  videoHintMutedUntil = now + 500
+  videoStateMutedUntil = now + 160
   videoPausedHintShown = false
 }
 
 /** <video> 的 play / pause 事件：暂停给提示，恢复播放只在「从暂停里点起来」时提示。
  *  自动播放、切片换源那种 pause→play 连击不该刷屏 */
 function onVideoPlayback(paused, ev) {
-  previewPaused.value = paused
-  if (Date.now() < videoHintMutedUntil) return
+  // 两个窗口分开：状态只挡 160ms 的 seek 连击（不闪按钮），提示挡 500ms（不刷屏）。
+  // 以前共用一个 500ms 窗口，用户在这半秒里点控制条暂停会完全丢状态
+  const now = Date.now()
+  if (now >= videoStateMutedUntil) previewPaused.value = paused
+  if (now < videoHintMutedUntil) return
   // 播到结尾也会派发 pause：这时候说「已暂停」不对，而且紧接着的「播放」也不该弹
   const ended = !!(paused && ev && ev.target && ev.target.ended)
   if (paused) {
@@ -1514,6 +1578,8 @@ function onTouchMove(e) {
   if (!touchTracking) return
   // 中途按下第二根手指（缩放等）直接作废本次手势，否则抬手时会误切图/误快进
   if (e.touches.length !== 1) { onTouchCancel(); return }
+  // 手势进行中：屏蔽 seek 触发的 pause/play 连击，免得中间按钮闪现
+  if (seekVideoEl) muteVideoPlaybackHint()
   // 预览层里拦掉默认行为（纵向滑动绝不能把滚动传到底层页面）；
   // 起点在控制条上的那次手势除外，否则进度条拖不动
   if (!touchNativeBar && e.cancelable) e.preventDefault()
@@ -1554,6 +1620,7 @@ function onTouchEnd(e) {
     // 阻止合成 click，否则 .preview-box 会把它当成「点空白退出预览」
     if (e.cancelable) e.preventDefault()
     suppressPreviewClickUntil = Date.now() + 400
+    muteVideoPlaybackHint()   // 松手后再压 500ms，覆盖 seek 落点时补发的 pause/play
     if (gestureAxis === 'h' && Math.abs(dx) >= GESTURE_MIN_DIST) {
       const ratio = dx / (window.innerWidth || 1)
       const applied = seekVideoBy(ratioToSeconds(ratio, seekDuration), seekVideoEl, seekBaseTime)
@@ -1569,15 +1636,15 @@ function onTouchEnd(e) {
     return
   }
   resetSeekGesture()
-  // 点一下画面（没滑动、也不在原生控制条上）＝ 播放/暂停。
-  // 安卓 WebView 里点视频不一定派发 click，这里也走一遍，两路一起由
-  // requestVideoToggle 去重，保证一次点按只切一次
+  // 点一下画面（没滑动、也不在原生控制条上）＝ 一次点按，交给两段式处理。
+  // 安卓 WebView 里点视频不一定派发 click，这里也走一遍，两路由
+  // handleSurfaceTap 的 350ms 窗口去重，保证一次点按只算一次
   if (!startedInBar && Math.abs(dx) <= GESTURE_MIN_DIST && Math.abs(dy) <= GESTURE_MIN_DIST) {
     const onButton = e.target && typeof e.target.closest === 'function' && e.target.closest('button')
     const tapVideo = previewShow.value && !slideShow.value ? getActiveVideo() : null
     if (!onButton && tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
         && !inNativeBar(startY, tapVideo)) {
-      requestVideoToggle(tapVideo)
+      handleSurfaceTap(tapVideo)
     }
   }
   // 图片：水平滑动切上一张/下一张。只在真的切了张时才拦合成 click
@@ -1614,6 +1681,12 @@ function handleKeydown(e) {
   // 左右键会退回切图逻辑——箭头已隐藏、点空白也不退出，却能莫名切到下个媒体。
   // 时长无效时 seekVideoBy 会静默返回，不会误操作。TV 是遥控器，仍保持左右切媒体
   if (video && !isTvMode) {
+    // 方向键只归视频管：焦点若落在原生控制条的按钮（尤其是全屏）上，
+    // 浏览器默认会把方向键用来在控件之间挪焦点/高亮窗口，先把它清掉
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)
+        && ae && ae !== document.body && typeof ae.blur === 'function') {
+      try { ae.blur() } catch (err) { /* 忽略 */ }
+    }
     switch (e.key) {
       case 'ArrowLeft':  e.preventDefault(); keySeekVideo(-KEY_SEEK_STEP); break
       case 'ArrowRight': e.preventDefault(); keySeekVideo(KEY_SEEK_STEP); break
@@ -2046,6 +2119,7 @@ function exitSlide() {
   // 幻灯片里的视频被卸载时补发的 pause 也要压掉
   onTouchCancel()
   muteVideoPlaybackHint()
+  resetSurfaceTap()
   clearTimeout(slideTimer.value)
   slideShow.value = false
   randomSlideMode.value = false
@@ -2137,13 +2211,13 @@ function onPreviewBoxClick(e) {
   // 这段时间内忽略「点空白退出」，避免刚快进完预览就被关掉
   if (Date.now() < suppressPreviewClickUntil) return
   if (isVideoPreview()) {
-    // 视频预览：点画面就是播放/暂停。底部那一条（原生控制条）和浏览器原生全屏
-    // 里都不接管，否则会和自带按钮互相打架、一次点击切两下
+    // 视频预览：点画面走两段式（先出控制条，再点才切播放）。底部那一条
+    // （原生控制条）和视频本体全屏都不接管，免得和自带按钮互相打架
     const t = e.target
     const v = getActiveVideo()
     if (t && t.tagName === 'VIDEO' && v && !inNativeBar(e.clientY, v)
         && currentFullscreenElement() !== v) {
-      requestVideoToggle(v)
+      handleSurfaceTap(v)
     }
     return
   }
@@ -2158,11 +2232,11 @@ function onPreviewBoxClick(e) {
 
 function closePreview() {
   // 手势状态与 HUD 一起清掉：刚滑完快进就按 Esc/返回时，
-  // 那行「+75 秒」会飘在已关闭的列表上等 1.5 秒才消失。
+  // 那行「+30 秒」会飘在已关闭的列表上等 1.5 秒才消失。
   // 视频被卸载时浏览器还会补一个 pause 事件，也要一并压掉
   onTouchCancel()
   muteVideoPlaybackHint()
-  if (toggleRequest) { clearTimeout(toggleRequest.timer); toggleRequest = null }
+  resetSurfaceTap()
   // 预览层正被放全屏时先退出来，否则关掉预览后可能留一块黑屏
   if (previewBoxRef.value && currentFullscreenElement() === previewBoxRef.value) {
     const exit = document.exitFullscreen || document.webkitExitFullscreen
@@ -2664,12 +2738,36 @@ function onClickOutsideDrop(e){
   }
 }
 
+// 老 WebKit 会同时派发 webkitfullscreenchange 和 fullscreenchange，
+// 同一轮里别重复发起 requestFullscreen；400ms 后自动允许重试（失败时可恢复）
+let fullscreenSwapAt = 0
+
 function onFullscreenChange(){
   // APK 接管 HTML5 视频原生全屏时（onShowCustomView），文档全屏可能同时退出、
   // fullscreenElement 变成 null；此时别把正在播放的幻灯片误关掉。
   // 浏览器里没有这个变量，undefined 为假，行为不变
   if (window.__albumVideoFullscreen) return
   const el = currentFullscreenElement()
+  // 浏览器把 <video> 本体送进全屏时，页面里的提示、中间的暂停按钮都不渲染，
+  // 方向键也会被原生控制条吞掉。趁文档仍在全屏态，把全屏元素换成整个预览层
+  // （规范允许在全屏状态下切换元素，不需要再要一次用户手势）。
+  // 这样「音量图标旁边的全屏按钮」照旧能用，进全屏后画面还是我们的 DOM
+  const v = previewMediaRef.value
+  const box = previewBoxRef.value
+  if (previewShow.value && el && el === v && box && el !== box
+      && Date.now() - fullscreenSwapAt > 400) {
+    fullscreenSwapAt = Date.now()
+    const req = box.requestFullscreen || box.webkitRequestFullscreen
+    if (req) {
+      try {
+        const p = req.call(box)
+        if (p && typeof p.catch === 'function') p.catch(() => {})
+      } catch (err) { /* 换不了就退回视频本体全屏，功能不受影响 */ }
+    }
+  } else if (el !== v) {
+    // 已经换到预览层（或用户退出了全屏）：立刻允许下一次全屏替换
+    fullscreenSwapAt = 0
+  }
   // 全屏切换后画面尺寸变了，右上角那个关闭按钮要重新贴到边缘
   if (previewShow.value) updateCloseBtnPos()
   if (el === document.documentElement) {
@@ -2710,6 +2808,8 @@ onMounted(() => {
 onUnmounted(() => {
   disposed = true
   clearTimeout(seekHudTimer)
+  clearTimeout(surfaceTapTimer)
+  if (toggleRequest) clearTimeout(toggleRequest.timer)
   lockPageScroll(false)
   delete window.__albumVideoSeekRatio
   delete window.__albumVideoGestureStart
@@ -3361,6 +3461,16 @@ input[type="checkbox"] {
   animation: mediaIn .24s ease;
 }
 /* 视频预览：底部只留文件名那一行，把画面高度还给视频 */
+.preview-box:fullscreen,
+.preview-box:-webkit-full-screen {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  background: #000;
+}
+.preview-box:fullscreen .preview-image-area,
+.preview-box:-webkit-full-screen .preview-image-area { padding: 0 }
 .preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
 /* 暂停时画面中间的播放按钮：点它或点画面任意处继续 */
 .pause-overlay {
@@ -3827,8 +3937,8 @@ input[type="checkbox"] {
 .tv-mode .slide-next-btn { width: 64px; height: 64px; font-size: 34px }
 .tv-mode .slide-exit-btn { padding: 12px 22px; font-size: 17px }
 .tv-mode .slide-name { font-size: 18px }
-/* 十英尺界面：18px 在沙发上根本看不清，整体放大 */
-.tv-mode .seek-hud { padding: 16px 34px; border-radius: 14px; font-size: 38px }
+/* 十英尺界面：整体等比放大，仍是同一套样式 */
+.tv-mode .seek-hud { padding: 14px 28px; border-radius: 12px; font-size: 28px }
 .tv-setup-btn { border-color: var(--accent) }
 
 /* ---------- 视频操作提示：快进/后退、音量、播放/暂停共用一行 ----------
@@ -3840,12 +3950,12 @@ input[type="checkbox"] {
   transform: translate(-50%, -50%);
   z-index: 99999;
   pointer-events: none;
-  padding: 10px 20px;
-  border-radius: 10px;
+  padding: 8px 16px;
+  border-radius: 8px;
   text-align: center;
   background: rgba(14, 16, 20, .8);
   color: #fff;
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 500;
   line-height: 1.3;
   white-space: nowrap;

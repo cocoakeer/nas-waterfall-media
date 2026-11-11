@@ -59,3 +59,15 @@ button {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--muted);
 }
+
+/* 原生控制条里的音量滑块改成竖向（WebKit/Blink 私有伪元素）。
+   新版 Chrome 的媒体控件是 closed shadow root，这条会被忽略，
+   那时只保留原生外观，不影响功能；Android WebView / Safari 生效 */
+video::-webkit-media-controls-volume-slider {
+  -webkit-appearance: slider-vertical;
+  appearance: slider-vertical;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 8px;
+  height: 72px;
+}

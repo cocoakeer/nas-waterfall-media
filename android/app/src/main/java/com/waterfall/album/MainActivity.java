@@ -330,13 +330,13 @@ public class MainActivity extends Activity {
         // 文案、配色、圆角、字号都跟网页端那行提示对齐，全屏与内联看起来是一个东西
         fullscreenHud = new TextView(this);
         fullscreenHud.setTextColor(Color.WHITE);
-        fullscreenHud.setTextSize(18f);
+        fullscreenHud.setTextSize(15f);
         fullscreenHud.setGravity(Gravity.CENTER);
         GradientDrawable hudBg = new GradientDrawable();
-        hudBg.setCornerRadius(dp(10));
+        hudBg.setCornerRadius(dp(8));
         hudBg.setColor(Color.parseColor("#CC0E1014"));
         fullscreenHud.setBackground(hudBg);
-        fullscreenHud.setPadding(dp(20), dp(10), dp(20), dp(10));
+        fullscreenHud.setPadding(dp(16), dp(8), dp(16), dp(8));
         fullscreenHud.setVisibility(View.GONE);
         fullscreenContainer.addView(fullscreenHud, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
