@@ -184,9 +184,15 @@
 
     <!-- 预览弹窗。手势挂在整个预览层上：视频、画面留白、底部按钮栏，
          任意位置左右滑快进、上下滑调音量都要生效（以前只在视频区域里才响应） -->
+    <!-- 全屏元素是 .preview-box（top layer 只渲染它和它的子树），
+         所以手势必须挂在它身上全屏时才收得到；遮罩那套加 .self 只补最外圈黑边，
+         两者互斥，不会一次触摸触发两遍 -->
     <div v-if="previewShow" class="preview-mask" @click.self="onPreviewMaskClick" @wheel="stopOverlayWheel"
-         @touchstart="onTouchStart" @touchmove="onTouchMove" @touchend="onTouchEnd" @touchcancel="onTouchCancel">
-      <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick">
+         @touchstart.self="onTouchStart" @touchmove.self="onTouchMove"
+         @touchend.self="onTouchEnd" @touchcancel.self="onTouchCancel">
+      <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick"
+           @touchstart="onTouchStart" @touchmove="onTouchMove"
+           @touchend="onTouchEnd" @touchcancel="onTouchCancel">
         <button class="close-btn" ref="closeBtnRef" :style="closeBtnStyle" @click="closePreview">×</button>
         <!-- 视频预览不显示左右切换箭头：方向键已改为快进/后退（浏览器、手机、
              电视都一样，TV 切下一个视频改用上下键），箭头只留给图片 -->
@@ -842,9 +848,16 @@ async function updateCloseBtnPos() {
   const gap = 8
   const bw = btn.offsetWidth || 34
   const bh = btn.offsetHeight || 34
-  // 旋转后 getBoundingClientRect 是外接矩形，右上角按视觉区域计算
-  let left = mr.right - br.left - bw - gap
-  let top = mr.top - br.top + gap
+  // 视频：贴预览框最外侧右上角，别贴画面右上角——原生媒体控件的音量/倍速
+  // 按钮在那一片，会与 × 叠在一起。图片仍按视觉区域右上角计算（含旋转）
+  let left, top
+  if (media.tagName === 'VIDEO') {
+    left = br.width - bw - gap
+    top = gap
+  } else {
+    left = mr.right - br.left - bw - gap
+    top = mr.top - br.top + gap
+  }
   left = Math.max(gap, Math.min(left, br.width - bw - gap))
   top = Math.max(gap, Math.min(top, br.height - bh - gap))
   closeBtnStyle.value = { left: left + 'px', top: top + 'px', right: 'auto' }
@@ -1260,22 +1273,27 @@ function onVideoSurface(x, y, v) {
   return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }
 
-/** 触摸起点是否落在视频底部让给原生进度条的那一条（手势放行区，36px） */
+/** 触摸起点是否落在视频底部让给原生进度条的那一条（手势放行区，36px）。
+ *  上下都要限死：只判「比底边靠下」会把底部文件名栏、画面外的黑边一起算成
+ *  控制条，那些位置的手势被整段放行掉，等于滑动无效区 */
 function inNativeBar(clientY, v) {
   if (!v) return false
   const r = v.getBoundingClientRect()
   if (!r.height) return false
-  return clientY > r.bottom - Math.min(NATIVE_BAR_HEIGHT, r.height * 0.25)
+  const top = r.bottom - Math.min(NATIVE_BAR_HEIGHT, r.height * 0.25)
+  return clientY > top && clientY <= r.bottom
 }
 
 /** 点按是否落在原生控制条的按钮区。比手势放行区略宽，
  *  保证播放/暂停按钮不会被「点画面不切播放」的防护误撤销；
- *  手势仍只用 36px，不会重新出现大块滑动无效区 */
+ *  手势仍只用 36px，不会重新出现大块滑动无效区。
+ *  同样限定在视频矩形内：画面下方的名字栏不算控制条 */
 function inControlsClickArea(clientY, v) {
   if (!v) return false
   const r = v.getBoundingClientRect()
   if (!r.height) return false
-  return clientY > r.bottom - Math.min(48, r.height * 0.25)
+  const top = r.bottom - Math.min(48, r.height * 0.25)
+  return clientY > top && clientY <= r.bottom
 }
 
 function getActiveVideo() {
@@ -1529,7 +1547,14 @@ function gestureVolume(dy) {
 let nativeGesture = null
 
 function nativeGestureStart() {
-  const v = getActiveVideo()
+  let v = getActiveVideo()
+  // 部分 WebView 在 onShowCustomView 时会把 <video> 从原父节点摘走，
+  // Vue 的 ref 可能已经失效，这时直接从 DOM 找回来
+  if (!v && typeof document !== 'undefined' && typeof document.querySelector === 'function') {
+    v = document.querySelector('.preview-box video') ||
+        document.querySelector('.slide-root video') ||
+        document.querySelector('video')
+  }
   const dur = videoDuration(v)
   if (!v || !dur) { nativeGesture = null; return '' }
   let vol = 1
@@ -1576,8 +1601,8 @@ function onTouchStart(e) {
   const dur = videoDuration(v)
   // 视频元数据还没就绪、或是图片预览时，也要拦住纵向滑动，别把滚动传到底层页面
   if (!v || !dur) return
-  // 只有最底下 56px 那条留给原生控制条：那一条里点能跳、拖也能拖，其余位置
-  // （画面、留白、底部按钮栏）全部接管手势
+  // 只有视频底部那 36px 留给原生控制条：那一条里点能跳、拖也能拖，其余位置
+  // （画面、画面外的黑边、底部文件名栏）全部接管手势
   if (inNativeBar(touchStartY, v)) {
     touchNativeBar = true
     return

@@ -366,7 +366,7 @@ public class MainActivity extends Activity {
 
     /**
      * 只观察、不拦截：事件仍完整交给 super 分发，原生视频控制条和暂停/播放
-     * 都不受影响。全屏时把横滑比例回传给网页，由网页对 &lt;video&gt; 做 seek。
+     * 都不受影响。全屏时把横/纵两轴比例回传给网页，由网页 seek 与调音量。
      */
     @Override
     public boolean dispatchTouchEvent(MotionEvent ev) {
@@ -375,13 +375,14 @@ public class MainActivity extends Activity {
     }
 
     private void trackFullscreenSeek(MotionEvent ev) {
-        if (fullscreenContainer == null || fullscreenHud == null || web == null) return;
+        // HUD 没建好也要能滑：只是不显示回显文字，seek/音量照常生效
+        if (fullscreenContainer == null || web == null) return;
         int action = ev.getActionMasked();
         int w = fullscreenContainer.getWidth();
         int h = fullscreenContainer.getHeight();
         if (action == MotionEvent.ACTION_DOWN) {
-            // 底部留给原生控制条的进度条，避免一次滑动触发两次 seek
-            seekTracking = ev.getPointerCount() == 1 && ev.getY() < h * 0.82f;
+            // 只把最底下 10% 留给原生控制条的进度条，其余位置都能手势
+            seekTracking = ev.getPointerCount() == 1 && ev.getY() < h * 0.90f;
             if (!seekTracking) return;
             seekDownX = ev.getX();
             seekDownY = ev.getY();
@@ -412,8 +413,9 @@ public class MainActivity extends Activity {
             // 用抬手时的最终坐标，不能用中途某次 MOVE 的 x：滑出去又滑回来不该快进
             float dx = ev.getX() - seekDownX;
             float dy = ev.getY() - seekDownY;
+            // 与轴锁定阈值保持一致（6px），别让小幅滑动白做一次
             boolean valid = action == MotionEvent.ACTION_UP && seekAxis != 0
-                    && Math.max(Math.abs(dx), Math.abs(dy)) > 10;
+                    && Math.max(Math.abs(dx), Math.abs(dy)) > 6;
             seekTracking = false;
             if (!valid) { hideFullscreenHud(); return; }
             callGestureJs(seekAxis == 1 && w > 0 ? dx / w : 0f,

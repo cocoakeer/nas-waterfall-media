@@ -809,7 +809,12 @@ def api_change_my_pwd(form: ChangePwdForm, user: UserItem = Depends(get_current_
             raise HTTPException(404, "用户不存在")
         if not _valid_password(form.old_password):
             raise HTTPException(400, "原密码错误")
-        if not bcrypt.checkpw(form.old_password.encode(), u.password_hash.encode()):
+        # users.json 里的 hash 被手工改坏时 bcrypt 会抛 ValueError，不能让它变成 500
+        try:
+            old_ok = bcrypt.checkpw(form.old_password.encode(), u.password_hash.encode())
+        except (ValueError, TypeError):
+            old_ok = False
+        if not old_ok:
             raise HTTPException(400, "原密码错误")
         if not _valid_password(form.new_password):
             raise HTTPException(400, "新密码需为 1~72 字节，且不能包含空字符")
@@ -1255,7 +1260,13 @@ def _refresh_images_subtrees(changed, removed=()) -> bool:
     t0 = time.perf_counter()
     with _images_index_write_lock:
         with _images_index_lock:
-            if not _images_index:
+            # 索引为空有两种情况，不能一律跳过增量：
+            #   1) 从没成功建过（ts == 0，多半是启动时挂载还没就绪）：此时只合并
+            #      变化目录会得到一份残缺索引，必须等全量重建；
+            #   2) 建过、结果本来就是 0 张（库刚建好 / 真的没有图片）：增量合并
+            #      正是唯一能立刻把新图收进来的路径，跳过就只能等一小时后的
+            #      兜底重建，随机幻灯片会一直报「没有可用的图片」
+            if not _images_index and _images_index_ts <= 0:
                 return False
             new_by_dir = dict(_images_by_dir)
             new_subdirs = dict(_images_subdirs)
