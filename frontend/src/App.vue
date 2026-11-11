@@ -191,6 +191,7 @@
          @touchstart.self="onTouchStart" @touchmove.self="onTouchMove"
          @touchend.self="onTouchEnd" @touchcancel.self="onTouchCancel">
       <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick"
+           @pointerdown="onSurfacePointerDown"
            @touchstart="onTouchStart" @touchmove="onTouchMove"
            @touchend="onTouchEnd" @touchcancel="onTouchCancel">
         <button class="close-btn" ref="closeBtnRef" :style="closeBtnStyle" @click="closePreview">×</button>
@@ -1245,6 +1246,9 @@ const NATIVE_BAR_HEIGHT = 36   // 只放行进度条最底下的一条，不占�
 const VOL_FULL_SPAN = 0.9      // 纵向滑一屏高度约改 90% 音量，逐像素连续调节
 const KEY_SEEK_STEP = 10       // 键盘左右键每次快进/后退 10 秒
 const KEY_VOLUME_STEP = 0.02   // 键盘上下键每次调 2% 音量
+// 全屏时 top layer 只画 <video>，那行 HUD 不在全屏子树里、看不见，
+// 2% 的差别听不出来，按一下像没反应。全屏用 10%，靠听感就能确认
+const KEY_VOLUME_STEP_FULLSCREEN = 0.1
 let touchStartX = 0
 let touchStartY = 0
 /** 本次手势是否从有效的单指触摸开始：多指/触摸取消都不该再触发切图或 seek */
@@ -1408,6 +1412,13 @@ let surfaceRestoreUntil = 0
 let surfaceRestoreVideo = null
 let surfaceRestorePaused = false   // 点按前的 v.paused，要还原成这个状态
 let surfaceRestoreTimer = null
+// pointerdown 时记下的「点击前是否暂停」。Chrome 点 <video> 本体会在 click 的
+// target 阶段就把播放切掉（原生控件是 shadow DOM，它的处理先于冒泡到 .preview-box
+// 的 click），等我们架防护时 v.paused 已经是被切过的值；拿它当「点击前状态」，
+// 就会把「暂停」当成要还原的目标，于是点了永远是暂停。pointerdown 一定早于那次
+// 切换，只能从这里记
+let surfacePausedBeforeTap = null
+let surfacePausedBeforeTapAt = 0
 
 /** 把浏览器自己切走的播放状态还原，并压住还原引发的提示 */
 function restoreVideoPlayback(v, wantPaused) {
@@ -1421,10 +1432,14 @@ function restoreVideoPlayback(v, wantPaused) {
 }
 
 /** 点画面之后架好防护 */
-function armPlaybackGuard(v, now) {
+function armPlaybackGuard(v, now, pausedBefore = null) {
   surfaceRestoreUntil = now + 800
   surfaceRestoreVideo = v
-  surfaceRestorePaused = v.paused
+  // 优先用 pointerdown 记下的点击前状态；没有（或已经过期）才退回读 v.paused
+  const fresh = surfacePausedBeforeTap !== null && now - surfacePausedBeforeTapAt < 1000
+  surfaceRestorePaused = pausedBefore !== null
+    ? pausedBefore
+    : (fresh ? surfacePausedBeforeTap : v.paused)
   muteVideoPlaybackHint()
   clearTimeout(surfaceRestoreTimer)
   surfaceRestoreTimer = setTimeout(() => {
@@ -1458,9 +1473,31 @@ function handleSurfaceTap(v) {
   armPlaybackGuard(v, now)
 }
 
+/** pointerdown 比浏览器切换播放更早：在这里记下「点击前是否暂停」并先把防护架好。
+ *  只靠 click 不够——Chrome 在 click 的 target 阶段就切了播放，那时读到的状态
+ *  已经是切过之后的 */
+function onSurfacePointerDown(e) {
+  if (!isVideoPreview()) return
+  const v = getActiveVideo()
+  if (!v) return
+  // <video> 本体全屏时整块画面归原生控制条管，点一下就是切播放，不插手
+  if (currentFullscreenElement() === v) return
+  const t = e.target
+  // 起点在自绘按钮上（× / 图片箭头）：交给按钮自己
+  if (t && typeof t.closest === 'function' && t.closest('button')) return
+  // 原生控制条那一条：上面按钮（播放、音量、全屏）的点击要真正生效
+  if (inControlsClickArea(e.clientY, v)) return
+  const now = Date.now()
+  surfacePausedBeforeTap = v.paused
+  surfacePausedBeforeTapAt = now
+  armPlaybackGuard(v, now, v.paused)
+}
+
 /** 打开/关闭预览、换片、退出幻灯片时把点按状态整个归零 */
 function resetSurfaceTap() {
   surfaceTapLastAt = 0
+  surfacePausedBeforeTap = null
+  surfacePausedBeforeTapAt = 0
   disarmPlaybackGuard()
 }
 
@@ -1735,11 +1772,16 @@ function handleKeydown(e) {
         && ae && ae !== document.body && typeof ae.blur === 'function') {
       try { ae.blur() } catch (err) { /* 忽略 */ }
     }
+    // <video> 本体全屏时那行 HUD 画不出来（top layer 只渲染 video），只能靠听，
+    // 用 10% 的步进；内联有百分比提示，保持 2% 的细腻手感
+    const volStep = currentFullscreenElement() === video
+      ? KEY_VOLUME_STEP_FULLSCREEN
+      : KEY_VOLUME_STEP
     switch (e.key) {
       case 'ArrowLeft':  e.preventDefault(); keySeekVideo(-KEY_SEEK_STEP); break
       case 'ArrowRight': e.preventDefault(); keySeekVideo(KEY_SEEK_STEP); break
-      case 'ArrowUp':    e.preventDefault(); adjustVideoVolume(KEY_VOLUME_STEP); break
-      case 'ArrowDown':  e.preventDefault(); adjustVideoVolume(-KEY_VOLUME_STEP); break
+      case 'ArrowUp':    e.preventDefault(); adjustVideoVolume(volStep); break
+      case 'ArrowDown':  e.preventDefault(); adjustVideoVolume(-volStep); break
       case ' ': case 'Spacebar':
         // 空格播放/暂停（网页里最顺手的那个键）。焦点在按钮上时让按钮自己响应，
         // 否则用户想按空格点「关闭」反而把视频切了
@@ -2827,6 +2869,15 @@ function onFullscreenChange(){
   // 打开下一个视频按 Esc 会被白吞一次）
   if (lastFullscreenEl && !el && previewShow.value) fullscreenExitAt = Date.now()
   lastFullscreenEl = el
+  // 进全屏后 Chrome 把焦点留在控制条的全屏按钮上，会画一圈白色焦点框。
+  // 那个按钮在 closed shadow DOM 里，CSS 选不中，只能把焦点松开；
+  // 键盘操作走 document 捕获，不依赖焦点
+  if (el) {
+    const focusEl = document.activeElement
+    if (focusEl && focusEl !== document.body && typeof focusEl.blur === 'function') {
+      try { focusEl.blur() } catch (err) { /* 忽略 */ }
+    }
+  }
   // 原生控制条上的全屏按钮，进的就是 <video> 本体全屏。这里必须接受它：
   // 曾经试过「趁文档还在全屏态把全屏元素换成 .preview-box」，但那等于在
   // fullscreenchange 回调里重新发一次 requestFullscreen，没有用户手势，
@@ -3524,7 +3575,15 @@ input[type="checkbox"] {
   max-height: 100%;
   object-fit: contain;
   animation: mediaIn .24s ease;
+  /* 点画面或按方向键后浏览器会给媒体元素画一圈 focus outline（蓝框），
+     看着像整块画面被选中。媒体元素不需要焦点框：键盘操作全走 document
+     的捕获监听，不依赖焦点，去掉不影响任何快捷键 */
+  outline: none;
 }
+.preview-image-area img:focus,
+.preview-image-area img:focus-visible,
+.preview-image-area video:focus,
+.preview-image-area video:focus-visible { outline: none }
 /* 视频预览：底部只留文件名那一行，把画面高度还给视频 */
 .preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
 .preview-footer {
