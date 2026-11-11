@@ -880,14 +880,29 @@ function togglePreviewFullscreen() {
   // 判断放在最前面：已经在全屏（不管全屏元素是谁）就只退出，
   // 不能落到下面再请求一次，否则按 Esc 反而重新进全屏
   if (currentFullscreenElement()) { exitPreviewFullscreen(); return }
-  const box = previewBoxRef.value
-  if (!box) return
+  const box = previewBoxRef.value || document.documentElement
   const req = box.requestFullscreen || box.webkitRequestFullscreen || box.msRequestFullscreen
-  if (!req) return
+  if (!req) { showHud('浏览器不支持全屏'); return }
+  // 预览层被拒（权限策略、浏览器限制）时退回整页全屏，至少让动作有结果；
+  // 整页也不行就把原因显示在 HUD 上，别让按钮按下去毫无反应
+  const fallback = (why) => {
+    const de = document.documentElement
+    if (box !== de) {
+      const req2 = de.requestFullscreen || de.webkitRequestFullscreen || de.msRequestFullscreen
+      if (req2) {
+        try {
+          const p2 = req2.call(de)
+          if (p2 && typeof p2.catch === 'function') p2.catch(() => showHud(why))
+          return
+        } catch (e) { /* 掉到下面的提示 */ }
+      }
+    }
+    showHud(why)
+  }
   try {
     const p = req.call(box)
-    if (p && typeof p.catch === 'function') p.catch(() => {})
-  } catch (e) { /* 用户拒绝或浏览器不允许时保持内联 */ }
+    if (p && typeof p.then === 'function') p.then(() => {}, () => fallback('浏览器拒绝全屏'))
+  } catch (e) { fallback('浏览器拒绝全屏') }
 }
 
 async function updateCloseBtnPos() {
@@ -930,6 +945,11 @@ function onPreviewMediaReady() {
   updateCloseBtnPos()
   const v = previewMediaRef.value
   if (!v || v.tagName !== 'VIDEO') return
+  // 模板属性偶尔会被某些 Vue/浏览器组合吞掉，这里再用 DOM 接口设一次：
+  // 桌面端把原生控制条的全屏按钮去掉，只留右上角那个自绘的
+  if (canPreviewFullscreen && v.controlsList) {
+    try { v.controlsList.add('nofullscreen') } catch (e) { /* 忽略 */ }
+  }
   // 上一个视频因策略降级为静音时，新视频先恢复有声再尝试
   if (videoMutedFallback) {
     v.muted = false
@@ -2899,8 +2919,9 @@ function onFullscreenChange(){
   // 全屏切换后画面尺寸变了，右上角那个关闭按钮要重新贴到边缘
   if (previewShow.value) updateCloseBtnPos()
   if (el === document.documentElement) {
-    // 整个页面进了全屏，说明是我们（或用户）要的幻灯片全屏
-    slideFullscreenOwned = true
+    // 整页全屏：幻灯片全屏是我们自己发起的，要记下来好在退出时一并收尾；
+    // 预览层全屏兜底失败时退到的整页全屏不算，别污染幻灯片状态
+    slideFullscreenOwned = slideShow.value
     return
   }
   if (el) {
