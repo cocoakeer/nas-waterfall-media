@@ -1201,7 +1201,7 @@ function handleCardClick(item) {
 function prevMedia() {
   if (previewCurrentIndex.value > 0) {
     muteVideoPlaybackHint()   // 换片会连带触发 pause/play，别弹「已暂停」
-    resetSurfaceTap()         // 两段式点击从头算，别把新片的第一下当成第二下
+    resetSurfaceTap()         // 点按状态从头算，防护别跨片残留
     previewCurrentIndex.value -= 1
     previewItem.value = previewMediaList.value[previewCurrentIndex.value]
     resetRotate()
@@ -1260,12 +1260,22 @@ function onVideoSurface(x, y, v) {
   return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }
 
-/** 触摸/点击是否落在视频底部的原生控制条上（那一条要整个让给浏览器） */
+/** 触摸起点是否落在视频底部让给原生进度条的那一条（手势放行区，36px） */
 function inNativeBar(clientY, v) {
   if (!v) return false
   const r = v.getBoundingClientRect()
   if (!r.height) return false
   return clientY > r.bottom - Math.min(NATIVE_BAR_HEIGHT, r.height * 0.25)
+}
+
+/** 点按是否落在原生控制条的按钮区。比手势放行区略宽，
+ *  保证播放/暂停按钮不会被「点画面不切播放」的防护误撤销；
+ *  手势仍只用 36px，不会重新出现大块滑动无效区 */
+function inControlsClickArea(clientY, v) {
+  if (!v) return false
+  const r = v.getBoundingClientRect()
+  if (!r.height) return false
+  return clientY > r.bottom - Math.min(48, r.height * 0.25)
 }
 
 function getActiveVideo() {
@@ -1370,19 +1380,18 @@ function adjustVideoVolume(delta) {
   showVolumeHud(r.value, r.applied)
 }
 
-/** 点画面：第一次只让原生控制条/进度条出现，此后 3 秒窗口内每点一次切一次
- *  播放/暂停；超过 3 秒没操作，再点又重新「只显示控制条」。
- *  触摸抬起和 click 都可能派发，350ms 内只算一次。
- *  Chrome 点 <video> 本体会自己顺手切一次播放，pause/play 事件还可能晚到；
- *  以前靠 100ms 定时检查再恢复，事件一晚就漏，看起来就是「第一次点击就暂停」。
- *  现在改成拦下第一个事件立刻恢复，跟事件什么时候到达无关。 */
-let surfaceTap = { until: 0, lastAt: 0 }
+/** 点视频画面 = 只让原生控制条出现，绝不切换播放状态。
+ *  暂停/播放只有三个入口：控制条上的播放/暂停按钮、空格键、TV 的 OK 键。
+ *  麻烦在于 Chrome 点 <video> 本体会自己顺手切一次播放，所以每次点画面都要
+ *  架一层防护：拦下紧接着的那个 play/pause 并还原；个别 WebView 不派发事件时
+ *  用 150ms 定时兜底再比一次状态。 */
+let surfaceTapLastAt = 0        // touch 与 click 两路只算一次点按
 let surfaceRestoreUntil = 0
 let surfaceRestoreVideo = null
-let surfaceRestorePaused = false   // 点击前的 v.paused，要恢复成这个状态
+let surfaceRestorePaused = false   // 点按前的 v.paused，要还原成这个状态
 let surfaceRestoreTimer = null
 
-/** 把浏览器自己切走的播放状态还原到点击前的样子，并压住还原引发的提示 */
+/** 把浏览器自己切走的播放状态还原，并压住还原引发的提示 */
 function restoreVideoPlayback(v, wantPaused) {
   if (wantPaused) {
     try { v.pause() } catch (e) { /* 忽略 */ }
@@ -1393,82 +1402,54 @@ function restoreVideoPlayback(v, wantPaused) {
   muteVideoPlaybackHint()
 }
 
+/** 点画面之后架好防护 */
+function armPlaybackGuard(v, now) {
+  surfaceRestoreUntil = now + 800
+  surfaceRestoreVideo = v
+  surfaceRestorePaused = v.paused
+  muteVideoPlaybackHint()
+  clearTimeout(surfaceRestoreTimer)
+  surfaceRestoreTimer = setTimeout(() => {
+    surfaceRestoreTimer = null
+    // 用户明确切了播放 / 换了片会 disarm 并把 surfaceRestoreVideo 置空，
+    // 那时不该再还原；抑制器命中过不算，兜底必须继续确认 play() 真的成功了
+    if (surfaceRestoreVideo !== v) return
+    if (!previewShow.value || getActiveVideo() !== v) return
+    if (v.paused !== surfaceRestorePaused) restoreVideoPlayback(v, surfaceRestorePaused)
+  }, 150)
+}
+
+/** 用户明确要切播放（点控制条按钮 / 按空格 / 遥控器 OK / 换片 / 片尾）：
+ *  撤掉防护，让浏览器或按键真正生效。clearHints 用于需要立刻看到状态提示的路径 */
+function disarmPlaybackGuard(clearHints = false) {
+  surfaceRestoreUntil = 0
+  surfaceRestoreVideo = null
+  clearTimeout(surfaceRestoreTimer)
+  surfaceRestoreTimer = null
+  if (clearHints) {
+    videoHintMutedUntil = 0
+    videoStateMutedUntil = 0
+  }
+}
+
 function handleSurfaceTap(v) {
   if (!v) return
   const now = Date.now()
-  if (now - surfaceTap.lastAt < 350) return
-  surfaceTap.lastAt = now
-  const wantToggle = now <= surfaceTap.until
-  if (wantToggle) {
-    // 控制条还在：这一次就是明确的暂停/继续，解除第一次留下的所有抑制
-    clearTimeout(surfaceRestoreTimer)
-    surfaceRestoreTimer = null
-    surfaceRestoreUntil = 0
-    surfaceRestoreVideo = null
-    videoHintMutedUntil = 0
-    videoStateMutedUntil = 0
-    previewPaused.value = v.paused
-    requestVideoToggle(v)
-  } else {
-    // 控制条已收起：只让它出来，播放状态必须原样保留。
-    // 窗口覆盖整个 3 秒显示期，浏览器什么时候派发 pause/play 都能拦住（只拦第一个）
-    surfaceRestoreUntil = now + 3000
-    surfaceRestoreVideo = v
-    surfaceRestorePaused = v.paused
-    muteVideoPlaybackHint()
-    // 事件兜底：个别 WebView 不派发 play/pause，或 play() 被自动播放策略拒绝，
-    // 150ms 后再比一次状态，确保第一次点击绝不会把视频停住
-    clearTimeout(surfaceRestoreTimer)
-    surfaceRestoreTimer = setTimeout(() => {
-      surfaceRestoreTimer = null
-      if (surfaceRestoreUntil === 0) return   // 抑制器已经处理过
-      if (!previewShow.value || getActiveVideo() !== v) return
-      if (v.paused !== surfaceRestorePaused) restoreVideoPlayback(v, surfaceRestorePaused)
-    }, 150)
-  }
-  surfaceTap.until = now + 3000
+  if (now - surfaceTapLastAt < 350) return
+  surfaceTapLastAt = now
+  armPlaybackGuard(v, now)
 }
 
-/** 打开/关闭预览、换片、退出幻灯片时把两段式点击与待定的切换整个归零。
- *  否则换片后 3 秒内第一次点画面会被当成「第二次点击」直接暂停 */
+/** 打开/关闭预览、换片、退出幻灯片时把点按状态整个归零 */
 function resetSurfaceTap() {
-  surfaceTap.until = 0
-  surfaceTap.lastAt = 0
-  surfaceRestoreUntil = 0
-  surfaceRestoreVideo = null
-  surfaceRestorePaused = false
-  clearTimeout(surfaceRestoreTimer)
-  surfaceRestoreTimer = null
-  if (toggleRequest) { clearTimeout(toggleRequest.timer); toggleRequest = null }
+  surfaceTapLastAt = 0
+  disarmPlaybackGuard()
 }
 
-/** 真正切一次播放/暂停。现在只由 handleSurfaceTap 的「第二次点击」调用，
- *  触摸抬起与 click 两路的去重已经在那里做完。浏览器自己也可能已经切过了，
- *  因此延迟 100ms 比一次状态再决定补不补，否则一次点击会切两下（等于没反应）。 */
-let toggleRequest = null   // { v, at, timer }
-
-function requestVideoToggle(v) {
-  if (!v) return
-  const now = Date.now()
-  if (toggleRequest && toggleRequest.v === v && now - toggleRequest.at < 350) return
-  if (toggleRequest) clearTimeout(toggleRequest.timer)
-  const before = v.paused
-  const timer = setTimeout(() => {
-    toggleRequest = null
-    // 这 100ms 里可能已经换片或关了预览：不能对旧元素补刀
-    if (!previewShow.value || getActiveVideo() !== v) return
-    if (v.paused === before) toggleVideoPlay()
-  }, 100)
-  toggleRequest = { v, at: now, timer }
-}
-
-/** 播放 / 暂停当前视频。这里也直接给一次提示：事件是异步派发的，
- *  遥控器/键盘按下去要立刻有反馈，点原生控制条那条路径由 play/pause 事件兜住 */
+/** 播放 / 暂停当前视频（空格 / TV OK）。这里直接给一次提示：
+ *  事件是异步派发的，按下去要立刻有反馈；点控制条按钮那条路径由事件兜住 */
 function toggleVideoPlay() {
-  // 键盘空格 / 遥控器 OK / 中间按钮都是用户主动切换，
-  // 随后到达的 pause 不能被「第一次点画面」的抑制器撤销
-  surfaceRestoreUntil = 0
-  surfaceRestoreVideo = null
+  disarmPlaybackGuard()
   const v = getActiveVideo()
   if (!v) return
   if (v.paused) {
@@ -1498,34 +1479,27 @@ function muteVideoPlaybackHint() {
   videoPausedHintShown = false
 }
 
+function isPlaybackGuardActive(now, ev) {
+  return now < surfaceRestoreUntil && !!ev && ev.target === surfaceRestoreVideo
+}
+
 /** <video> 的 play / pause 事件：暂停给提示，恢复播放只在「从暂停里点起来」时提示。
  *  自动播放、切片换源那种 pause→play 连击不该刷屏 */
 function onVideoPlayback(paused, ev) {
   const now = Date.now()
-  // 播到结尾同样会派发 pause，这不是浏览器顺手切的那次。先解除抑制器，
-  // 否则 3 秒窗口内片尾一到，视频会被强行重新播一遍
-  if (ev && ev.target && ev.target.ended && ev.target === surfaceRestoreVideo
-      && surfaceRestoreUntil) {
+  // 播到结尾同样会派发 pause，这不是浏览器顺手切的那次。解除防护与静音窗口，
+  // 否则片尾会被强行重新播一遍，且「播放结束」提示与状态都被吞掉
+  if (ev && ev.target && ev.target.ended) disarmPlaybackGuard(true)
+  // 点画面：浏览器顺手切的那次播放状态一律撤销（只撤销一次）。
+  // 播放中点会变成 pause，暂停中点会变成 play，两种都要还原
+  if (isPlaybackGuardActive(now, ev)) {
+    // 只关掉事件拦截（第二个事件不该再被拦），别 disarm：
+    // 否则 150ms 兜底被取消，万一这次 play() 被自动播放策略拒绝就没人补救
     surfaceRestoreUntil = 0
-    surfaceRestoreVideo = null
-    clearTimeout(surfaceRestoreTimer)
-    surfaceRestoreTimer = null
-    // 片尾同样是一次真实的状态变化，别被第一次点击的静音窗口吞掉
-    videoHintMutedUntil = 0
-    videoStateMutedUntil = 0
-  }
-  // 第一次点画面：浏览器顺手切的那次播放状态一律撤销（只撤销一次）。
-  // 播放中点会变成 pause，暂停中点会变成 play，两种都要还原，
-  // 否则「暂停时点一下显示控制条」会直接把视频放起来
-  if (now < surfaceRestoreUntil && ev && ev.target === surfaceRestoreVideo) {
-    clearTimeout(surfaceRestoreTimer)
-    surfaceRestoreTimer = null
-    surfaceRestoreUntil = 0
-    surfaceRestoreVideo = null
     restoreVideoPlayback(ev.target, surfaceRestorePaused)
     return
   }
-  // 两个窗口分开：状态只挡 160ms 的 seek 连击（不闪按钮），提示挡 500ms（不刷屏）。
+  // 两个窗口分开：状态只挡 160ms 的 seek 连击（不跳变），提示挡 500ms（不刷屏）。
   // 以前共用一个 500ms 窗口，用户在这半秒里点控制条暂停会完全丢状态
   if (now >= videoStateMutedUntil) previewPaused.value = paused
   if (now < videoHintMutedUntil) return
@@ -1656,10 +1630,7 @@ function onTouchEnd(e) {
   // resetSeekGesture 会清掉这两个，先留一份
   const startedInBar = touchNativeBar
   const startY = touchStartY
-  if (startedInBar) {
-    surfaceRestoreUntil = 0
-    surfaceRestoreVideo = null
-  }
+  if (startedInBar) disarmPlaybackGuard(true)
   if (seekActive) {
     // 阻止合成 click，否则 .preview-box 会把它当成「点空白退出预览」
     if (e.cancelable) e.preventDefault()
@@ -1680,13 +1651,17 @@ function onTouchEnd(e) {
     return
   }
   resetSeekGesture()
-  // 点一下画面（没滑动、也不在原生控制条上）＝ 一次点按，交给两段式处理。
+  // 点一下画面（没滑动、也不在原生控制条上）＝ 只显示控制条，不切播放。
   // 安卓 WebView 里点视频不一定派发 click，这里也走一遍，两路由
-  // handleSurfaceTap 的 350ms 窗口去重，保证一次点按只算一次
+  // handleSurfaceTap 的 350ms 窗口去重
   if (!startedInBar && Math.abs(dx) <= GESTURE_MIN_DIST && Math.abs(dy) <= GESTURE_MIN_DIST) {
     const onButton = e.target && typeof e.target.closest === 'function' && e.target.closest('button')
     const tapVideo = previewShow.value && !slideShow.value ? getActiveVideo() : null
-    if (!onButton && tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
+    if (tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
+        && inControlsClickArea(startY, tapVideo)) {
+      // 点的是控制条按钮区（含播放/暂停键）：撤掉防护，交给浏览器
+      disarmPlaybackGuard(true)
+    } else if (!onButton && tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
         && !inNativeBar(startY, tapVideo)
         && currentFullscreenElement() !== tapVideo) {
       handleSurfaceTap(tapVideo)
@@ -2256,16 +2231,13 @@ function onPreviewBoxClick(e) {
   // 这段时间内忽略「点空白退出」，避免刚快进完预览就被关掉
   if (Date.now() < suppressPreviewClickUntil) return
   if (isVideoPreview()) {
-    // 视频预览：点画面走两段式（先出控制条，再点才切播放）。底部那一条
-    // （原生控制条）和视频本体全屏都不接管，免得和自带按钮互相打架
+    // 视频预览：点画面只显示控制条，绝不切播放。底部那一条是原生控制条，
+    // 用户点上面的播放/暂停按钮时撤掉防护，让浏览器自己切
     const t = e.target
     const v = getActiveVideo()
     if (t && t.tagName === 'VIDEO' && v) {
-      if (inNativeBar(e.clientY, v) || currentFullscreenElement() === v) {
-        // 点的是原生控制条（或视频本体全屏）：用户要操作自带按钮，
-        // 随后派发的 pause 是主动操作，不能被上一轮的抑制器撤销
-        surfaceRestoreUntil = 0
-        surfaceRestoreVideo = null
+      if (inControlsClickArea(e.clientY, v) || currentFullscreenElement() === v) {
+        disarmPlaybackGuard(true)
       } else {
         handleSurfaceTap(v)
       }
@@ -2879,7 +2851,6 @@ onUnmounted(() => {
   disposed = true
   clearTimeout(seekHudTimer)
   clearTimeout(surfaceRestoreTimer)
-  if (toggleRequest) clearTimeout(toggleRequest.timer)
   lockPageScroll(false)
   delete window.__albumVideoSeekRatio
   delete window.__albumVideoGestureStart
