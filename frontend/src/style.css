@@ -60,13 +60,7 @@ button {
   background: var(--muted);
 }
 
-/* 原生控制条里的音量滑块保持竖向（WebKit/Blink 私有伪元素）。
-   只改外观，不用 writing-mode / direction：那两条会让部分 WebView 把滑块
-   从控制条里挤出去、顶到画面右上角，与关闭按钮 × 重叠。
-  新版 Chrome 的媒体控件是 closed shadow root，这条会被忽略，保持原生外观。 */
-video::-webkit-media-controls-volume-slider {
-  -webkit-appearance: slider-vertical;
-  appearance: slider-vertical;
-  width: 8px;
-  height: 40px;
-}
+/* 原生控制条的音量滑块保持浏览器默认外观。
+   不要用 ::-webkit-media-controls-volume-slider 强行改竖向（appearance:
+   slider-vertical + height: 40px）：滑块比 36px 高的控制条还高，会从控制条里
+   穿出来、顶到画面上并压住音量图标，桌面 Chrome 上就是这个表现。 */
