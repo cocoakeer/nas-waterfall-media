@@ -191,6 +191,7 @@
          @touchstart.self="onTouchStart" @touchmove.self="onTouchMove"
          @touchend.self="onTouchEnd" @touchcancel.self="onTouchCancel">
       <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick"
+           @click.capture="onSurfaceClickCapture"
            @pointerdown="onSurfacePointerDown"
            @touchstart="onTouchStart" @touchmove="onTouchMove"
            @touchend="onTouchEnd" @touchcancel="onTouchCancel">
@@ -229,11 +230,6 @@
             <button @click="rotateRight">↻ 右旋90°</button>
             <button @click="resetRotate">重置旋转</button>
             <button @click="startSlideFromCurrent">从此处开始幻灯片</button>
-          </div>
-          <!-- 视频：原生全屏按钮全屏的是 <video> 本身，网页提示层画不出来。
-               这个按钮全屏的是整个预览层，快进/音量/暂停提示都能显示 -->
-          <div v-else-if="!isTvMode" class="img-action-bar">
-            <button @click="togglePreviewFullscreen">{{ previewFullscreen ? '退出全屏' : '全屏' }}</button>
           </div>
           <!-- 电视只有遥控器，没有可点的按钮：把键位直接写在画面上，
                否则「左右快进、上下切换、OK 暂停」全靠猜 -->
@@ -1248,7 +1244,8 @@ function nextMedia() {
 // 长片要跳远就多滑几次，每次松手后从新位置继续
 const SEEK_MAX_SPAN = 120
 const GESTURE_MIN_DIST = 6     // 6px 即触发，小幅滑动也能立刻看到反馈
-const NATIVE_BAR_HEIGHT = 36   // 只放行进度条最底下的一条，不占整条控制栏
+const NATIVE_BAR_HEIGHT = 36   // 手势放行区：只让出进度条最底下的一条
+const CONTROLS_CLICK_HEIGHT = 48  // 点按放行区：略宽一点，盖住控制条上的按钮
 const VOL_FULL_SPAN = 0.9      // 纵向滑一屏高度约改 90% 音量，逐像素连续调节
 const KEY_SEEK_STEP = 10       // 键盘左右键每次快进/后退 10 秒
 const KEY_VOLUME_STEP = 0.02   // 键盘上下键每次调 2% 音量
@@ -1284,27 +1281,26 @@ function onVideoSurface(x, y, v) {
   return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }
 
-/** 触摸起点是否落在视频底部让给原生进度条的那一条（手势放行区，36px）。
+/** 触摸点是否落在视频底部那条「交给原生控制条」的横条里。
  *  上下都要限死：只判「比底边靠下」会把底部文件名栏、画面外的黑边一起算成
  *  控制条，那些位置的手势被整段放行掉，等于滑动无效区 */
-function inNativeBar(clientY, v) {
+function inBottomStrip(clientY, v, stripHeight) {
   if (!v) return false
   const r = v.getBoundingClientRect()
   if (!r.height) return false
-  const top = r.bottom - Math.min(NATIVE_BAR_HEIGHT, r.height * 0.25)
+  const top = r.bottom - Math.min(stripHeight, r.height * 0.25)
   return clientY > top && clientY <= r.bottom
 }
 
-/** 点按是否落在原生控制条的按钮区。比手势放行区略宽，
- *  保证播放/暂停按钮不会被「点画面不切播放」的防护误撤销；
- *  手势仍只用 36px，不会重新出现大块滑动无效区。
- *  同样限定在视频矩形内：画面下方的名字栏不算控制条 */
+/** 手势放行区：底部 36px 留给原生进度条，那一条里不接管滑动 */
+function inNativeBar(clientY, v) {
+  return inBottomStrip(clientY, v, NATIVE_BAR_HEIGHT)
+}
+
+/** 点按放行区：比手势区略宽，保证播放/暂停按钮不会被当成「点画面」而多切一次；
+ *  手势仍只用 36px，不会重新出现大块滑动无效区 */
 function inControlsClickArea(clientY, v) {
-  if (!v) return false
-  const r = v.getBoundingClientRect()
-  if (!r.height) return false
-  const top = r.bottom - Math.min(48, r.height * 0.25)
-  return clientY > top && clientY <= r.bottom
+  return inBottomStrip(clientY, v, CONTROLS_CLICK_HEIGHT)
 }
 
 function getActiveVideo() {
@@ -1399,7 +1395,7 @@ function showVolumeHud(value, applied) {
   showHud(applied ? '音量 ' + Math.round(value * 100) + '%' : '音量不可调')
 }
 
-/** 键盘上下键：每次 2% 音量 */
+/** 键盘上下键：内联每次 2%，原生 <video> 全屏时由调用方传 10%（那种全屏看不到提示） */
 function adjustVideoVolume(delta) {
   const v = getActiveVideo()
   if (!v) return
@@ -1410,16 +1406,14 @@ function adjustVideoVolume(delta) {
 }
 
 /** 点视频画面 = 播放 / 暂停切换（和原生播放器的手感一致）。
- *  麻烦在「谁去切这一下」：
- *  1) 浏览器自己也会切。Chrome / Firefox / 移动端 WebView 点 <video> 本体时，
- *     原生控件会在 click 的 target 阶段先切一次（shadow DOM，早于冒泡到
- *     .preview-box 的我们）。所以不能无脑切，否则两次抵消、看着像没反应。
- *  2) 触屏上我们比浏览器更早：touchend 就能切，随后的合成 click 里浏览器又切一次，
- *     同样抵消。350ms 去重不能只是「直接返回」，否则触屏上永远切不动。
- *  解法：把「这次点按的期望状态」记下来，两条路径都只负责把状态拉到这个值
- *  （幂等）。谁先切、切几次都不影响结果。 */
+ *  桌面端由 onSurfaceClickCapture 在捕获阶段 preventDefault 掉浏览器的默认切换，
+ *  再调这里的 handleSurfaceTap；但下面两种情况仍可能让浏览器抢在前面切一次：
+ *  1) WebView 里 click 不可取消（cancelable=false），preventDefault 无效；
+ *  2) 触屏上我们先在 touchend 里切，随后的合成 click 里浏览器又切回来。
+ *  所以这里记下「本次点按期望的结束状态」，350ms 内的第二次派发只把状态拉回
+ *  该值、不再重新取反（幂等），谁先切、切几次都不影响结果。 */
 let surfaceTapLastAt = 0        // touch 与 click 两路只算一次点按
-// pointerdown 记下的「点击前是否暂停」。pointerdown 一定早于浏览器可能顺手做的那次
+// pointerdown 记下的「点击前是否暂停」。pointerdown 早于浏览器可能顺手做的那次
 // 切换，只有这里能拿到真实的前置状态
 let surfacePausedBeforeTap = null
 let surfacePausedBeforeTapAt = 0
@@ -1692,16 +1686,16 @@ function onTouchEnd(e) {
   // 安卓 WebView 里点视频不一定派发 click，这里也走一遍，两路由
   // handleSurfaceTap 的 350ms 窗口去重
   if (!startedInBar && Math.abs(dx) <= GESTURE_MIN_DIST && Math.abs(dy) <= GESTURE_MIN_DIST) {
-    const onButton = e.target && typeof e.target.closest === 'function' && e.target.closest('button')
     const tapVideo = previewShow.value && !slideShow.value ? getActiveVideo() : null
-    if (tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
-        && inControlsClickArea(startY, tapVideo)) {
-      // 点的是控制条按钮区（含播放/暂停键）：交给浏览器，顺便把提示窗口清掉
-      unmutePlaybackHints()
-    } else if (!onButton && tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
-        && !inControlsClickArea(startY, tapVideo)
-        && currentFullscreenElement() !== tapVideo) {
-      handleSurfaceTap(tapVideo)
+    if (tapVideo && onVideoSurface(touchStartX, startY, tapVideo)) {
+      if (inControlsClickArea(startY, tapVideo)) {
+        // 点的是控制条按钮区（含播放/暂停键）：交给浏览器，顺便把提示窗口清掉
+        unmutePlaybackHints()
+      } else if (currentFullscreenElement() !== tapVideo
+          && !(e.target && typeof e.target.closest === 'function' && e.target.closest('button'))) {
+        // 画面本体（不是自绘按钮）：切播放 / 暂停
+        handleSurfaceTap(tapVideo)
+      }
     }
   }
   // 图片：水平滑动切上一张/下一张。只在真的切了张时才拦合成 click
@@ -2318,23 +2312,36 @@ function onPreviewMaskClick() {
   closePreview()
 }
 
+/** 点视频画面的 click 必须在捕获阶段就拦下来：
+ *  原生控件会在这次 click 里自己切一次播放（Chrome 是 DOM 默认动作，等事件派发
+ *  结束才执行），和我们自己那次一正一反正好抵消，表现就是「点了闪一下、又播回去」。
+ *  preventDefault 挡默认动作、stopPropagation 挡 shadow 里的监听，两条一起做才拦得干净。
+ *  底部控制条那一条必须放行，否则原生播放/音量/全屏按钮全部失效。 */
+function onSurfaceClickCapture(e) {
+  if (Date.now() < suppressPreviewClickUntil) return
+  if (!isVideoPreview()) return
+  const v = getActiveVideo()
+  if (!v || e.target !== v) return
+  // <video> 本体全屏时整块画面归原生控制条管
+  if (currentFullscreenElement() === v) return
+  if (inControlsClickArea(e.clientY, v)) return
+  if (e.cancelable) e.preventDefault()
+  e.stopPropagation()
+  handleSurfaceTap(v)
+}
+
 function onPreviewBoxClick(e) {
   // 视频横滑结束后浏览器仍可能合成 click（touchend 的 preventDefault 不是绝对可靠），
   // 这段时间内忽略「点空白退出」，避免刚快进完预览就被关掉
   if (Date.now() < suppressPreviewClickUntil) return
   if (isVideoPreview()) {
-    // 视频预览：点画面切播放 / 暂停；底部那一条是原生控制条，上面的按钮
-    // （播放、音量、全屏）交给浏览器自己处理。
-    // <video> 本体全屏时整块画面都归原生控制条管（点一下是显示/隐藏控制条），
-    // 这里也一并放行
+    // 点画面的 click 已经被 onSurfaceClickCapture 拦掉了，能走到这里的只剩
+    // 底部原生控制条那一条：上面的按钮（播放、音量、全屏）交给浏览器自己处理，
+    // 顺手把提示静音窗口清掉，按下去就能看到状态
     const t = e.target
     const v = getActiveVideo()
-    if (t && t.tagName === 'VIDEO' && v) {
-      if (inControlsClickArea(e.clientY, v) || currentFullscreenElement() === v) {
-        unmutePlaybackHints()
-      } else {
-        handleSurfaceTap(v)
-      }
+    if (t && t.tagName === 'VIDEO' && v && inControlsClickArea(e.clientY, v)) {
+      unmutePlaybackHints()
     }
     return
   }
@@ -3589,19 +3596,14 @@ input[type="checkbox"] {
      的捕获监听，不依赖焦点，去掉不影响任何快捷键 */
   outline: none;
 }
+/* 显式覆盖 :focus / :focus-visible 两个伪类：只靠上面那条基础规则时，
+   个别浏览器（含部分 WebView）仍会按 UA 样式给媒体元素补画焦点框 */
 .preview-image-area img:focus,
 .preview-image-area img:focus-visible,
 .preview-image-area video:focus,
 .preview-image-area video:focus-visible { outline: none }
-/* 视频预览：底部只放文件名 + 全屏按钮那一行，把画面高度还给视频 */
-.preview-footer.footer-compact {
-  padding: 6px 16px 10px;
-  gap: 10px;
-  flex-direction: row;
-  flex-wrap: wrap;
-  justify-content: center;
-  align-items: center;
-}
+/* 视频预览：底部只留文件名那一行，把画面高度还给视频 */
+.preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
 .preview-footer {
   flex-shrink: 0;
   padding: 10px 16px 14px;

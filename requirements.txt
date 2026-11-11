@@ -1,6 +1,7 @@
 fastapi>=0.104.1
+# uvicorn[standard] 已经带上 uvloop（以及 httptools/websockets/watchfiles），
+# 不要再单独写一行 uvloop：重复声明，而且它在 Windows 上根本装不上
 uvicorn[standard]>=0.24.0
 pillow>=10.1.0
-uvloop>=0.19.0
 apscheduler>=3.10.4
 bcrypt>=4.0.1
