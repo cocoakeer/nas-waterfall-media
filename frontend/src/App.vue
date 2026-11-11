@@ -194,18 +194,6 @@
            @touchstart="onTouchStart" @touchmove="onTouchMove"
            @touchend="onTouchEnd" @touchcancel="onTouchCancel">
         <button class="close-btn" ref="closeBtnRef" :style="closeBtnStyle" @click="closePreview">×</button>
-        <!-- 桌面端的全屏按钮自己画：原生控制条那个进的是 <video> 本体全屏，
-             页面 DOM 全不渲染，也没法在同一次手势里换成预览层全屏 -->
-        <button v-if="canPreviewFullscreen && previewItem.type !== 'image'"
-                class="fullscreen-btn" @click.stop="togglePreviewFullscreen"
-                :title="previewFullscreen ? '退出全屏' : '全屏'"
-                :aria-label="previewFullscreen ? '退出全屏' : '全屏'">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
-               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path v-if="!previewFullscreen" d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/>
-            <path v-else d="M3 8h3a2 2 0 0 0 2-2V3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M21 16h-3a2 2 0 0 0-2 2v3"/>
-          </svg>
-        </button>
         <!-- 视频预览不显示左右切换箭头：方向键已改为快进/后退（浏览器、手机、
              电视都一样，TV 切下一个视频改用上下键），箭头只留给图片 -->
         <button v-if="previewItem.type === 'image'" class="arrow-btn arrow-left" @click.stop="prevMedia" :disabled="previewCurrentIndex <= 0">‹</button>
@@ -223,7 +211,6 @@
             v-else
             ref="previewMediaRef"
             controls
-            :controlslist="fsControlsList"
             autoplay
             playsinline
             :src="getSrcUrl(previewItem.path)"
@@ -849,62 +836,6 @@ const slideVideoRef = ref(null)
 const closeBtnRef = ref(null)
 const closeBtnStyle = ref({})
 
-// 桌面端自己画全屏按钮，并隐藏原生控制条上那个。
-// 原因：原生全屏按钮把 <video> 本体送进全屏，页面 DOM（提示层、× 按钮）全不渲染；
-// 想在全屏状态下换成 .preview-box 全屏，等于在 fullscreenchange 回调里发起「无手势
-// 请求」，Chrome 会以 NotAllowedError 拒绝，代码随后兜底退出全屏 —— 用户看到的就是
-// 「点全屏，闪一下又回到内联」。自己画一个按钮，点击时是真实手势，必定成功。
-// Android / iOS 的视频全屏由 WebView 或系统播放器接管，保留原生按钮更稳，不启用这套。
-const canPreviewFullscreen = (() => {
-  try {
-    if (!(document.fullscreenEnabled || document.webkitFullscreenEnabled)) return false
-  } catch (e) { return false }
-  const ua = navigator.userAgent || ''
-  if (/Android|iPhone|iPad|iPod|Windows Phone|Mobile/i.test(ua)) return false
-  // iPadOS 13+ 的 UA 伪装成 Macintosh，靠触点数区分
-  if (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) return false
-  return true
-})()
-// 桌面端把原生全屏按钮藏掉，避免两个全屏入口并存（点原生那个仍会失败）
-const fsControlsList = canPreviewFullscreen ? 'nofullscreen' : null
-const previewFullscreen = ref(false)
-
-/** 只退全屏，不做「没全屏就进全屏」的反向动作（Esc 用这个） */
-function exitPreviewFullscreen() {
-  const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
-  if (!exit) return
-  try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (e) { /* 忽略 */ }
-}
-
-function togglePreviewFullscreen() {
-  // 判断放在最前面：已经在全屏（不管全屏元素是谁）就只退出，
-  // 不能落到下面再请求一次，否则按 Esc 反而重新进全屏
-  if (currentFullscreenElement()) { exitPreviewFullscreen(); return }
-  const box = previewBoxRef.value || document.documentElement
-  const req = box.requestFullscreen || box.webkitRequestFullscreen || box.msRequestFullscreen
-  if (!req) { showHud('浏览器不支持全屏'); return }
-  // 预览层被拒（权限策略、浏览器限制）时退回整页全屏，至少让动作有结果；
-  // 整页也不行就把原因显示在 HUD 上，别让按钮按下去毫无反应
-  const fallback = (why) => {
-    const de = document.documentElement
-    if (box !== de) {
-      const req2 = de.requestFullscreen || de.webkitRequestFullscreen || de.msRequestFullscreen
-      if (req2) {
-        try {
-          const p2 = req2.call(de)
-          if (p2 && typeof p2.catch === 'function') p2.catch(() => showHud(why))
-          return
-        } catch (e) { /* 掉到下面的提示 */ }
-      }
-    }
-    showHud(why)
-  }
-  try {
-    const p = req.call(box)
-    if (p && typeof p.then === 'function') p.then(() => {}, () => fallback('浏览器拒绝全屏'))
-  } catch (e) { fallback('浏览器拒绝全屏') }
-}
-
 async function updateCloseBtnPos() {
   await nextTick()
   const box = previewBoxRef.value
@@ -945,11 +876,6 @@ function onPreviewMediaReady() {
   updateCloseBtnPos()
   const v = previewMediaRef.value
   if (!v || v.tagName !== 'VIDEO') return
-  // 模板属性偶尔会被某些 Vue/浏览器组合吞掉，这里再用 DOM 接口设一次：
-  // 桌面端把原生控制条的全屏按钮去掉，只留右上角那个自绘的
-  if (canPreviewFullscreen && v.controlsList) {
-    try { v.controlsList.add('nofullscreen') } catch (e) { /* 忽略 */ }
-  }
   // 上一个视频因策略降级为静音时，新视频先恢复有声再尝试
   if (videoMutedFallback) {
     v.muted = false
@@ -1671,7 +1597,7 @@ function onTouchStart(e) {
   if (!touchTracking) { hideSeekHud(); return }
   touchStartX = e.touches[0].clientX
   touchStartY = e.touches[0].clientY
-  // 起点在自绘按钮上（×、全屏、图片箭头、图片操作栏）：这次触摸交给按钮自己，
+  // 起点在自绘按钮上（×、图片箭头、图片操作栏）：这次触摸交给按钮自己，
   // 不挂手势。否则手指抖几像素就锁成快进/音量手势，按钮反而点不动
   if (e.target && typeof e.target.closest === 'function' && e.target.closest('button')) return
   const v = getActiveVideo()
@@ -1821,13 +1747,28 @@ function handleKeydown(e) {
         e.preventDefault()
         toggleVideoPlay()
         break
-      case 'Escape':
+      case 'Escape': {
         e.preventDefault()
-        // 预览层正全屏时，Esc 只退全屏、保留预览；否则一次 Esc 把两层一起关了
-        if (previewFullscreen.value) { exitPreviewFullscreen(); break }
-        if (slideShow.value) exitSlide()
-        else closePreview()
+        // 幻灯片的全屏是幻灯片自己的一部分，Esc 依旧一次退出幻灯片（保持原样）
+        if (slideShow.value) { exitSlide(); break }
+        // 视频预览全屏时 Esc 只退全屏，预览留着；再按一次才关预览
+        if (currentFullscreenElement()) {
+          const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
+          if (exit) {
+            // 这次退全屏是我们按 Esc 主动做的，先清掉「上一次全屏元素」，
+            // 免得随后的 fullscreenchange 又记一次退出时刻，把下一次 Esc 白吞掉
+            lastFullscreenEl = null
+            try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (err) { /* 忽略 */ }
+          }
+          break
+        }
+        // 浏览器可能已经先替我们退了全屏（原生 <video> 全屏时 Esc 由浏览器自己处理），
+        // 此时 fullscreenElement 已是 null。刚退过全屏的那一次 Esc 不再叠加关预览，
+        // 否则一次 Esc 会同时退全屏 + 关预览，看着像按一下就全没了
+        if (Date.now() - fullscreenExitAt < 600) { fullscreenExitAt = 0; break }
+        closePreview()
         break
+      }
     }
     return
   }
@@ -2212,6 +2153,13 @@ function startSlideFromCurrent() {
 // 「幻灯片里的视频全屏被退出」——后者不该把整个幻灯片关掉
 let slideFullscreenOwned = false
 
+// 最近一次「从全屏退到非全屏」的时刻。浏览器处理 Esc 的顺序不确定：有时先退
+// 全屏再派发 keydown，keydown 到达时 fullscreenElement 已经清空，光看它就分不清
+// 「这次 Esc 已经用来退全屏」还是「用户想关预览」。这条时间窗专门兜这种情况：
+// 刚退过全屏的那一次 Esc 不再叠加关预览，600ms 后自动失效
+let fullscreenExitAt = 0
+let lastFullscreenEl = null
+
 async function openRootFullscreen() {
   const docEl = document.documentElement
   const req = docEl.requestFullscreen || docEl.webkitRequestFullscreen || docEl.msRequestFullscreen
@@ -2336,7 +2284,9 @@ function onPreviewBoxClick(e) {
   if (Date.now() < suppressPreviewClickUntil) return
   if (isVideoPreview()) {
     // 视频预览：点画面只显示控制条，绝不切播放。底部那一条是原生控制条，
-    // 用户点上面的播放/暂停按钮时撤掉防护，让浏览器自己切
+    // 用户点上面的播放/暂停按钮时撤掉防护，让浏览器自己切。
+    // <video> 本体全屏时整块画面都归原生控制条管（点一下是显示/隐藏控制条、
+    // 双击才是全屏行为），这里也一并放行，不去架防护
     const t = e.target
     const v = getActiveVideo()
     if (t && t.tagName === 'VIDEO' && v) {
@@ -2364,10 +2314,14 @@ function closePreview() {
   onTouchCancel()
   muteVideoPlaybackHint()
   resetSurfaceTap()
-  // 关预览时任何全屏都要退掉：可能全屏的是预览层，也可能是兜底没换层成功的
-  // <video>——留着就是一块退不出去的黑屏
-  if (currentFullscreenElement()) exitPreviewFullscreen()
-  previewFullscreen.value = false
+  // 关预览前先退出全屏：全屏元素被 v-if 卸载后虽然浏览器也会收尾，
+  // 但显式退比依赖实现细节稳
+  if (currentFullscreenElement()) {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen
+    if (exit) {
+      try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (e) { /* 忽略 */ }
+    }
+  }
   previewShow.value = false
   previewItem.value = null
   previewMediaList.value = []
@@ -2448,7 +2402,6 @@ function resetUiState() {
   randomSlideHint.value = ''
   randomSlideCancelled = true
 
-  previewFullscreen.value = false
   previewShow.value = false
   previewItem.value = null
   previewMediaList.value = []
@@ -2863,65 +2816,29 @@ function onClickOutsideDrop(e){
   }
 }
 
-// 老 WebKit 会同时派发 webkitfullscreenchange 和 fullscreenchange，
-// 同一轮里别重复发起 requestFullscreen；400ms 后自动允许重试（失败时可恢复）
-let fullscreenSwapAt = 0
-
 function onFullscreenChange(){
   // APK 接管 HTML5 视频原生全屏时（onShowCustomView），文档全屏可能同时退出、
   // fullscreenElement 变成 null；此时别把正在播放的幻灯片误关掉。
   // 浏览器里没有这个变量，undefined 为假，行为不变
   if (window.__albumVideoFullscreen) return
   const el = currentFullscreenElement()
-  // 兜底：某些环境下 <video> 全屏仍会走到这里（浏览器忽略 controlsList、
-  // 或者用户用了右键菜单）。<video> 本体全屏时页面 DOM 全不渲染，提示层、
-  // × 按钮都看不见，所以试着把全屏元素换成整个预览层。
-  // 注意：这次请求发生在 fullscreenchange 回调里，没有用户手势，Chrome 会拒绝，
-  // 桌面端因此改由自绘的 .fullscreen-btn 发起（见 togglePreviewFullscreen）；
-  // 这里换不成时退回内联，不做「停在只有视频的全屏」这种半吊子状态。
-  const v = previewMediaRef.value
-  const box = previewBoxRef.value
-  if (previewShow.value && el && el === v && box && el !== box
-      && Date.now() - fullscreenSwapAt > 400) {
-    fullscreenSwapAt = Date.now()
-    // 换不成预览层全屏时，停在 <video> 本体全屏 = 网页 DOM 整个不渲染，
-    // 中间的暂停按钮、提示层、状态栏全都看不见。宁可退回内联预览，
-    // 这样「内联 / 全屏」看到的始终是同一套界面
-    const backToInline = () => {
-      if (fullscreenSwapAt === 0) return   // 已换层成功或已兜底过，不重复退全屏
-      fullscreenSwapAt = 0
-      const exit = document.exitFullscreen || document.webkitExitFullscreen
-      if (exit) {
-        try {
-          const q = exit.call(document)
-          if (q && typeof q.catch === 'function') q.catch(() => {})
-        } catch (e) { /* 忽略 */ }
-      }
-    }
-    const req = box.requestFullscreen || box.webkitRequestFullscreen
-    if (!req) backToInline()
-    else {
-      try {
-        const p = req.call(box)
-        if (p && typeof p.then === 'function') p.then(() => {}, backToInline)
-        // 老 WebKit 的前缀 API 不返回 Promise，失败时没有回调，只能事后校验
-        setTimeout(() => {
-          if (previewShow.value && currentFullscreenElement() === v) backToInline()
-        }, 300)
-      } catch (err) { backToInline() }
-    }
-  } else if (el !== v) {
-    // 已经换到预览层（或用户退出了全屏）：立刻允许下一次全屏替换
-    fullscreenSwapAt = 0
-  }
-  // 自绘全屏按钮的图标跟随实际全屏元素：按 Esc、点浏览器菜单退出都要复位
-  previewFullscreen.value = !!(box && el === box)
-  // 全屏切换后画面尺寸变了，右上角那个关闭按钮要重新贴到边缘
+  // 记下「刚退出全屏」的时刻，供 Esc 分支判断这一次 Esc 是不是已经用来退全屏了。
+  // 关预览 / 关幻灯片时也会退全屏，那不属于按 Esc 退全屏，不记（否则紧接着
+  // 打开下一个视频按 Esc 会被白吞一次）
+  if (lastFullscreenEl && !el && previewShow.value) fullscreenExitAt = Date.now()
+  lastFullscreenEl = el
+  // 原生控制条上的全屏按钮，进的就是 <video> 本体全屏。这里必须接受它：
+  // 曾经试过「趁文档还在全屏态把全屏元素换成 .preview-box」，但那等于在
+  // fullscreenchange 回调里重新发一次 requestFullscreen，没有用户手势，
+  // Chrome 直接 NotAllowedError，代码随后退回内联 —— 表现就是「点全屏、
+  // 闪一下又回到内联」，按钮像坏了。所以这里不做任何换层，只记录状态。
+  // 全屏时预览层里的提示、× 不渲染（top layer 只画 <video>），但手势监听
+  // 挂在 .preview-box 上，事件仍沿 DOM 冒泡，快进/音量照旧可用。
+  // 全屏切换后画面尺寸变了，右上角的关闭按钮要重新贴边（内联时可见）
   if (previewShow.value) updateCloseBtnPos()
   if (el === document.documentElement) {
-    // 整页全屏：幻灯片全屏是我们自己发起的，要记下来好在退出时一并收尾；
-    // 预览层全屏兜底失败时退到的整页全屏不算，别污染幻灯片状态
-    slideFullscreenOwned = slideShow.value
+    // 整个页面进了全屏，说明是我们（或用户）要的幻灯片全屏
+    slideFullscreenOwned = true
     return
   }
   if (el) {
@@ -3567,26 +3484,6 @@ input[type="checkbox"] {
   transition: background .15s ease;
 }
 .close-btn:hover { background: rgba(91, 130, 247, .8) }
-/* 桌面端自绘的全屏按钮：贴在 × 左边（视频预览时 × 恒在右上角 gap=8、宽 34） */
-.fullscreen-btn {
-  position: absolute;
-  top: 8px;
-  right: 48px;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  background: rgba(20, 24, 32, .7);
-  border: 1px solid rgba(255, 255, 255, .2);
-  color: #fff;
-  cursor: pointer;
-  z-index: 4;
-  backdrop-filter: blur(8px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background .15s ease;
-}
-.fullscreen-btn:hover { background: rgba(91, 130, 247, .8) }
 .arrow-btn {
   position: absolute;
   top: 50%;
@@ -3629,16 +3526,6 @@ input[type="checkbox"] {
   animation: mediaIn .24s ease;
 }
 /* 视频预览：底部只留文件名那一行，把画面高度还给视频 */
-.preview-box:fullscreen,
-.preview-box:-webkit-full-screen {
-  width: 100%;
-  height: 100%;
-  max-width: none;
-  max-height: none;
-  background: #000;
-}
-.preview-box:fullscreen .preview-image-area,
-.preview-box:-webkit-full-screen .preview-image-area { padding: 0 }
 .preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
 .preview-footer {
   flex-shrink: 0;
