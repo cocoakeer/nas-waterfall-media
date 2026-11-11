@@ -1378,54 +1378,49 @@ function adjustVideoVolume(delta) {
   showVolumeHud(r.value, r.applied)
 }
 
-/** 点画面两次：第一次只让原生控制条/进度条出现，第二次才播放/暂停。
- *  触摸抬起和 click 都可能派发，350ms 内只算一次；100ms 后检查浏览器
- *  有没有自己动过播放状态：第一次动过就恢复回去，第二次动过就不重复切。 */
-let surfaceTap = { shown: false, until: 0, lastAt: 0 }
-let surfaceTapTimer = null
+/** 点画面：第一次只让原生控制条/进度条出现，此后 3 秒窗口内每点一次切一次
+ *  播放/暂停；超过 3 秒没操作，再点又重新「只显示控制条」。
+ *  触摸抬起和 click 都可能派发，350ms 内只算一次。
+ *  Chrome 点 <video> 本体会自己顺手切一次播放，pause/play 事件还可能晚到；
+ *  以前靠 100ms 定时检查再恢复，事件一晚就漏，看起来就是「第一次点击就暂停」。
+ *  现在改成拦下第一个事件立刻恢复，跟事件什么时候到达无关。 */
+let surfaceTap = { until: 0, lastAt: 0 }
+let surfaceRestoreUntil = 0
+let surfaceRestoreVideo = null
+let surfaceRestorePaused = false   // 点击前的 v.paused，要恢复成这个状态
 
 function handleSurfaceTap(v) {
   if (!v) return
   const now = Date.now()
   if (now - surfaceTap.lastAt < 350) return
   surfaceTap.lastAt = now
-  const wantToggle = surfaceTap.shown && now <= surfaceTap.until
+  const wantToggle = now <= surfaceTap.until
   if (wantToggle) {
-    // 第二次点击是明确的暂停/继续，别让第一次点击的 500ms 静音窗口吞掉它的提示
+    // 控制条还在：这一次就是明确的暂停/继续，解除第一次留下的所有抑制
+    surfaceRestoreUntil = 0
+    surfaceRestoreVideo = null
     videoHintMutedUntil = 0
+    videoStateMutedUntil = 0
+    previewPaused.value = v.paused
+    requestVideoToggle(v)
   } else {
-    // 第一次点击不暂停：有的浏览器仍会顺手发一个 pause，先压住这段时间，
-    // 否则中间那个播放按钮照样会闪一下
+    // 控制条已收起：只让它出来，播放状态必须原样保留
+    surfaceRestoreUntil = now + 400
+    surfaceRestoreVideo = v
+    surfaceRestorePaused = v.paused
     muteVideoPlaybackHint()
   }
-  surfaceTap.shown = !wantToggle
   surfaceTap.until = now + 3000
-  const before = v.paused
-  clearTimeout(surfaceTapTimer)
-  surfaceTapTimer = setTimeout(() => {
-    surfaceTapTimer = null
-    if (!previewShow.value || getActiveVideo() !== v) return
-    if (wantToggle) {
-      // 原生若已经顺手切过，也要让中间的按钮跟上当前状态（全屏里同样有效）
-      previewPaused.value = v.paused
-      requestVideoToggle(v)   // 第二次：正常切一次
-    } else if (v.paused !== before) {
-      // 第一次：个别浏览器点画面会顺手切播放，恢复它，只保留「出进度条」
-      if (before) { try { v.pause() } catch (err) { /* 忽略 */ } }
-      else { const p = v.play(); if (p && typeof p.catch === 'function') p.catch(() => {}) }
-      muteVideoPlaybackHint()
-    }
-  }, 100)
 }
 
 /** 打开/关闭预览、换片、退出幻灯片时把两段式点击与待定的切换整个归零。
  *  否则换片后 3 秒内第一次点画面会被当成「第二次点击」直接暂停 */
 function resetSurfaceTap() {
-  clearTimeout(surfaceTapTimer)
-  surfaceTapTimer = null
-  surfaceTap.shown = false
   surfaceTap.until = 0
   surfaceTap.lastAt = 0
+  surfaceRestoreUntil = 0
+  surfaceRestoreVideo = null
+  surfaceRestorePaused = false
   if (toggleRequest) { clearTimeout(toggleRequest.timer); toggleRequest = null }
 }
 
@@ -1452,6 +1447,10 @@ function requestVideoToggle(v) {
 /** 播放 / 暂停当前视频。这里也直接给一次提示：事件是异步派发的，
  *  遥控器/键盘按下去要立刻有反馈，点原生控制条那条路径由 play/pause 事件兜住 */
 function toggleVideoPlay() {
+  // 键盘空格 / 遥控器 OK / 中间按钮都是用户主动切换，
+  // 随后到达的 pause 不能被「第一次点画面」的抑制器撤销
+  surfaceRestoreUntil = 0
+  surfaceRestoreVideo = null
   const v = getActiveVideo()
   if (!v) return
   if (v.paused) {
@@ -1484,9 +1483,25 @@ function muteVideoPlaybackHint() {
 /** <video> 的 play / pause 事件：暂停给提示，恢复播放只在「从暂停里点起来」时提示。
  *  自动播放、切片换源那种 pause→play 连击不该刷屏 */
 function onVideoPlayback(paused, ev) {
+  const now = Date.now()
+  // 第一次点画面：浏览器顺手切的那次播放状态一律撤销（只撤销一次）。
+  // 播放中点会变成 pause，暂停中点会变成 play，两种都要还原，
+  // 否则「暂停时点一下显示控制条」会直接把视频放起来
+  if (now < surfaceRestoreUntil && ev && ev.target === surfaceRestoreVideo) {
+    surfaceRestoreUntil = 0
+    surfaceRestoreVideo = null
+    const v = ev.target
+    if (surfaceRestorePaused) {
+      try { v.pause() } catch (err) { /* 忽略 */ }
+    } else {
+      const p = v.play()
+      if (p && typeof p.catch === 'function') p.catch(() => {})
+    }
+    muteVideoPlaybackHint()
+    return
+  }
   // 两个窗口分开：状态只挡 160ms 的 seek 连击（不闪按钮），提示挡 500ms（不刷屏）。
   // 以前共用一个 500ms 窗口，用户在这半秒里点控制条暂停会完全丢状态
-  const now = Date.now()
   if (now >= videoStateMutedUntil) previewPaused.value = paused
   if (now < videoHintMutedUntil) return
   // 播到结尾也会派发 pause：这时候说「已暂停」不对，而且紧接着的「播放」也不该弹
@@ -1616,6 +1631,10 @@ function onTouchEnd(e) {
   // resetSeekGesture 会清掉这两个，先留一份
   const startedInBar = touchNativeBar
   const startY = touchStartY
+  if (startedInBar) {
+    surfaceRestoreUntil = 0
+    surfaceRestoreVideo = null
+  }
   if (seekActive) {
     // 阻止合成 click，否则 .preview-box 会把它当成「点空白退出预览」
     if (e.cancelable) e.preventDefault()
@@ -1643,7 +1662,8 @@ function onTouchEnd(e) {
     const onButton = e.target && typeof e.target.closest === 'function' && e.target.closest('button')
     const tapVideo = previewShow.value && !slideShow.value ? getActiveVideo() : null
     if (!onButton && tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
-        && !inNativeBar(startY, tapVideo)) {
+        && !inNativeBar(startY, tapVideo)
+        && currentFullscreenElement() !== tapVideo) {
       handleSurfaceTap(tapVideo)
     }
   }
@@ -2215,9 +2235,15 @@ function onPreviewBoxClick(e) {
     // （原生控制条）和视频本体全屏都不接管，免得和自带按钮互相打架
     const t = e.target
     const v = getActiveVideo()
-    if (t && t.tagName === 'VIDEO' && v && !inNativeBar(e.clientY, v)
-        && currentFullscreenElement() !== v) {
-      handleSurfaceTap(v)
+    if (t && t.tagName === 'VIDEO' && v) {
+      if (inNativeBar(e.clientY, v) || currentFullscreenElement() === v) {
+        // 点的是原生控制条（或视频本体全屏）：用户要操作自带按钮，
+        // 随后派发的 pause 是主动操作，不能被上一轮的抑制器撤销
+        surfaceRestoreUntil = 0
+        surfaceRestoreVideo = null
+      } else {
+        handleSurfaceTap(v)
+      }
     }
     return
   }
@@ -2757,12 +2783,31 @@ function onFullscreenChange(){
   if (previewShow.value && el && el === v && box && el !== box
       && Date.now() - fullscreenSwapAt > 400) {
     fullscreenSwapAt = Date.now()
+    // 换不成预览层全屏时，停在 <video> 本体全屏 = 网页 DOM 整个不渲染，
+    // 中间的暂停按钮、提示层、状态栏全都看不见。宁可退回内联预览，
+    // 这样「内联 / 全屏」看到的始终是同一套界面
+    const backToInline = () => {
+      if (fullscreenSwapAt === 0) return   // 已换层成功或已兜底过，不重复退全屏
+      fullscreenSwapAt = 0
+      const exit = document.exitFullscreen || document.webkitExitFullscreen
+      if (exit) {
+        try {
+          const q = exit.call(document)
+          if (q && typeof q.catch === 'function') q.catch(() => {})
+        } catch (e) { /* 忽略 */ }
+      }
+    }
     const req = box.requestFullscreen || box.webkitRequestFullscreen
-    if (req) {
+    if (!req) backToInline()
+    else {
       try {
         const p = req.call(box)
-        if (p && typeof p.catch === 'function') p.catch(() => {})
-      } catch (err) { /* 换不了就退回视频本体全屏，功能不受影响 */ }
+        if (p && typeof p.then === 'function') p.then(() => {}, backToInline)
+        // 老 WebKit 的前缀 API 不返回 Promise，失败时没有回调，只能事后校验
+        setTimeout(() => {
+          if (previewShow.value && currentFullscreenElement() === v) backToInline()
+        }, 300)
+      } catch (err) { backToInline() }
     }
   } else if (el !== v) {
     // 已经换到预览层（或用户退出了全屏）：立刻允许下一次全屏替换
@@ -2808,7 +2853,6 @@ onMounted(() => {
 onUnmounted(() => {
   disposed = true
   clearTimeout(seekHudTimer)
-  clearTimeout(surfaceTapTimer)
   if (toggleRequest) clearTimeout(toggleRequest.timer)
   lockPageScroll(false)
   delete window.__albumVideoSeekRatio
@@ -3451,7 +3495,9 @@ input[type="checkbox"] {
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  padding: 18px 18px 10px;
+  /* 上下必须对称：暂停按钮按 padding box 居中，视频按 content box 居中。
+     不对称时内联会偏几像素，全屏（padding:0）却不偏，两边看着就不一样 */
+  padding: 14px 18px;
 }
 .preview-image-area img,
 .preview-image-area video {
@@ -3472,7 +3518,8 @@ input[type="checkbox"] {
 .preview-box:fullscreen .preview-image-area,
 .preview-box:-webkit-full-screen .preview-image-area { padding: 0 }
 .preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
-/* 暂停时画面中间的播放按钮：点它或点画面任意处继续 */
+/* 暂停时画面中间的播放按钮：点它或点画面任意处继续。
+   内联与预览层全屏共用这一份 DOM 和样式，不做任何 :fullscreen 覆盖 */
 .pause-overlay {
   position: absolute;
   left: 50%;
