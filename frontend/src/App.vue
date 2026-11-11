@@ -224,10 +224,16 @@
           <div class="preview-name">{{ previewItem.name }} ({{ previewCurrentIndex + 1 }} / {{ previewMediaList.length }})</div>
           <div v-if="previewItem.type === 'image'" class="img-action-bar">
             <button @click="openOriginal">查看原图</button>
+            <button @click="togglePreviewFullscreen">{{ previewFullscreen ? '退出全屏' : '全屏' }}</button>
             <button @click="rotateLeft">↺ 左旋90°</button>
             <button @click="rotateRight">↻ 右旋90°</button>
             <button @click="resetRotate">重置旋转</button>
             <button @click="startSlideFromCurrent">从此处开始幻灯片</button>
+          </div>
+          <!-- 视频：原生全屏按钮全屏的是 <video> 本身，网页提示层画不出来。
+               这个按钮全屏的是整个预览层，快进/音量/暂停提示都能显示 -->
+          <div v-else-if="!isTvMode" class="img-action-bar">
+            <button @click="togglePreviewFullscreen">{{ previewFullscreen ? '退出全屏' : '全屏' }}</button>
           </div>
           <!-- 电视只有遥控器，没有可点的按钮：把键位直接写在画面上，
                否则「左右快进、上下切换、OK 暂停」全靠猜 -->
@@ -240,8 +246,8 @@
             </template>
           </p>
         </div>
-        <!-- 全屏元素换成 .preview-box 后，只有它子树里的 DOM 才会被渲染。
-             提示层必须放一份在这里，全屏时的快进/音量/播放提示才看得见 -->
+        <!-- 预览层全屏时浏览器只渲染 .preview-box 这棵子树，提示层必须放在
+             这里；原生 <video> 全屏时它仍然画不出来（那是浏览器机制） -->
         <div v-if="seekHud.show" class="seek-hud">{{ seekHud.deltaText }}</div>
       </div>
     </div>
@@ -1246,8 +1252,9 @@ const NATIVE_BAR_HEIGHT = 36   // 只放行进度条最底下的一条，不占�
 const VOL_FULL_SPAN = 0.9      // 纵向滑一屏高度约改 90% 音量，逐像素连续调节
 const KEY_SEEK_STEP = 10       // 键盘左右键每次快进/后退 10 秒
 const KEY_VOLUME_STEP = 0.02   // 键盘上下键每次调 2% 音量
-// 全屏时 top layer 只画 <video>，那行 HUD 不在全屏子树里、看不见，
-// 2% 的差别听不出来，按一下像没反应。全屏用 10%，靠听感就能确认
+// 只有原生 <video> 全屏时用大一点的步进：那种全屏下浏览器只画 <video>，
+// 提示层不在全屏子树里、看不见（机制限制，代码解不了），2% 的差别听不出来，
+// 按一下像没反应。预览层全屏（.preview-box）有提示，仍用 2%
 const KEY_VOLUME_STEP_FULLSCREEN = 0.1
 let touchStartX = 0
 let touchStartY = 0
@@ -1402,95 +1409,67 @@ function adjustVideoVolume(delta) {
   showVolumeHud(r.value, r.applied)
 }
 
-/** 点视频画面 = 只让原生控制条出现，绝不切换播放状态。
- *  暂停/播放只有三个入口：控制条上的播放/暂停按钮、空格键、TV 的 OK 键。
- *  麻烦在于 Chrome 点 <video> 本体会自己顺手切一次播放，所以每次点画面都要
- *  架一层防护：拦下紧接着的那个 play/pause 并还原；个别 WebView 不派发事件时
- *  用 150ms 定时兜底再比一次状态。 */
+/** 点视频画面 = 播放 / 暂停切换（和原生播放器的手感一致）。
+ *  麻烦在「谁去切这一下」：
+ *  1) 浏览器自己也会切。Chrome / Firefox / 移动端 WebView 点 <video> 本体时，
+ *     原生控件会在 click 的 target 阶段先切一次（shadow DOM，早于冒泡到
+ *     .preview-box 的我们）。所以不能无脑切，否则两次抵消、看着像没反应。
+ *  2) 触屏上我们比浏览器更早：touchend 就能切，随后的合成 click 里浏览器又切一次，
+ *     同样抵消。350ms 去重不能只是「直接返回」，否则触屏上永远切不动。
+ *  解法：把「这次点按的期望状态」记下来，两条路径都只负责把状态拉到这个值
+ *  （幂等）。谁先切、切几次都不影响结果。 */
 let surfaceTapLastAt = 0        // touch 与 click 两路只算一次点按
-let surfaceRestoreUntil = 0
-let surfaceRestoreVideo = null
-let surfaceRestorePaused = false   // 点按前的 v.paused，要还原成这个状态
-let surfaceRestoreTimer = null
-// pointerdown 时记下的「点击前是否暂停」。Chrome 点 <video> 本体会在 click 的
-// target 阶段就把播放切掉（原生控件是 shadow DOM，它的处理先于冒泡到 .preview-box
-// 的 click），等我们架防护时 v.paused 已经是被切过的值；拿它当「点击前状态」，
-// 就会把「暂停」当成要还原的目标，于是点了永远是暂停。pointerdown 一定早于那次
-// 切换，只能从这里记
+// pointerdown 记下的「点击前是否暂停」。pointerdown 一定早于浏览器可能顺手做的那次
+// 切换，只有这里能拿到真实的前置状态
 let surfacePausedBeforeTap = null
 let surfacePausedBeforeTapAt = 0
+// 本次点按期望的结束状态（true = 暂停）。第二次派发只做「拉回」，不再重新取反
+let surfaceTapDesired = null
 
-/** 把浏览器自己切走的播放状态还原，并压住还原引发的提示 */
-function restoreVideoPlayback(v, wantPaused) {
+/** 把播放状态强制设成 wantPaused；已经是这个状态就什么都不做 */
+function setVideoPaused(v, wantPaused) {
+  if (!v || v.paused === wantPaused) return
   if (wantPaused) {
     try { v.pause() } catch (e) { /* 忽略 */ }
-  } else {
-    const p = v.play()
-    if (p && typeof p.catch === 'function') p.catch(() => {})
+    return
   }
-  muteVideoPlaybackHint()
-}
-
-/** 点画面之后架好防护 */
-function armPlaybackGuard(v, now, pausedBefore = null) {
-  surfaceRestoreUntil = now + 800
-  surfaceRestoreVideo = v
-  // 优先用 pointerdown 记下的点击前状态；没有（或已经过期）才退回读 v.paused
-  const fresh = surfacePausedBeforeTap !== null && now - surfacePausedBeforeTapAt < 1000
-  surfaceRestorePaused = pausedBefore !== null
-    ? pausedBefore
-    : (fresh ? surfacePausedBeforeTap : v.paused)
-  muteVideoPlaybackHint()
-  clearTimeout(surfaceRestoreTimer)
-  surfaceRestoreTimer = setTimeout(() => {
-    surfaceRestoreTimer = null
-    // 用户明确切了播放 / 换了片会 disarm 并把 surfaceRestoreVideo 置空，
-    // 那时不该再还原；抑制器命中过不算，兜底必须继续确认 play() 真的成功了
-    if (surfaceRestoreVideo !== v) return
-    if (!previewShow.value || getActiveVideo() !== v) return
-    if (v.paused !== surfaceRestorePaused) restoreVideoPlayback(v, surfaceRestorePaused)
-  }, 150)
-}
-
-/** 用户明确要切播放（点控制条按钮 / 按空格 / 遥控器 OK / 换片 / 片尾）：
- *  撤掉防护，让浏览器或按键真正生效。clearHints 用于需要立刻看到状态提示的路径 */
-function disarmPlaybackGuard(clearHints = false) {
-  surfaceRestoreUntil = 0
-  surfaceRestoreVideo = null
-  clearTimeout(surfaceRestoreTimer)
-  surfaceRestoreTimer = null
-  if (clearHints) {
-    videoHintMutedUntil = 0
-    videoStateMutedUntil = 0
-  }
+  const p = v.play()
+  if (p && typeof p.catch === 'function') p.catch(() => {})
 }
 
 function handleSurfaceTap(v) {
   if (!v) return
   const now = Date.now()
-  if (now - surfaceTapLastAt < 350) return
+  if (now - surfaceTapLastAt < 350) {
+    // 同一根手指的第二次派发（touchend 之后的合成 click）：浏览器可能刚替我们
+    // 又切了一次，这里把状态拉回期望值，不再重新取反
+    if (surfaceTapDesired !== null && !v.ended) setVideoPaused(v, surfaceTapDesired)
+    return
+  }
   surfaceTapLastAt = now
-  armPlaybackGuard(v, now)
+  // 没有 pointerdown 记录（合成 click、脚本触发）就按当前状态取反
+  const fresh = surfacePausedBeforeTap !== null && now - surfacePausedBeforeTapAt < 1000
+  const before = fresh ? surfacePausedBeforeTap : v.paused
+  surfacePausedBeforeTap = null
+  surfacePausedBeforeTapAt = 0
+  surfaceTapDesired = !before
+  setVideoPaused(v, surfaceTapDesired)
 }
 
-/** pointerdown 比浏览器切换播放更早：在这里记下「点击前是否暂停」并先把防护架好。
- *  只靠 click 不够——Chrome 在 click 的 target 阶段就切了播放，那时读到的状态
- *  已经是切过之后的 */
+/** pointerdown 只做一件事：记下点击前的播放状态。
+ *  只认 <video> 本体——黑边、自绘按钮、原生控制条那一条都不算「点画面」 */
 function onSurfacePointerDown(e) {
   if (!isVideoPreview()) return
   const v = getActiveVideo()
   if (!v) return
-  // <video> 本体全屏时整块画面归原生控制条管，点一下就是切播放，不插手
+  // <video> 本体全屏时整块画面归原生控制条管，点一下是显示/隐藏控制条
   if (currentFullscreenElement() === v) return
   const t = e.target
-  // 起点在自绘按钮上（× / 图片箭头）：交给按钮自己
-  if (t && typeof t.closest === 'function' && t.closest('button')) return
+  if (!t || t.tagName !== 'VIDEO') return
   // 原生控制条那一条：上面按钮（播放、音量、全屏）的点击要真正生效
   if (inControlsClickArea(e.clientY, v)) return
-  const now = Date.now()
   surfacePausedBeforeTap = v.paused
-  surfacePausedBeforeTapAt = now
-  armPlaybackGuard(v, now, v.paused)
+  surfacePausedBeforeTapAt = Date.now()
 }
 
 /** 打开/关闭预览、换片、退出幻灯片时把点按状态整个归零 */
@@ -1498,13 +1477,13 @@ function resetSurfaceTap() {
   surfaceTapLastAt = 0
   surfacePausedBeforeTap = null
   surfacePausedBeforeTapAt = 0
-  disarmPlaybackGuard()
+  surfaceTapDesired = null
 }
 
 /** 播放 / 暂停当前视频（空格 / TV OK）。这里直接给一次提示：
  *  事件是异步派发的，按下去要立刻有反馈；点控制条按钮那条路径由事件兜住 */
 function toggleVideoPlay() {
-  disarmPlaybackGuard()
+  unmutePlaybackHints()
   const v = getActiveVideo()
   if (!v) return
   if (v.paused) {
@@ -1534,26 +1513,19 @@ function muteVideoPlaybackHint() {
   videoPausedHintShown = false
 }
 
-function isPlaybackGuardActive(now, ev) {
-  return now < surfaceRestoreUntil && !!ev && ev.target === surfaceRestoreVideo
+/** 立刻解除抑制：用户明确点了控制条按钮 / 拖完进度条，提示与状态要马上跟上 */
+function unmutePlaybackHints() {
+  videoHintMutedUntil = 0
+  videoStateMutedUntil = 0
 }
 
 /** <video> 的 play / pause 事件：暂停给提示，恢复播放只在「从暂停里点起来」时提示。
  *  自动播放、切片换源那种 pause→play 连击不该刷屏 */
 function onVideoPlayback(paused, ev) {
   const now = Date.now()
-  // 播到结尾同样会派发 pause，这不是浏览器顺手切的那次。解除防护与静音窗口，
-  // 否则片尾会被强行重新播一遍，且「播放结束」提示与状态都被吞掉
-  if (ev && ev.target && ev.target.ended) disarmPlaybackGuard(true)
-  // 点画面：浏览器顺手切的那次播放状态一律撤销（只撤销一次）。
-  // 播放中点会变成 pause，暂停中点会变成 play，两种都要还原
-  if (isPlaybackGuardActive(now, ev)) {
-    // 只关掉事件拦截（第二个事件不该再被拦），别 disarm：
-    // 否则 150ms 兜底被取消，万一这次 play() 被自动播放策略拒绝就没人补救
-    surfaceRestoreUntil = 0
-    restoreVideoPlayback(ev.target, surfaceRestorePaused)
-    return
-  }
+  // 播到结尾同样会派发 pause，这不是浏览器顺手切的那次。解除静音窗口，
+  // 否则「播放结束」提示与状态都被吞掉
+  if (ev && ev.target && ev.target.ended) unmutePlaybackHints()
   // 两个窗口分开：状态只挡 160ms 的 seek 连击（不跳变），提示挡 500ms（不刷屏）。
   // 以前共用一个 500ms 窗口，用户在这半秒里点控制条暂停会完全丢状态
   if (now >= videoStateMutedUntil) previewPaused.value = paused
@@ -1695,7 +1667,7 @@ function onTouchEnd(e) {
   // resetSeekGesture 会清掉这两个，先留一份
   const startedInBar = touchNativeBar
   const startY = touchStartY
-  if (startedInBar) disarmPlaybackGuard(true)
+  if (startedInBar) unmutePlaybackHints()
   if (seekActive) {
     // 阻止合成 click，否则 .preview-box 会把它当成「点空白退出预览」
     if (e.cancelable) e.preventDefault()
@@ -1716,7 +1688,7 @@ function onTouchEnd(e) {
     return
   }
   resetSeekGesture()
-  // 点一下画面（没滑动、也不在原生控制条上）＝ 只显示控制条，不切播放。
+  // 点一下画面（没滑动、也不在原生控制条上）＝ 播放 / 暂停切换。
   // 安卓 WebView 里点视频不一定派发 click，这里也走一遍，两路由
   // handleSurfaceTap 的 350ms 窗口去重
   if (!startedInBar && Math.abs(dx) <= GESTURE_MIN_DIST && Math.abs(dy) <= GESTURE_MIN_DIST) {
@@ -1724,10 +1696,10 @@ function onTouchEnd(e) {
     const tapVideo = previewShow.value && !slideShow.value ? getActiveVideo() : null
     if (tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
         && inControlsClickArea(startY, tapVideo)) {
-      // 点的是控制条按钮区（含播放/暂停键）：撤掉防护，交给浏览器
-      disarmPlaybackGuard(true)
+      // 点的是控制条按钮区（含播放/暂停键）：交给浏览器，顺便把提示窗口清掉
+      unmutePlaybackHints()
     } else if (!onButton && tapVideo && onVideoSurface(touchStartX, startY, tapVideo)
-        && !inNativeBar(startY, tapVideo)
+        && !inControlsClickArea(startY, tapVideo)
         && currentFullscreenElement() !== tapVideo) {
       handleSurfaceTap(tapVideo)
     }
@@ -1772,8 +1744,8 @@ function handleKeydown(e) {
         && ae && ae !== document.body && typeof ae.blur === 'function') {
       try { ae.blur() } catch (err) { /* 忽略 */ }
     }
-    // <video> 本体全屏时那行 HUD 画不出来（top layer 只渲染 video），只能靠听，
-    // 用 10% 的步进；内联有百分比提示，保持 2% 的细腻手感
+    // <video> 本体全屏时那行 HUD 画不出来（浏览器只渲染全屏元素本身），只能靠听，
+    // 用 10% 的步进；预览层全屏与内联都有百分比提示，保持 2% 的细腻手感
     const volStep = currentFullscreenElement() === video
       ? KEY_VOLUME_STEP_FULLSCREEN
       : KEY_VOLUME_STEP
@@ -1793,15 +1765,12 @@ function handleKeydown(e) {
         e.preventDefault()
         // 幻灯片的全屏是幻灯片自己的一部分，Esc 依旧一次退出幻灯片（保持原样）
         if (slideShow.value) { exitSlide(); break }
-        // 视频预览全屏时 Esc 只退全屏，预览留着；再按一次才关预览
+        // 视频预览 / 图片预览层全屏时 Esc 只退全屏，预览留着；再按一次才关预览
         if (currentFullscreenElement()) {
-          const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
-          if (exit) {
-            // 这次退全屏是我们按 Esc 主动做的，先清掉「上一次全屏元素」，
-            // 免得随后的 fullscreenchange 又记一次退出时刻，把下一次 Esc 白吞掉
-            lastFullscreenEl = null
-            try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (err) { /* 忽略 */ }
-          }
+          // 这次退全屏是我们按 Esc 主动做的，先清掉「上一次全屏元素」，
+          // 免得随后的 fullscreenchange 又记一次退出时刻，把下一次 Esc 白吞掉
+          lastFullscreenEl = null
+          exitAnyFullscreen()
           break
         }
         // 浏览器可能已经先替我们退了全屏（原生 <video> 全屏时 Esc 由浏览器自己处理），
@@ -2217,6 +2186,39 @@ async function openRootFullscreen() {
   }
 }
 
+// 预览层自己的全屏：全屏的是 .preview-box，不是 <video>。
+// 视频走原生全屏按钮时，浏览器把 <video> 单独放进 top layer，只渲染它本身，
+// 预览层里的提示（快进秒数、音量、已暂停）根本画不出来。全屏容器就绕开了这一点：
+// 提示层、关闭键、上下张箭头都在同一个子树里，全屏时照样可见，
+// Esc 也保持「先退全屏、再按一次才关预览」。
+const previewFullscreen = ref(false)
+
+/** 退出全屏统一入口：各浏览器把方法挂在 document 上的前缀不一样 */
+function exitAnyFullscreen() {
+  const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
+  if (!exit || !currentFullscreenElement()) return Promise.resolve()
+  try {
+    return Promise.resolve(exit.call(document)).catch(() => {})
+  } catch (e) { return Promise.resolve() }
+}
+
+async function togglePreviewFullscreen() {
+  if (currentFullscreenElement()) {
+    await exitAnyFullscreen()
+    return
+  }
+  const box = previewBoxRef.value
+  if (!box) return
+  const req = box.requestFullscreen || box.webkitRequestFullscreen || box.msRequestFullscreen
+  if (!req) { showHud('当前浏览器不支持全屏'); return }
+  try {
+    await req.call(box)
+  } catch (e) {
+    // 浏览器要求全屏由用户手势触发，脚本代点会走到这里
+    showHud('浏览器拒绝了全屏')
+  }
+}
+
 // 前缀 API 的老浏览器（旧 Safari / 旧 Edge）没有标准属性，必须一起判断
 function currentFullscreenElement() {
   return document.fullscreenElement
@@ -2237,13 +2239,9 @@ function exitSlide() {
   clearTimeout(slideTimer.value)
   slideShow.value = false
   randomSlideMode.value = false
-  const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
-  // 已经不在全屏时（用户按 ESC 退出）再调 exitFullscreen 一定 reject，要兜住
-  if (exit && currentFullscreenElement()) {
-    try {
-      Promise.resolve(exit.call(document)).catch(() => {})
-    } catch (e) { /* 忽略：退出全屏失败不影响关闭幻灯片界面 */ }
-  }
+  // 已经不在全屏时（用户按 ESC 退出）再调 exitFullscreen 一定 reject，
+  // exitAnyFullscreen 里已经先判过全屏元素、也兜住了 rejection
+  exitAnyFullscreen()
   slideFullscreenOwned = false
 }
 
@@ -2325,15 +2323,15 @@ function onPreviewBoxClick(e) {
   // 这段时间内忽略「点空白退出」，避免刚快进完预览就被关掉
   if (Date.now() < suppressPreviewClickUntil) return
   if (isVideoPreview()) {
-    // 视频预览：点画面只显示控制条，绝不切播放。底部那一条是原生控制条，
-    // 用户点上面的播放/暂停按钮时撤掉防护，让浏览器自己切。
-    // <video> 本体全屏时整块画面都归原生控制条管（点一下是显示/隐藏控制条、
-    // 双击才是全屏行为），这里也一并放行，不去架防护
+    // 视频预览：点画面切播放 / 暂停；底部那一条是原生控制条，上面的按钮
+    // （播放、音量、全屏）交给浏览器自己处理。
+    // <video> 本体全屏时整块画面都归原生控制条管（点一下是显示/隐藏控制条），
+    // 这里也一并放行
     const t = e.target
     const v = getActiveVideo()
     if (t && t.tagName === 'VIDEO' && v) {
       if (inControlsClickArea(e.clientY, v) || currentFullscreenElement() === v) {
-        disarmPlaybackGuard(true)
+        unmutePlaybackHints()
       } else {
         handleSurfaceTap(v)
       }
@@ -2358,16 +2356,14 @@ function closePreview() {
   resetSurfaceTap()
   // 关预览前先退出全屏：全屏元素被 v-if 卸载后虽然浏览器也会收尾，
   // 但显式退比依赖实现细节稳
-  if (currentFullscreenElement()) {
-    const exit = document.exitFullscreen || document.webkitExitFullscreen
-    if (exit) {
-      try { Promise.resolve(exit.call(document)).catch(() => {}) } catch (e) { /* 忽略 */ }
-    }
-  }
+  if (currentFullscreenElement()) exitAnyFullscreen()
   previewShow.value = false
   previewItem.value = null
   previewMediaList.value = []
   previewCurrentIndex.value = 0
+  // 退出全屏由 fullscreenchange 兜着，这里再清一次：个别 WebView 退全屏不派发
+  // 事件，残留 true 会让下次打开显示成「退出全屏」
+  previewFullscreen.value = false
   // 界面主动关闭时把预览占用的那条历史退掉；popstate 会负责清标志
   if (previewHistoryPushed) {
     window.history.back()
@@ -2449,6 +2445,7 @@ function resetUiState() {
   previewMediaList.value = []
   previewCurrentIndex.value = 0
   previewHistoryPushed = false
+  previewFullscreen.value = false
 
   settingShow.value = false
   changePwdModal.value = false
@@ -2864,6 +2861,8 @@ function onFullscreenChange(){
   // 浏览器里没有这个变量，undefined 为假，行为不变
   if (window.__albumVideoFullscreen) return
   const el = currentFullscreenElement()
+  // 预览层全屏时按钮文案要变成「退出全屏」；<video> 本体全屏不算
+  previewFullscreen.value = !!el && el === previewBoxRef.value
   // 记下「刚退出全屏」的时刻，供 Esc 分支判断这一次 Esc 是不是已经用来退全屏了。
   // 关预览 / 关幻灯片时也会退全屏，那不属于按 Esc 退全屏，不记（否则紧接着
   // 打开下一个视频按 Esc 会被白吞一次）
@@ -2925,7 +2924,6 @@ onMounted(() => {
 onUnmounted(() => {
   disposed = true
   clearTimeout(seekHudTimer)
-  clearTimeout(surfaceRestoreTimer)
   lockPageScroll(false)
   delete window.__albumVideoSeekRatio
   delete window.__albumVideoGestureStart
@@ -3557,6 +3555,17 @@ input[type="checkbox"] {
 }
 .arrow-btn:hover:not(:disabled) { background: rgba(91, 130, 247, .8) }
 .arrow-btn:disabled { opacity: .25; cursor: default }
+/* 预览层全屏（图片 / 视频共用）：全屏的是 .preview-box 而不是 <video>，
+   提示层、关闭键、上下张箭头都在它子树里，全屏时照常可见 */
+.preview-box:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  background: #000;
+}
+/* 全屏时画到边，不再留遮罩那圈 18px 内边距 */
+.preview-box:fullscreen .preview-image-area { padding: 0 }
 .arrow-left { left: 10px }
 .arrow-right { right: 10px }
 .preview-image-area {
@@ -3584,8 +3593,15 @@ input[type="checkbox"] {
 .preview-image-area img:focus-visible,
 .preview-image-area video:focus,
 .preview-image-area video:focus-visible { outline: none }
-/* 视频预览：底部只留文件名那一行，把画面高度还给视频 */
-.preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
+/* 视频预览：底部只放文件名 + 全屏按钮那一行，把画面高度还给视频 */
+.preview-footer.footer-compact {
+  padding: 6px 16px 10px;
+  gap: 10px;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+}
 .preview-footer {
   flex-shrink: 0;
   padding: 10px 16px 14px;
