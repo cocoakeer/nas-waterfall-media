@@ -212,12 +212,6 @@
             @play="onVideoPlayback(false, $event)"
             @pause="onVideoPlayback(true, $event)"
           ></video>
-          <!-- 暂停时画面中间给一个大按钮：底部的操作条已经去掉了，
-               不给提示会让人以为卡住；点画面任意处或点它都能继续 -->
-          <button v-if="showPauseOverlay" class="pause-overlay" aria-label="继续播放"
-                  @click.stop="toggleVideoPlay">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-          </button>
         </div>
         <div class="preview-footer" :class="{'footer-compact': previewItem.type !== 'image' && !isTvMode}">
           <div class="preview-name">{{ previewItem.name }} ({{ previewCurrentIndex + 1 }} / {{ previewMediaList.length }})</div>
@@ -640,11 +634,6 @@ const previewCurrentIndex = ref(0)
 const imgRotateDeg = ref(0)
 /** 预览里的视频是否暂停着：画面中间那个大按钮与电视端的键位提示都靠它 */
 const previewPaused = ref(false)
-/** 暂停时的居中播放按钮：只给视频、只在预览里显示 */
-const showPauseOverlay = computed(() =>
-  previewShow.value && previewPaused.value && !!previewItem.value &&
-  previewItem.value.type !== 'image')
-
 const settingShow = ref(false)
 const slideDelay = ref(3)
 const slideLoop = ref(true)
@@ -885,7 +874,9 @@ function onPreviewMediaReady() {
     p.catch(() => {
       v.muted = true
       videoMutedFallback = true
-      v.play().catch(() => {})
+      // 部分 WebView 的 play() 返回 undefined，直接 .catch 会抛 TypeError
+      const p2 = v.play()
+      if (p2 && typeof p2.catch === 'function') p2.catch(() => {})
     })
   }
 }
@@ -1353,7 +1344,8 @@ function keySeekVideo(delta) {
 function applyVolume(v, wanted) {
   const next = Math.min(1, Math.max(0, Math.round(wanted * 100) / 100))
   if (next > 0 && v.muted) {
-    // 自动播放被浏览器策略拦截时会降级为静音，调大音量应顺带恢复声音
+    // 自动播放被浏览器策略拦截时会降级为静音；目标音量不为 0 就说明用户想听声，
+    // 顺带解除静音（减小音量时同样生效）
     try { v.muted = false } catch (e) { /* 忽略 */ }
   }
   let applied = false
@@ -1388,6 +1380,18 @@ let surfaceTap = { until: 0, lastAt: 0 }
 let surfaceRestoreUntil = 0
 let surfaceRestoreVideo = null
 let surfaceRestorePaused = false   // 点击前的 v.paused，要恢复成这个状态
+let surfaceRestoreTimer = null
+
+/** 把浏览器自己切走的播放状态还原到点击前的样子，并压住还原引发的提示 */
+function restoreVideoPlayback(v, wantPaused) {
+  if (wantPaused) {
+    try { v.pause() } catch (e) { /* 忽略 */ }
+  } else {
+    const p = v.play()
+    if (p && typeof p.catch === 'function') p.catch(() => {})
+  }
+  muteVideoPlaybackHint()
+}
 
 function handleSurfaceTap(v) {
   if (!v) return
@@ -1397,6 +1401,8 @@ function handleSurfaceTap(v) {
   const wantToggle = now <= surfaceTap.until
   if (wantToggle) {
     // 控制条还在：这一次就是明确的暂停/继续，解除第一次留下的所有抑制
+    clearTimeout(surfaceRestoreTimer)
+    surfaceRestoreTimer = null
     surfaceRestoreUntil = 0
     surfaceRestoreVideo = null
     videoHintMutedUntil = 0
@@ -1404,11 +1410,21 @@ function handleSurfaceTap(v) {
     previewPaused.value = v.paused
     requestVideoToggle(v)
   } else {
-    // 控制条已收起：只让它出来，播放状态必须原样保留
-    surfaceRestoreUntil = now + 400
+    // 控制条已收起：只让它出来，播放状态必须原样保留。
+    // 窗口覆盖整个 3 秒显示期，浏览器什么时候派发 pause/play 都能拦住（只拦第一个）
+    surfaceRestoreUntil = now + 3000
     surfaceRestoreVideo = v
     surfaceRestorePaused = v.paused
     muteVideoPlaybackHint()
+    // 事件兜底：个别 WebView 不派发 play/pause，或 play() 被自动播放策略拒绝，
+    // 150ms 后再比一次状态，确保第一次点击绝不会把视频停住
+    clearTimeout(surfaceRestoreTimer)
+    surfaceRestoreTimer = setTimeout(() => {
+      surfaceRestoreTimer = null
+      if (surfaceRestoreUntil === 0) return   // 抑制器已经处理过
+      if (!previewShow.value || getActiveVideo() !== v) return
+      if (v.paused !== surfaceRestorePaused) restoreVideoPlayback(v, surfaceRestorePaused)
+    }, 150)
   }
   surfaceTap.until = now + 3000
 }
@@ -1421,6 +1437,8 @@ function resetSurfaceTap() {
   surfaceRestoreUntil = 0
   surfaceRestoreVideo = null
   surfaceRestorePaused = false
+  clearTimeout(surfaceRestoreTimer)
+  surfaceRestoreTimer = null
   if (toggleRequest) { clearTimeout(toggleRequest.timer); toggleRequest = null }
 }
 
@@ -1484,20 +1502,27 @@ function muteVideoPlaybackHint() {
  *  自动播放、切片换源那种 pause→play 连击不该刷屏 */
 function onVideoPlayback(paused, ev) {
   const now = Date.now()
+  // 播到结尾同样会派发 pause，这不是浏览器顺手切的那次。先解除抑制器，
+  // 否则 3 秒窗口内片尾一到，视频会被强行重新播一遍
+  if (ev && ev.target && ev.target.ended && ev.target === surfaceRestoreVideo
+      && surfaceRestoreUntil) {
+    surfaceRestoreUntil = 0
+    surfaceRestoreVideo = null
+    clearTimeout(surfaceRestoreTimer)
+    surfaceRestoreTimer = null
+    // 片尾同样是一次真实的状态变化，别被第一次点击的静音窗口吞掉
+    videoHintMutedUntil = 0
+    videoStateMutedUntil = 0
+  }
   // 第一次点画面：浏览器顺手切的那次播放状态一律撤销（只撤销一次）。
   // 播放中点会变成 pause，暂停中点会变成 play，两种都要还原，
   // 否则「暂停时点一下显示控制条」会直接把视频放起来
   if (now < surfaceRestoreUntil && ev && ev.target === surfaceRestoreVideo) {
+    clearTimeout(surfaceRestoreTimer)
+    surfaceRestoreTimer = null
     surfaceRestoreUntil = 0
     surfaceRestoreVideo = null
-    const v = ev.target
-    if (surfaceRestorePaused) {
-      try { v.pause() } catch (err) { /* 忽略 */ }
-    } else {
-      const p = v.play()
-      if (p && typeof p.catch === 'function') p.catch(() => {})
-    }
-    muteVideoPlaybackHint()
+    restoreVideoPlayback(ev.target, surfaceRestorePaused)
     return
   }
   // 两个窗口分开：状态只挡 160ms 的 seek 连击（不闪按钮），提示挡 500ms（不刷屏）。
@@ -2853,6 +2878,7 @@ onMounted(() => {
 onUnmounted(() => {
   disposed = true
   clearTimeout(seekHudTimer)
+  clearTimeout(surfaceRestoreTimer)
   if (toggleRequest) clearTimeout(toggleRequest.timer)
   lockPageScroll(false)
   delete window.__albumVideoSeekRatio
@@ -3488,15 +3514,13 @@ input[type="checkbox"] {
 .arrow-left { left: 10px }
 .arrow-right { right: 10px }
 .preview-image-area {
-  position: relative;   /* 暂停按钮的定位参照：贴在画面正中，不被页脚拉偏 */
   flex: 1;
   min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  /* 上下必须对称：暂停按钮按 padding box 居中，视频按 content box 居中。
-     不对称时内联会偏几像素，全屏（padding:0）却不偏，两边看着就不一样 */
+  /* 上下对称，内联与全屏（padding:0）的画面区中心一致 */
   padding: 14px 18px;
 }
 .preview-image-area img,
@@ -3518,29 +3542,6 @@ input[type="checkbox"] {
 .preview-box:fullscreen .preview-image-area,
 .preview-box:-webkit-full-screen .preview-image-area { padding: 0 }
 .preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
-/* 暂停时画面中间的播放按钮：点它或点画面任意处继续。
-   内联与预览层全屏共用这一份 DOM 和样式，不做任何 :fullscreen 覆盖 */
-.pause-overlay {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  width: 76px;
-  height: 76px;
-  padding: 0;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(10, 12, 18, .62);
-  border: 1px solid rgba(255, 255, 255, .22);
-  color: #fff;
-  cursor: pointer;
-  backdrop-filter: blur(6px);
-  transition: background .15s ease, transform .12s ease;
-}
-.pause-overlay:hover { background: rgba(10, 12, 18, .78); transform: translate(-50%, -50%) scale(1.04) }
-.pause-overlay svg { width: 34px; height: 34px; margin-left: 3px }
 .preview-footer {
   flex-shrink: 0;
   padding: 10px 16px 14px;
@@ -3968,8 +3969,6 @@ input[type="checkbox"] {
 }
 .tv-mode .preview-name { font-size: 18px }
 /* 遥控器没有可点的按钮，键位只能写在画面上（十英尺外也要看得清） */
-.tv-mode .pause-overlay { width: 120px; height: 120px }
-.tv-mode .pause-overlay svg { width: 54px; height: 54px }
 .tv-key-hint {
   margin: 0;
   font-size: 18px;
