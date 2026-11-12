@@ -191,7 +191,8 @@
     <!-- 全屏元素是 .preview-box（top layer 只渲染它和它的子树），
          所以手势必须挂在它身上全屏时才收得到；遮罩那套加 .self 只补最外圈黑边，
          两者互斥，不会一次触摸触发两遍 -->
-    <div v-if="previewShow" class="preview-mask" @click.self="onPreviewMaskClick" @wheel="stopOverlayWheel"
+    <div v-if="previewShow" class="preview-mask" :class="{ 'is-preview-fs': pseudoFullscreen }"
+         @click.self="onPreviewMaskClick" @wheel="stopOverlayWheel"
          @touchstart.self="onTouchStart" @touchmove.self="onTouchMove"
          @touchend.self="onTouchEnd" @touchcancel.self="onTouchCancel">
       <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick"
@@ -227,8 +228,6 @@
               @click="onVideoSurfaceClick"
               @play="onVideoPlayback(false, $event)"
               @pause="onVideoPlayback(true, $event)"
-              @webkitbeginfullscreen="onIosVideoFullscreen(true)"
-              @webkitendfullscreen="onIosVideoFullscreen(false)"
             ></video>
             <!-- 暂停时画面中央的圆钮：尺寸自己定，比浏览器内建那个小一号 -->
             <button v-if="previewPaused" class="video-center-btn" type="button"
@@ -268,9 +267,9 @@
                      :value="Math.round(videoVolume * 100)"
                      aria-label="音量" @input="onVolumeInput" />
               <button class="vc-btn" type="button"
-                      :aria-label="previewFullscreen ? '退出全屏' : '全屏'"
+                      :aria-label="isPreviewFs ? '退出全屏' : '全屏'"
                       @click="togglePreviewFullscreen">
-                <svg v-if="previewFullscreen" viewBox="0 0 24 24" aria-hidden="true">
+                <svg v-if="isPreviewFs" viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M9 4H4v5h2V6h3zm6 0v2h3v3h2V4zM4 15v5h5v-2H6v-3zm14 0h-2v3h-3v2h5z"/>
                 </svg>
                 <svg v-else viewBox="0 0 24 24" aria-hidden="true">
@@ -288,12 +287,12 @@
               <span class="icon-btn-text">查看原图</span>
             </button>
             <button class="icon-btn" type="button"
-                    :data-tip="previewFullscreen ? '退出全屏' : '全屏'"
-                    :aria-label="previewFullscreen ? '退出全屏' : '全屏'"
+                    :data-tip="isPreviewFs ? '退出全屏' : '全屏'"
+                    :aria-label="isPreviewFs ? '退出全屏' : '全屏'"
                     @click.stop="togglePreviewFullscreen">
-              <svg v-if="previewFullscreen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg>
+              <svg v-if="isPreviewFs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg>
               <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
-              <span class="icon-btn-text">{{ previewFullscreen ? '退出全屏' : '全屏' }}</span>
+              <span class="icon-btn-text">{{ isPreviewFs ? '退出全屏' : '全屏' }}</span>
             </button>
             <button class="icon-btn" type="button" data-tip="向左旋转 90°" aria-label="向左旋转 90 度" @click="rotateLeft">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
@@ -1946,14 +1945,13 @@ function handleKeydown(e) {
           exitAnyFullscreen()
           break
         }
-        // 浏览器可能已经先替我们退了全屏（原生 <video> 全屏时 Esc 由浏览器自己处理），
-        // 此时 fullscreenElement 已是 null。刚退过全屏的那一次 Esc 不再叠加关预览，
-        // 否则一次 Esc 会同时退全屏 + 关预览，看着像按一下就全没了
+        // 浏览器可能已经先替我们退了全屏（Esc 退全屏时由浏览器自己处理，
+        // 页面未必收得到 keydown），此时 fullscreenElement 已是 null。
+        // 刚退过全屏的那一次 Esc 不再叠加关预览，否则一次 Esc 会同时
+        // 退全屏 + 关预览，看着像按一下就全没了
         if (Date.now() - fullscreenExitAt < 600) { fullscreenExitAt = 0; break }
-        // iPhone 系统播放器全屏不是 DOM 全屏：previewFullscreen 为 true 但查不到
-        // 全屏元素。这一下 Esc 归系统播放器处理，网页不能再顺手关预览，
-        // 否则系统还在播、背后的预览已经没了
-        if (previewFullscreen.value) break
+        // 伪全屏（iPhone 上没有 Element 全屏）同理：Esc 先退全屏，预览留着；再按一次才关
+        if (pseudoFullscreen.value) { exitPseudoFullscreen(); break }
         closePreview()
         break
       }
@@ -2027,6 +2025,8 @@ function handleKeydown(e) {
       // 浏览器可能已经先替我们退了全屏，此时 fullscreenElement 已是 null，
       // 刚退过全屏的那一次 Esc 不再叠加关预览
       if (Date.now() - fullscreenExitAt < 600) { fullscreenExitAt = 0; break }
+      // 伪全屏（iPhone 图片预览）同样两段式：先退全屏，再按一次才关预览
+      if (pseudoFullscreen.value) { exitPseudoFullscreen(); break }
       closePreview()
       break
     }
@@ -2394,11 +2394,31 @@ async function openRootFullscreen() {
 }
 
 // 预览层自己的全屏：全屏的是 .preview-box，不是 <video>。
-// 视频走原生全屏按钮时，浏览器把 <video> 单独放进 top layer，只渲染它本身，
-// 预览层里的提示（快进秒数、音量、已暂停）根本画不出来。全屏容器就绕开了这一点：
-// 提示层、关闭键、上下张箭头都在同一个子树里，全屏时照样可见，
-// Esc 也保持「先退全屏、再按一次才关预览」。
+// 这也是不让 <video> 自己全屏的原因：浏览器会把 <video> 单独放进 top layer，
+// 只渲染它本身，预览层里的提示（快进秒数、音量、已暂停）根本画不出来。
+// 全屏容器就绕开了这一点：提示层、关闭键、上下张箭头都在同一个子树里，
+// 全屏时照样可见，Esc 也保持「先退全屏、再按一次才关预览」。
 const previewFullscreen = ref(false)
+
+// iPhone 上 WebKit 不提供 Element 全屏（只有 iPad 和桌面有），所以预览层
+// 拿不到真正的全屏，只能把预览框用 CSS 铺满可见视口——图片和视频共用这一套。
+// 视频本来可以走 webkitEnterFullscreen 交给系统播放器换真全屏，但那是独立
+// 原生界面，网页的 JS 在里面不执行，左右滑快进/上下滑调音量/自绘控制条
+// 全部失效，所以不用它。地址栏和底部工具栏仍然在，那是 WebKit 的硬限制——
+// JS 无论怎么调都关不掉，换浏览器也一样，因为 iOS 上所有浏览器内核都是 WebKit。
+// 两个状态分开存：DOM 全屏由 fullscreenchange 事件驱动，伪全屏由我们自己管，
+// 混成一个会被事件回调覆盖掉
+const pseudoFullscreen = ref(false)
+/** 按钮文案与图标看这个：不管走的是真全屏还是伪全屏，都该显示「退出全屏」 */
+const isPreviewFs = computed(() => previewFullscreen.value || pseudoFullscreen.value)
+
+function exitPseudoFullscreen() {
+  pseudoFullscreen.value = false
+  // 退出后画面尺寸变了：× 原本贴在图片右上角要重新算，
+  // 视频控制条也要按新的实际宽度决定收多少（和 DOM 全屏那条路一致）
+  updateCloseBtnPos()
+  updateVideoControlsMetrics()
+}
 
 /** 退出全屏统一入口：各浏览器把方法挂在 document 上的前缀不一样 */
 function exitAnyFullscreen() {
@@ -2410,6 +2430,8 @@ function exitAnyFullscreen() {
 }
 
 async function togglePreviewFullscreen() {
+  // 伪全屏没有 DOM 全屏元素，得先单独接住，否则会一路走到下面的 requestFullscreen
+  if (pseudoFullscreen.value) { exitPseudoFullscreen(); return }
   if (currentFullscreenElement()) {
     // 点「退出全屏」这一下会让 .preview-box 从 100vw×100vh 缩回窗口尺寸，
     // 按钮位置也跟着挪。鼠标 pointerdown 还按在按钮上、pointerup 时布局已经
@@ -2425,49 +2447,26 @@ async function togglePreviewFullscreen() {
   if (!box) return
   const req = box.requestFullscreen || box.webkitRequestFullscreen || box.msRequestFullscreen
   if (!req) {
-    // iPhone 上 WebKit 根本不提供 Element 全屏（只给 iPad 和桌面），
-    // 唯一能把画面铺满屏幕的办法，是把 <video> 交给 iOS 系统播放器。
-    // 代价固定：进去以后是系统控制条，自绘控制层、快进/音量手势、黄色提示
-    // 全都不再显示——这是平台机制，代码换不回来。
-    // 这里必须同步调用：iOS 要求全屏由用户手势直接触发，中间 await 一次就会被拒
-    const v = isVideoPreview() ? previewMediaRef.value : null
-    if (v && typeof v.webkitEnterFullscreen === 'function') {
-      try {
-        v.webkitEnterFullscreen()
-      } catch (e) {
-        showHud('进入全屏失败')
-      }
-      return
-    }
-    showHud('当前浏览器不支持全屏')
+    // iPhone 上 WebKit 根本不提供 Element 全屏（只给 iPad 和桌面）。
+    // 曾经把 <video> 交给 iOS 系统播放器（webkitEnterFullscreen）来换真全屏，
+    // 但那是独立的原生界面，网页的 JS 在里面完全不执行——左右滑快进、
+    // 上下滑调音量、自绘控制条、黄色提示全都失效，一进全屏就丢功能。
+    // 所以图片和视频统一退回伪全屏：CSS 把预览框铺满可见视口，手势和控件都还在。
+    // 代价固定：地址栏和底部工具栏去不掉（WebKit 硬限制，换浏览器也一样），
+    // 也不是系统播放器那种真全屏
+    pseudoFullscreen.value = true
+    updateCloseBtnPos()
+    updateVideoControlsMetrics()
     return
   }
   try {
     await req.call(box)
   } catch (e) {
-    // 浏览器要求全屏由用户手势触发，脚本代点会走到这里
-    showHud('浏览器拒绝了全屏')
-  }
-}
-
-// iPhone 的系统播放器全屏不派发 fullscreenchange，只有这两个私有事件。
-// 进出都把播放提示静音：系统播放器接管、交还 <video> 时浏览器会补发一对
-// pause→play，那不是用户点的，弹「已暂停」纯属误导。
-// 退出后把按钮文案复位，否则控制条会一直停在「退出全屏」
-function onIosVideoFullscreen(on) {
-  muteVideoPlaybackHint()
-  previewFullscreen.value = on
-  if (on) return
-  // 系统播放器里拖过进度，退出后这边的 <video> 未必会立刻补一次 timeupdate，
-  // 手动同步一下，免得控制条停在进全屏之前的位置
-  onVideoTimeUpdate()
-  // 上面那 160ms 的状态静音窗口会把系统播放器交还时补发的 pause/play 一起挡掉，
-  // previewPaused 就停在进全屏之前的旧值上——退回页面后中央播放按钮、
-  // 控制条显隐会和真实状态对不上。直接读 DOM 拉齐一次
-  const v = previewMediaRef.value
-  if (v && v.tagName === 'VIDEO') {
-    previewPaused.value = v.paused
-    if (previewShow.value && !slideShow.value) showVideoControls(v.paused)
+    // 浏览器要求全屏必须由用户手势直接触发，脚本代点会走到这里。
+    // 有 API 但被拒（个别 WebView 会这样），同样退回伪全屏，别让按钮变成死键
+    pseudoFullscreen.value = true
+    updateCloseBtnPos()
+    updateVideoControlsMetrics()
   }
 }
 
@@ -2587,6 +2586,7 @@ function onPreviewBoxClick(e) {
   // 以前这里直接 closePreview，全屏下点一下黑边整个预览就没了，
   // 看着像「退出全屏怎么把预览一起关了」。与 Esc 的两段式保持一致；
   // 全屏时 × 仍在画面右上角，真想关预览点它就行
+  if (pseudoFullscreen.value) { exitPseudoFullscreen(); return }
   if (currentFullscreenElement() === previewBoxRef.value) {
     exitAnyFullscreen()
     return
@@ -2611,6 +2611,7 @@ function closePreview() {
   // 退出全屏由 fullscreenchange 兜着，这里再清一次：个别 WebView 退全屏不派发
   // 事件，残留 true 会让下次打开显示成「退出全屏」
   previewFullscreen.value = false
+  pseudoFullscreen.value = false
   // 界面主动关闭时把预览占用的那条历史退掉；popstate 会负责清标志
   if (previewHistoryPushed) {
     window.history.back()
@@ -3822,6 +3823,25 @@ input[type="checkbox"] {
 }
 /* 全屏时画到边，不再留遮罩那圈 18px 内边距 */
 .preview-box:fullscreen .preview-image-area { padding: 0 }
+
+/* iPhone 没有 Element 全屏，图片预览退到这一套：遮罩自身铺满可见视口，
+   预览框跟着撑满，四周不再留 3vw / 6vh 的白。
+   100dvh 跟随 iOS 地址栏收放后的可视高度；旧浏览器不认这个单位时整条声明
+   被丢弃，自动回落到上一行的 100vh，不会丢样式。
+   地址栏本身去不掉——那是 WebKit 的限制，不是这里没写对 */
+.preview-mask.is-preview-fs {
+  padding: 0;
+  height: 100vh;
+  height: 100dvh;
+}
+.preview-mask.is-preview-fs .preview-box {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  background: #000;
+}
+.preview-mask.is-preview-fs .preview-image-area { padding: 0 }
 .arrow-left { left: 10px }
 .arrow-right { right: 10px }
 .preview-image-area {
@@ -4316,6 +4336,11 @@ input[type="checkbox"] {
 .slide-root {
   position: fixed;
   inset: 0;
+  /* 只写 inset:0 时高度取的是 layout viewport，iOS 上地址栏会盖住底部一条。
+     换成 dvh 跟随可见高度，底部文件名和箭头不会被挡。
+     不支持 dvh 的浏览器丢弃这一行，回落到上一行的 100vh */
+  height: 100vh;
+  height: 100dvh;
   background: #000;
   z-index: 9999;
   display: flex;
