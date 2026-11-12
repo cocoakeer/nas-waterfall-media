@@ -449,7 +449,7 @@
           <div class="um-form-item">
             <label>允许访问目录（多选）</label>
             <div class="multi-select-wrap">
-              <div v-for="opt in dirOptions" class="check-item">
+              <div v-for="opt in dirOptions" :key="opt" class="check-item">
                 <input type="checkbox" :value="opt" v-model="umForm.allow_dirs" :id="'umdir_'+opt" />
                 <label :for="'umdir_'+opt">{{opt}}</label>
               </div>
@@ -540,7 +540,9 @@
     </div>
 
     <!-- 幻灯片 / 列表页那份提示。预览打开时由 .preview-box 内那份负责，
-         两者互斥，不会同时出现两个（fixed + 极高 z-index 保证盖得住） -->
+         两者互斥，不会同时出现两个（fixed + 极高 z-index 保证盖得住）。
+         从预览点进幻灯片时预览层仍挂在底下（退出要回原图），但那条路只播图片、
+         不会有快进提示，所以这里判 previewShow 不会漏提示 -->
     <div v-if="seekHud.show && !previewShow" class="seek-hud">{{ seekHud.deltaText }}</div>
   </div>
 </template>
@@ -749,6 +751,9 @@ let randomSlideCancelled = false
 // 首页随机幻灯片：全库随机抽取；预览里的「从此处开始幻灯片」仍是顺序播放
 const randomSlideLoading = ref(false)
 const randomSlideMode = ref(false)
+// 从预览点进来的幻灯片，退出时要回到当前这张的预览；首页「随机幻灯片」没有
+// 来源预览，退出仍回列表。两种来源靠这个标志区分
+let slideFromPreview = false
 const randomBatchLoading = ref(false)
 // 首次启动后台要在后台建图片索引，大库可能要几十秒，这里把它显示出来
 const randomSlideHint = ref('')
@@ -2361,10 +2366,21 @@ function startSlideFromCurrent() {
   if (slideList.value.length === 0) return alert('没有图片可以幻灯片')
   const idx = slideList.value.findIndex(x => x.path === previewItem.value.path)
   slideIndex.value = Math.max(idx, 0)
-  closePreview()
-  openRootFullscreen()
+  // 预览层不关：幻灯片只是盖在它上面（z-index 更高）。退出时才能原地回到
+  // 当前这张的预览——不用重新加载图片，也不会一路退回列表
+  slideFromPreview = true
   slideShow.value = true
   runSlide()
+  enterSlideFullscreen()
+}
+
+// 幻灯片要的是整页全屏。若预览层本来就在全屏（先全屏看图、再点幻灯片），
+// 必须把全屏元素换成整页：top layer 只渲染全屏元素那棵子树，留在 .preview-box
+// 上的话幻灯片根本画不出来。换不过去（个别浏览器不允许在无手势的异步链路里
+// 换全屏元素）时至少把预览的全屏退掉，别让幻灯片藏在后面
+async function enterSlideFullscreen() {
+  await openRootFullscreen()
+  if (currentFullscreenElement() === previewBoxRef.value) exitAnyFullscreen()
 }
 
 // 我们自己请求的全屏是否还在生效：用来区分「用户按 ESC 退出全屏」和
@@ -2491,9 +2507,36 @@ function exitSlide() {
   slideShow.value = false
   randomSlideMode.value = false
   // 已经不在全屏时（用户按 ESC 退出）再调 exitFullscreen 一定 reject，
-  // exitAnyFullscreen 里已经先判过全屏元素、也兜住了 rejection
+  // exitAnyFullscreen 里已经先判过全屏元素、也兜住了 rejection。
+  // 退全屏前清掉「上一次全屏元素」：这是我们主动退的，别让 fullscreenchange
+  // 记成「刚按 Esc 退过全屏」，否则紧接着按 Esc 想关预览会被白吞一次
+  lastFullscreenEl = null
   exitAnyFullscreen()
   slideFullscreenOwned = false
+  // 同理：有的浏览器先自己退全屏、再派发 keydown，fullscreenchange 会先记一次
+  // 「刚退过全屏」。这次 Esc 已经用来退幻灯片了，清掉时间窗，
+  // 免得紧接着按 Esc 想关预览被白吞一次
+  fullscreenExitAt = 0
+  // 从预览进来的：翻到哪张就回到哪张的预览，而不是退回列表
+  if (slideFromPreview) {
+    slideFromPreview = false
+    syncPreviewToSlide()
+  }
+}
+
+// 退出幻灯片时把预览对齐到当前这一张：用户翻了几张再退出，应该停在最后看的那张。
+// 幻灯片是从预览列表里筛出图片生成的，当前这张的路径一定能在这份列表里找到
+function syncPreviewToSlide() {
+  const cur = currentSlide.value
+  const list = previewMediaList.value
+  if (!cur || !cur.path || !list.length) return
+  const idx = list.findIndex(x => x.path === cur.path)
+  previewCurrentIndex.value = idx >= 0
+    ? idx
+    : Math.min(Math.max(previewCurrentIndex.value, 0), list.length - 1)
+  previewItem.value = list[previewCurrentIndex.value]
+  // 同一张图可能刚被旋转过：换片就要回到原始方向，和其它切张路径一致
+  resetRotate()
 }
 
 function runSlide() {
@@ -2619,20 +2662,24 @@ function closePreview() {
 }
 
 function onPopState(e) {
+  // 幻灯片盖在预览之上（从预览点进来的），返回键先退幻灯片回到那张的预览。
+  // 幻灯片自己不占历史记录，这次 pop 消费掉的是预览那条，所以退完要补压一条，
+  // 否则再按一次返回会把目录一起退掉
+  if (slideShow.value) {
+    exitSlide()
+    if (previewShow.value) {
+      previewHistoryPushed = false
+      pushPreviewHistory()
+      return
+    }
+    const backDir = e.state?.dir ?? getDirFromUrl()
+    if (backDir !== currentDir.value) loadMedia(backDir, false)
+    return
+  }
   // 预览占着一条历史：这次 pop 只用于关闭预览，保持当前目录与 URL 不变
   if (previewHistoryPushed) {
     previewHistoryPushed = false
     if (previewShow.value) closePreview()
-    return
-  }
-  // 幻灯片没有自己的历史记录：手机/电视的返回键（安卓 back 走 web.goBack）
-  // 会落到目录级 popstate 上。这里先关幻灯片——电视遥控器没有 Esc，界面上那个
-  // 「退出全屏」按钮也点不到，不处理就成了死胡同——再把界面与刚退到的
-  // 那条目录历史对齐（同目录时不动列表，避免白白重载一次）
-  if (slideShow.value) {
-    exitSlide()
-    const backDir = e.state?.dir ?? getDirFromUrl()
-    if (backDir !== currentDir.value) loadMedia(backDir, false)
     return
   }
   // 前进到预览那条历史时不做无谓的目录重载（预览本身不重新打开）
@@ -2674,7 +2721,9 @@ async function doLogin() {
 // 弹窗、用户列表、执行日志还会以残留 ref 的形式显示出来（跨账号泄露）。
 function resetUiState() {
   // 复用退出流程：停定时器、退全屏、关界面、递增会话令牌作废旧请求，
-  // 不再重复实现一遍 exitFullscreen 的前缀判断
+  // 不再重复实现一遍 exitFullscreen 的前缀判断。
+  // 先清「从预览进幻灯片」的标志：复位时不该再回填预览状态
+  slideFromPreview = false
   exitSlide()
   stopLoginLock()
   onTouchCancel()  // 复用：清 touchTracking / seek 状态 / HUD
