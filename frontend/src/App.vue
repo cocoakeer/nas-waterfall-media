@@ -191,8 +191,6 @@
          @touchstart.self="onTouchStart" @touchmove.self="onTouchMove"
          @touchend.self="onTouchEnd" @touchcancel.self="onTouchCancel">
       <div class="preview-box" ref="previewBoxRef" @click="onPreviewBoxClick"
-           @click.capture="onSurfaceClickCapture"
-           @pointerdown="onSurfacePointerDown"
            @touchstart="onTouchStart" @touchmove="onTouchMove"
            @touchend="onTouchEnd" @touchcancel="onTouchCancel">
         <button class="close-btn" ref="closeBtnRef" :style="closeBtnStyle" @click="closePreview">×</button>
@@ -209,23 +207,78 @@
             :style="imgRotateStyle"
             @load="updateCloseBtnPos"
           />
-          <video
-            v-else
-            ref="previewMediaRef"
-            controls
-            autoplay
-            playsinline
-            :src="getSrcUrl(previewItem.path)"
-            @loadedmetadata="onPreviewMediaReady"
-            @play="onVideoPlayback(false, $event)"
-            @pause="onVideoPlayback(true, $event)"
-          ></video>
+          <!-- 视频不用浏览器原生控件：原生控件层在 shadow DOM 里，网页既查不到它是否
+               显示、也没法让它显示，「点一下先出控件、再点才暂停」在原生控件上做不了。
+               这里整套自绘：进度、时间、音量、全屏都自己画，点几次做什么完全可控 -->
+          <div v-else class="video-stage" @pointermove="onVideoStageMove">
+            <video
+              ref="previewMediaRef"
+              autoplay
+              playsinline
+              :src="getSrcUrl(previewItem.path)"
+              @loadedmetadata="onPreviewMediaReady"
+              @timeupdate="onVideoTimeUpdate"
+              @durationchange="onVideoTimeUpdate"
+              @volumechange="onVideoVolumeChange"
+              @click="onVideoSurfaceClick"
+              @play="onVideoPlayback(false, $event)"
+              @pause="onVideoPlayback(true, $event)"
+            ></video>
+            <!-- 暂停时画面中央的圆钮：尺寸自己定，比浏览器内建那个小一号 -->
+            <button v-if="previewPaused" class="video-center-btn" type="button"
+                    aria-label="播放" @click.stop="toggleVideoPlay">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 5.4v13.2L19 12z"/></svg>
+            </button>
+            <div class="video-controls"
+                 :class="{ 'is-hidden': !videoControlsVisible, 'is-narrow': videoControlsNarrow, 'is-tiny': videoControlsTiny }"
+                 @click.stop @pointerdown.stop>
+              <button class="vc-btn" type="button"
+                      :aria-label="previewPaused ? '播放' : '暂停'" @click="toggleVideoPlay">
+                <svg v-if="previewPaused" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M8.5 5.4v13.2L19 12z"/>
+                </svg>
+                <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/>
+                </svg>
+              </button>
+              <span class="vc-time">{{ formatDuration(videoCurrentTime) }} / {{ formatDuration(videoTotalTime) }}</span>
+              <div class="vc-track" @pointerdown="onTrackPointerDown"
+                   @pointermove="onTrackPointerMove"
+                   @pointerup="onTrackPointerUp" @pointercancel="onTrackPointerUp">
+                <div class="vc-buffer" :style="videoBufferStyle"></div>
+                <div class="vc-played" :style="videoPlayedStyle"></div>
+                <div class="vc-thumb" :style="videoThumbStyle"></div>
+              </div>
+              <button class="vc-btn" type="button"
+                      :aria-label="videoMuted ? '取消静音' : '静音'" @click="toggleMuteVideo">
+                <svg v-if="videoMuted || videoVolume === 0" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 9v6h3.5L13 19V5L7.5 9zM16.2 9.3l1.4 1.4-1.4 1.4 1.4 1.4-1.4 1.4-1.4-1.4-1.4 1.4-1.4-1.4 1.4-1.4-1.4-1.4 1.4-1.4 1.4 1.4z"/>
+                </svg>
+                <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 9v6h3.5L13 19V5L7.5 9zM15.6 8.4a5 5 0 0 1 0 7.2l1.1 1.1a6.6 6.6 0 0 0 0-9.4z"/>
+                </svg>
+              </button>
+              <input class="vc-volume" type="range" min="0" max="100" step="5"
+                     :value="Math.round(videoVolume * 100)"
+                     aria-label="音量" @input="onVolumeInput" />
+              <button class="vc-btn" type="button"
+                      :aria-label="previewFullscreen ? '退出全屏' : '全屏'"
+                      @click="togglePreviewFullscreen">
+                <svg v-if="previewFullscreen" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 4H4v5h2V6h3zm6 0v2h3v3h2V4zM4 15v5h5v-2H6v-3zm14 0h-2v3h-3v2h5z"/>
+                </svg>
+                <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 9V4h5v2H6v3zm16 0h-2V6h-3V4h5zm0 6v5h-5v-2h3v-3zM9 20H4v-5h2v3h3z"/>
+                </svg>
+              </button>
+            </div>
+          </div>
         </div>
         <div class="preview-footer" :class="{'footer-compact': previewItem.type !== 'image' && !isTvMode}">
           <div class="preview-name">{{ previewItem.name }} ({{ previewCurrentIndex + 1 }} / {{ previewMediaList.length }})</div>
           <div v-if="previewItem.type === 'image'" class="img-action-bar">
             <button @click="openOriginal">查看原图</button>
-            <button @click="togglePreviewFullscreen">{{ previewFullscreen ? '退出全屏' : '全屏' }}</button>
+            <button @click.stop="togglePreviewFullscreen">{{ previewFullscreen ? '退出全屏' : '全屏' }}</button>
             <button @click="rotateLeft">↺ 左旋90°</button>
             <button @click="rotateRight">↻ 右旋90°</button>
             <button @click="resetRotate">重置旋转</button>
@@ -465,7 +518,6 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 
-const baseUrl = ''
 // TV 客户端的 WebView 在 UA 里加了 WaterfallAlbumTV 标记；
 // 浏览器与手机 App 检测不到，所有 TV 逻辑都不会生效
 const isTvMode = typeof navigator !== 'undefined' && /WaterfallAlbumTV/.test(navigator.userAgent)
@@ -816,14 +868,15 @@ function onWindowResize(){
   resizeTimer = setTimeout(()=>{
     layoutWaterfall()
     updateCloseBtnPos()
+    updateVideoControlsMetrics()
   },150)
 }
 
 const getThumbUrl = (path) => {
-  return `${baseUrl}/api/thumb?path=${encodeURIComponent(path)}`
+  return `/api/thumb?path=${encodeURIComponent(path)}`
 }
 const getSrcUrl = (path) => {
-  return `${baseUrl}/api/src?path=${encodeURIComponent(path)}`
+  return `/api/src?path=${encodeURIComponent(path)}`
 }
 
 // 旋转只保留一个角度源，样式由它派生，避免两份状态不同步
@@ -851,8 +904,9 @@ async function updateCloseBtnPos() {
   const gap = 8
   const bw = btn.offsetWidth || 34
   const bh = btn.offsetHeight || 34
-  // 视频：贴预览框最外侧右上角，别贴画面右上角——原生媒体控件的音量/倍速
-  // 按钮在那一片，会与 × 叠在一起。图片仍按视觉区域右上角计算（含旋转）
+  // 视频：贴预览框最外侧右上角（画面可能比框小，贴画面会悬在半空）；
+  // 幻灯片里的视频全屏时右上角那块归原生控件，贴框也避开重叠。
+  // 图片仍按视觉区域右上角计算（含旋转）
   let left, top
   if (media.tagName === 'VIDEO') {
     left = br.width - bw - gap
@@ -885,6 +939,15 @@ function onPreviewMediaReady() {
     videoMutedFallback = false
   }
   previewPaused.value = false
+  // 新片从头开始：时间轴、缓冲条、控件都归零，避免沿用上一条的进度
+  videoCurrentTime.value = v.currentTime || 0
+  videoTotalTime.value = videoDuration(v)
+  videoBufferedRatio.value = 0
+  videoScrubRatio.value = null
+  if (typeof v.volume === 'number') videoVolume.value = v.volume
+  videoMuted.value = !!v.muted
+  showVideoControls(false)
+  updateVideoControlsMetrics()
   const p = v.play()
   if (p && typeof p.catch === 'function') {
     p.catch(() => {
@@ -935,7 +998,7 @@ function startStatusPoll() {
 async function pollCacheStatus() {
   statusPollTimer = null
   try {
-    const res = await fetch(`${baseUrl}/api/cache-status`)
+    const res = await fetch('/api/cache-status')
     if (disposed) return
     if (!res.ok) {
       checkAuthResp(res)
@@ -973,7 +1036,7 @@ async function initCheckCacheTask() {
     return
   }
   try {
-    const res = await fetch(`${baseUrl}/api/cache-status`)
+    const res = await fetch('/api/cache-status')
     if (!res.ok) { checkAuthResp(res); return }
     const st = await res.json()
     if (st.running) {
@@ -995,7 +1058,7 @@ async function runCacheTask() {
   cacheRunning.value = true
   cachePercent.value = 0
   try {
-    const res = await fetch(`${baseUrl}/api/cache-run`)
+    const res = await fetch('/api/cache-run')
     if (!res.ok) {
       // 先复位再交给鉴权处理，否则界面会永远停在「缓存处理中 0%」
       cacheRunning.value = false
@@ -1025,7 +1088,7 @@ async function runCacheTask() {
 async function stopCacheTask() {
   if (!confirm("确认要终止缓存任务吗？")) return
   try {
-    const res = await fetch(`${baseUrl}/api/cache-stop`)
+    const res = await fetch('/api/cache-stop')
     if (!res.ok) { checkAuthResp(res); return }
     const ret = await res.json()
     if (ret.code !== 0) {
@@ -1125,7 +1188,7 @@ async function silentRefreshList() {
   const abortCtrl = new AbortController()
   const abortTimer = setTimeout(() => abortCtrl.abort(), 8000)
   try {
-    const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dirAtStart)}`,
+    const res = await fetch(`/api/list?dir=${encodeURIComponent(dirAtStart)}`,
       { signal: abortCtrl.signal })
     if (!res.ok) { checkAuthResp(res); return }
     const data = await res.json()
@@ -1174,7 +1237,7 @@ async function loadMedia(dir = '', pushHistory = false) {
   mediaList.value = []
   breadcrumbList.value = []
   try {
-    const res = await fetch(`${baseUrl}/api/list?dir=${encodeURIComponent(dir)}`)
+    const res = await fetch(`/api/list?dir=${encodeURIComponent(dir)}`)
     if (!res.ok) { checkAuthResp(res); return }
     const data = await res.json()
     // 请求在途时用户可能已经登出，别把上一位用户的目录内容写回来
@@ -1244,8 +1307,6 @@ function nextMedia() {
 // 长片要跳远就多滑几次，每次松手后从新位置继续
 const SEEK_MAX_SPAN = 120
 const GESTURE_MIN_DIST = 6     // 6px 即触发，小幅滑动也能立刻看到反馈
-const NATIVE_BAR_HEIGHT = 36   // 手势放行区：只让出进度条最底下的一条
-const CONTROLS_CLICK_HEIGHT = 48  // 点按放行区：略宽一点，盖住控制条上的按钮
 const VOL_FULL_SPAN = 0.9      // 纵向滑一屏高度约改 90% 音量，逐像素连续调节
 const KEY_SEEK_STEP = 10       // 键盘左右键每次快进/后退 10 秒
 const KEY_VOLUME_STEP = 0.02   // 键盘上下键每次调 2% 音量
@@ -1264,8 +1325,9 @@ let seekBaseTime = 0
 let seekBaseVolume = 0
 let seekDuration = 0
 let seekActive = false
-/** 起点落在原生控制条上：这一次完全不拦默认行为，让浏览器自己拖进度条 */
-let touchNativeBar = false
+/** 起点落在按钮或自绘控制条上：这一次完全不拦默认行为，让控件自己处理
+ *  （按钮点击、进度条拖动）；否则手指抖几像素就会被锁成手势 */
+let touchInControls = false
 /** 一次手势只锁定一个轴：'h' 快进后退 / 'v' 音量，避免斜滑时两种操作互相打架 */
 let gestureAxis = null
 let seekHudTimer = null
@@ -1279,28 +1341,6 @@ function onVideoSurface(x, y, v) {
   const r = v.getBoundingClientRect()
   if (!r.width || !r.height) return false
   return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
-}
-
-/** 触摸点是否落在视频底部那条「交给原生控制条」的横条里。
- *  上下都要限死：只判「比底边靠下」会把底部文件名栏、画面外的黑边一起算成
- *  控制条，那些位置的手势被整段放行掉，等于滑动无效区 */
-function inBottomStrip(clientY, v, stripHeight) {
-  if (!v) return false
-  const r = v.getBoundingClientRect()
-  if (!r.height) return false
-  const top = r.bottom - Math.min(stripHeight, r.height * 0.25)
-  return clientY > top && clientY <= r.bottom
-}
-
-/** 手势放行区：底部 36px 留给原生进度条，那一条里不接管滑动 */
-function inNativeBar(clientY, v) {
-  return inBottomStrip(clientY, v, NATIVE_BAR_HEIGHT)
-}
-
-/** 点按放行区：比手势区略宽，保证播放/暂停按钮不会被当成「点画面」而多切一次；
- *  手势仍只用 36px，不会重新出现大块滑动无效区 */
-function inControlsClickArea(clientY, v) {
-  return inBottomStrip(clientY, v, CONTROLS_CLICK_HEIGHT)
 }
 
 function getActiveVideo() {
@@ -1362,7 +1402,7 @@ function hideSeekHud() {
 function resetSeekGesture() {
   seekVideoEl = null
   seekActive = false
-  touchNativeBar = false
+  touchInControls = false
   gestureAxis = null
   seekDuration = 0
   seekBaseTime = 0
@@ -1405,76 +1445,183 @@ function adjustVideoVolume(delta) {
   showVolumeHud(r.value, r.applied)
 }
 
-/** 点视频画面 = 播放 / 暂停切换（和原生播放器的手感一致）。
- *  桌面端由 onSurfaceClickCapture 在捕获阶段 preventDefault 掉浏览器的默认切换，
- *  再调这里的 handleSurfaceTap；但下面两种情况仍可能让浏览器抢在前面切一次：
- *  1) WebView 里 click 不可取消（cancelable=false），preventDefault 无效；
- *  2) 触屏上我们先在 touchend 里切，随后的合成 click 里浏览器又切回来。
- *  所以这里记下「本次点按期望的结束状态」，350ms 内的第二次派发只把状态拉回
- *  该值、不再重新取反（幂等），谁先切、切几次都不影响结果。 */
-let surfaceTapLastAt = 0        // touch 与 click 两路只算一次点按
-// pointerdown 记下的「点击前是否暂停」。pointerdown 早于浏览器可能顺手做的那次
-// 切换，只有这里能拿到真实的前置状态
-let surfacePausedBeforeTap = null
-let surfacePausedBeforeTapAt = 0
-// 本次点按期望的结束状态（true = 暂停）。第二次派发只做「拉回」，不再重新取反
-let surfaceTapDesired = null
+// ========= 视频预览：自绘控制层 =========
+// 不用浏览器原生 controls。原生控件的显示时机、中央按钮大小都不归网页管，
+// 而「点一下先出控件、再点才暂停」只有自己维护显隐状态才能做到。
+/** touch 与 click 两路只算一次点按 */
+let surfaceTapLastAt = 0
+const videoControlsVisible = ref(true)
+/** 控制条太窄时依次让出音量条、时间：竖屏视频在宽屏上只有 300 多像素，
+ *  光靠视口媒体查询判断不出来，只能按视频实际渲染宽度打类 */
+const videoControlsNarrow = ref(false)
+const videoControlsTiny = ref(false)
+const videoCurrentTime = ref(0)
+const videoTotalTime = ref(0)
+const videoVolume = ref(1)
+const videoMuted = ref(false)
+const videoBufferedRatio = ref(0)
+/** 拖动进度条时的临时比例；null = 没在拖，显示真实播放进度 */
+const videoScrubRatio = ref(null)
+let videoControlsTimer = null
+let videoTrackDragging = false
+/** 鼠标移动节流：pointermove 每秒几十次，没必要每次都重排计时器 */
+let videoStageMoveAt = 0
 
-/** 把播放状态强制设成 wantPaused；已经是这个状态就什么都不做 */
-function setVideoPaused(v, wantPaused) {
-  if (!v || v.paused === wantPaused) return
-  if (wantPaused) {
-    try { v.pause() } catch (e) { /* 忽略 */ }
-    return
-  }
-  const p = v.play()
-  if (p && typeof p.catch === 'function') p.catch(() => {})
+const videoPlayedRatio = computed(() => {
+  if (videoScrubRatio.value !== null) return videoScrubRatio.value
+  const d = videoTotalTime.value
+  if (!d) return 0
+  return Math.min(1, Math.max(0, videoCurrentTime.value / d))
+})
+const videoPlayedStyle = computed(() => ({ width: (videoPlayedRatio.value * 100) + '%' }))
+const videoThumbStyle = computed(() => ({ left: (videoPlayedRatio.value * 100) + '%' }))
+// 缓冲条不能比已播条短，否则拖动时会看到一截空白
+const videoBufferStyle = computed(() => ({
+  width: (Math.min(1, Math.max(videoBufferedRatio.value, videoPlayedRatio.value)) * 100) + '%'
+}))
+
+/** 控件显示：暂停 / 电视模式常显，播放中 3 秒后淡出 */
+function showVideoControls(pausedNow = previewPaused.value) {
+  videoControlsVisible.value = true
+  stopVideoControlsTimer()
+  if (pausedNow || isTvMode) return
+  videoControlsTimer = setTimeout(() => {
+    videoControlsTimer = null
+    // 这 3 秒里用户按了暂停，就别藏了
+    if (!previewPaused.value) videoControlsVisible.value = false
+  }, 3000)
 }
 
+function stopVideoControlsTimer() {
+  if (videoControlsTimer) clearTimeout(videoControlsTimer)
+  videoControlsTimer = null
+}
+
+/** 鼠标在画面上移动就把控件叫回来（主流播放器都是这个手感） */
+function onVideoStageMove() {
+  if (isTvMode) return
+  const now = Date.now()
+  if (now - videoStageMoveAt < 200) return
+  videoStageMoveAt = now
+  showVideoControls()
+}
+
+/** 点画面：第一下只把控件叫出来（不动播放状态），第二下才切播放 */
 function handleSurfaceTap(v) {
   if (!v) return
   const now = Date.now()
-  if (now - surfaceTapLastAt < 350) {
-    // 同一根手指的第二次派发（touchend 之后的合成 click）：浏览器可能刚替我们
-    // 又切了一次，这里把状态拉回期望值，不再重新取反
-    if (surfaceTapDesired !== null && !v.ended) setVideoPaused(v, surfaceTapDesired)
+  if (now - surfaceTapLastAt < 350) return
+  surfaceTapLastAt = now
+  if (!videoControlsVisible.value) {
+    showVideoControls()
     return
   }
-  surfaceTapLastAt = now
-  // 没有 pointerdown 记录（合成 click、脚本触发）就按当前状态取反
-  const fresh = surfacePausedBeforeTap !== null && now - surfacePausedBeforeTapAt < 1000
-  const before = fresh ? surfacePausedBeforeTap : v.paused
-  surfacePausedBeforeTap = null
-  surfacePausedBeforeTapAt = 0
-  surfaceTapDesired = !before
-  setVideoPaused(v, surfaceTapDesired)
+  toggleVideoPlay()
 }
 
-/** pointerdown 只做一件事：记下点击前的播放状态。
- *  只认 <video> 本体——黑边、自绘按钮、原生控制条那一条都不算「点画面」 */
-function onSurfacePointerDown(e) {
-  if (!isVideoPreview()) return
-  const v = getActiveVideo()
-  if (!v) return
-  // <video> 本体全屏时整块画面归原生控制条管，点一下是显示/隐藏控制条
-  if (currentFullscreenElement() === v) return
-  const t = e.target
-  if (!t || t.tagName !== 'VIDEO') return
-  // 原生控制条那一条：上面按钮（播放、音量、全屏）的点击要真正生效
-  if (inControlsClickArea(e.clientY, v)) return
-  surfacePausedBeforeTap = v.paused
-  surfacePausedBeforeTapAt = Date.now()
+/** <video> 本体的 click。触摸端 touchend 也走 handleSurfaceTap，靠 350ms 去重 */
+function onVideoSurfaceClick() {
+  if (Date.now() < suppressPreviewClickUntil) return
+  handleSurfaceTap(getActiveVideo())
 }
 
-/** 打开/关闭预览、换片、退出幻灯片时把点按状态整个归零 */
+/** 打开 / 换片 / 关预览时把点按、拖动、控件显隐一起归零 */
 function resetSurfaceTap() {
   surfaceTapLastAt = 0
-  surfacePausedBeforeTap = null
-  surfacePausedBeforeTapAt = 0
-  surfaceTapDesired = null
+  videoTrackDragging = false
+  videoScrubRatio.value = null
+  videoControlsVisible.value = true
+  stopVideoControlsTimer()
 }
 
-/** 播放 / 暂停当前视频（空格 / TV OK）。这里直接给一次提示：
+function onVideoTimeUpdate() {
+  const v = previewMediaRef.value
+  if (!v || v.tagName !== 'VIDEO') return
+  videoCurrentTime.value = v.currentTime || 0
+  const d = videoDuration(v)
+  if (d) videoTotalTime.value = d
+  if (d && v.buffered && v.buffered.length) {
+    try {
+      videoBufferedRatio.value = Math.min(1, v.buffered.end(v.buffered.length - 1) / d)
+    } catch (e) { /* 忽略：读不到缓冲不影响进度显示 */ }
+  }
+}
+
+/** 按视频实际渲染宽度决定控制条收多少：竖屏视频在宽屏上只有 300 多像素 */
+function updateVideoControlsMetrics() {
+  if (!isVideoPreview()) return
+  const v = previewMediaRef.value
+  if (!v || v.tagName !== 'VIDEO') return
+  const w = v.getBoundingClientRect().width
+  videoControlsNarrow.value = w > 0 && w < 420
+  videoControlsTiny.value = w > 0 && w < 300
+}
+
+function onVideoVolumeChange() {
+  const v = previewMediaRef.value
+  if (!v || v.tagName !== 'VIDEO') return
+  if (typeof v.volume === 'number') videoVolume.value = v.volume
+  videoMuted.value = !!v.muted
+}
+
+function toggleMuteVideo() {
+  const v = getActiveVideo()
+  if (!v) return
+  v.muted = !v.muted
+}
+
+function onVolumeInput(e) {
+  const v = getActiveVideo()
+  if (!v) return
+  const next = Math.min(1, Math.max(0, Number(e.target.value) / 100))
+  try {
+    v.volume = next
+    if (next > 0) v.muted = false
+  } catch (err) { /* 忽略：个别 WebView 不允许改音量 */ }
+}
+
+/** 指针位置 → 进度条上的 0~1 比例 */
+function ratioFromPointer(e) {
+  const r = e.currentTarget.getBoundingClientRect()
+  if (!r.width) return 0
+  return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width))
+}
+
+function onTrackPointerDown(e) {
+  const v = getActiveVideo()
+  if (!v || !videoDuration(v)) return
+  videoTrackDragging = true
+  videoScrubRatio.value = ratioFromPointer(e)
+  if (e.currentTarget.setPointerCapture) {
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch (err) { /* 忽略 */ }
+  }
+  e.preventDefault()
+}
+
+function onTrackPointerMove(e) {
+  if (!videoTrackDragging) return
+  videoScrubRatio.value = ratioFromPointer(e)
+}
+
+/** 松手才真正 seek：拖动过程中连续跳，NAS 上会把缓冲打散、卡成一片 */
+function onTrackPointerUp() {
+  if (!videoTrackDragging) return
+  videoTrackDragging = false
+  const ratio = videoScrubRatio.value
+  videoScrubRatio.value = null
+  const v = getActiveVideo()
+  if (!v || ratio === null) return
+  const d = videoDuration(v)
+  if (!d) return
+  const target = Math.min(Math.max(0, ratio * d), Math.max(0, d - 0.1))
+  try {
+    v.currentTime = target
+    videoCurrentTime.value = target
+  } catch (err) { /* 忽略 */ }
+  showVideoControls()
+}
+
+/** 播放 / 暂停当前视频（空格 / TV OK / 控制条按钮）。这里直接给一次提示：
  *  事件是异步派发的，按下去要立刻有反馈；点控制条按钮那条路径由事件兜住 */
 function toggleVideoPlay() {
   unmutePlaybackHints()
@@ -1497,7 +1644,7 @@ let videoPausedHintShown = false
 /** 换片 / 打开预览时浏览器会顺带发 pause+play，这段时间内不弹提示，免得刷屏 */
 let videoHintMutedUntil = 0
 /** 状态更新只挡 seek 引发的那一对 pause→play 连击。窗口必须比提示窗口短：
- *  否则用户在这半秒里点原生控制条暂停，中间按钮与 TV 键位提示会一直不更新 */
+ *  否则用户在这半秒里点控制条暂停，中间按钮与 TV 键位提示会一直不更新 */
 let videoStateMutedUntil = 0
 
 function muteVideoPlaybackHint() {
@@ -1523,6 +1670,9 @@ function onVideoPlayback(paused, ev) {
   // 两个窗口分开：状态只挡 160ms 的 seek 连击（不跳变），提示挡 500ms（不刷屏）。
   // 以前共用一个 500ms 窗口，用户在这半秒里点控制条暂停会完全丢状态
   if (now >= videoStateMutedUntil) previewPaused.value = paused
+  // 预览层的自绘控件跟着播放状态走：暂停常显，播放中 3 秒淡出。
+  // 直接传 paused 而不是读 previewPaused，免得撞上 160ms 静音窗口读到旧值
+  if (previewShow.value && !slideShow.value) showVideoControls(paused)
   if (now < videoHintMutedUntil) return
   // 播到结尾也会派发 pause：这时候说「已暂停」不对，而且紧接着的「播放」也不该弹
   const ended = !!(paused && ev && ev.target && ev.target.ended)
@@ -1600,19 +1750,18 @@ function onTouchStart(e) {
   if (!touchTracking) { hideSeekHud(); return }
   touchStartX = e.touches[0].clientX
   touchStartY = e.touches[0].clientY
-  // 起点在自绘按钮上（×、图片箭头、图片操作栏）：这次触摸交给按钮自己，
-  // 不挂手势。否则手指抖几像素就锁成快进/音量手势，按钮反而点不动
-  if (e.target && typeof e.target.closest === 'function' && e.target.closest('button')) return
+  // 起点在按钮或自绘控制条上（×、图片箭头、进度条、音量、全屏）：这次触摸交给
+  // 控件自己，不挂手势——否则手指抖几像素就锁成快进/音量手势，按钮点不动、
+  // 进度条也拖不动
+  if (e.target && typeof e.target.closest === 'function'
+      && (e.target.closest('button') || e.target.closest('.video-controls'))) {
+    touchInControls = true
+    return
+  }
   const v = getActiveVideo()
   const dur = videoDuration(v)
   // 视频元数据还没就绪、或是图片预览时，也要拦住纵向滑动，别把滚动传到底层页面
   if (!v || !dur) return
-  // 只有视频底部那 36px 留给原生控制条：那一条里点能跳、拖也能拖，其余位置
-  // （画面、画面外的黑边、底部文件名栏）全部接管手势
-  if (inNativeBar(touchStartY, v)) {
-    touchNativeBar = true
-    return
-  }
   seekVideoEl = v
   seekDuration = dur
   seekBaseTime = v.currentTime || 0
@@ -1627,7 +1776,7 @@ function onTouchMove(e) {
   if (seekVideoEl) muteVideoPlaybackHint()
   // 预览层里拦掉默认行为（纵向滑动绝不能把滚动传到底层页面）；
   // 起点在控制条上的那次手势除外，否则进度条拖不动
-  if (!touchNativeBar && e.cancelable) e.preventDefault()
+  if (!touchInControls && e.cancelable) e.preventDefault()
   if (!seekVideoEl) return
   const dx = e.touches[0].clientX - touchStartX
   const dy = e.touches[0].clientY - touchStartY
@@ -1659,9 +1808,9 @@ function onTouchEnd(e) {
   const dx = e.changedTouches[0].clientX - touchStartX
   const dy = e.changedTouches[0].clientY - touchStartY
   // resetSeekGesture 会清掉这两个，先留一份
-  const startedInBar = touchNativeBar
+  const startedInControls = touchInControls
   const startY = touchStartY
-  if (startedInBar) unmutePlaybackHints()
+  if (startedInControls) unmutePlaybackHints()
   if (seekActive) {
     // 阻止合成 click，否则 .preview-box 会把它当成「点空白退出预览」
     if (e.cancelable) e.preventDefault()
@@ -1682,25 +1831,18 @@ function onTouchEnd(e) {
     return
   }
   resetSeekGesture()
-  // 点一下画面（没滑动、也不在原生控制条上）＝ 播放 / 暂停切换。
-  // 安卓 WebView 里点视频不一定派发 click，这里也走一遍，两路由
-  // handleSurfaceTap 的 350ms 窗口去重
-  if (!startedInBar && Math.abs(dx) <= GESTURE_MIN_DIST && Math.abs(dy) <= GESTURE_MIN_DIST) {
+  // 点一下画面（没滑动、起点也不在控制条/按钮上）。安卓 WebView 里点视频不一定
+  // 派发 click，这里也走一遍，两路由 handleSurfaceTap 的 350ms 窗口去重。
+  // 具体是「叫出控件」还是「切播放」由 handleSurfaceTap 按控件当前显隐决定
+  if (!startedInControls && Math.abs(dx) <= GESTURE_MIN_DIST && Math.abs(dy) <= GESTURE_MIN_DIST) {
     const tapVideo = previewShow.value && !slideShow.value ? getActiveVideo() : null
     if (tapVideo && onVideoSurface(touchStartX, startY, tapVideo)) {
-      if (inControlsClickArea(startY, tapVideo)) {
-        // 点的是控制条按钮区（含播放/暂停键）：交给浏览器，顺便把提示窗口清掉
-        unmutePlaybackHints()
-      } else if (currentFullscreenElement() !== tapVideo
-          && !(e.target && typeof e.target.closest === 'function' && e.target.closest('button'))) {
-        // 画面本体（不是自绘按钮）：切播放 / 暂停
-        handleSurfaceTap(tapVideo)
-      }
+      handleSurfaceTap(tapVideo)
     }
   }
   // 图片：水平滑动切上一张/下一张。只在真的切了张时才拦合成 click
   // （原来没拦，切完可能顺带把预览关掉）。视频若时长未知、或手指落在
-  // 底部控制条上，这里必须放行，否则拖不动原生进度条、点不亮控制条
+  // 底部控制条上，这里必须放行，否则拖不动进度条
   if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
     const isImage = slideShow.value
       ? currentSlide.value && currentSlide.value.type === 'image'
@@ -1732,7 +1874,7 @@ function handleKeydown(e) {
   // 左右键会退回切图逻辑——箭头已隐藏、点空白也不退出，却能莫名切到下个媒体。
   // 时长无效时 seekVideoBy 会静默返回，不会误操作。TV 是遥控器，仍保持左右切媒体
   if (video && !isTvMode) {
-    // 方向键只归视频管：焦点若落在原生控制条的按钮（尤其是全屏）上，
+    // 方向键只归视频管：焦点若落在控制条按钮（幻灯片里是原生控件，尤其全屏）上，
     // 浏览器默认会把方向键用来在控件之间挪焦点/高亮窗口，先把它清掉
     if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)
         && ae && ae !== document.body && typeof ae.blur === 'function') {
@@ -1829,10 +1971,24 @@ function handleKeydown(e) {
       e.preventDefault()
       nextMedia()
       break
-    case 'Escape':
+    case 'Escape': {
       e.preventDefault()
+      // 图片预览走的是这一支（没有 <video>，前面那段视频逻辑不会进来）。
+      // 全屏时同样保持两段式：第一次只退全屏，预览留着，再按一次才关。
+      // 少了这段，图片全屏按一下 Esc 会连预览一起关掉
+      if (currentFullscreenElement()) {
+        // 这次退全屏是我们主动做的，先清掉「上一次全屏元素」，
+        // 免得随后的 fullscreenchange 又记一次退出时刻，把下一次 Esc 白吞掉
+        lastFullscreenEl = null
+        exitAnyFullscreen()
+        break
+      }
+      // 浏览器可能已经先替我们退了全屏，此时 fullscreenElement 已是 null，
+      // 刚退过全屏的那一次 Esc 不再叠加关预览
+      if (Date.now() - fullscreenExitAt < 600) { fullscreenExitAt = 0; break }
       closePreview()
       break
+    }
   }
 }
 
@@ -1966,7 +2122,7 @@ function openTvSetup() {
 
 async function loadSlideSettings() {
   try {
-    const res = await fetch(`${baseUrl}/api/settings`)
+    const res = await fetch('/api/settings')
     if (!res.ok) { checkAuthResp(res); return }
     const j = await res.json()
     if (j.code === 0 && j.settings) {
@@ -1986,7 +2142,7 @@ async function openSlideSetting() {
 async function saveSetting() {
   slideDelay.value = clampSlideDelay(slideDelay.value)
   try {
-    const res = await fetch(`${baseUrl}/api/settings`, {
+    const res = await fetch('/api/settings', {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slide_delay: slideDelay.value, slide_loop: slideLoop.value })
@@ -2022,7 +2178,7 @@ async function fetchRandomImages(onWaiting = null, waitMs = RANDOM_INDEX_WAIT_MS
     const timer = setTimeout(() => ctrl.abort(), timeoutMs)
     let j
     try {
-      const res = await fetch(`${baseUrl}/api/random-images?limit=${RANDOM_BATCH_SIZE}`,
+      const res = await fetch(`/api/random-images?limit=${RANDOM_BATCH_SIZE}`,
         { signal: ctrl.signal })
       if (!res.ok) { checkAuthResp(res); return null }
       j = await res.json()
@@ -2198,6 +2354,13 @@ function exitAnyFullscreen() {
 
 async function togglePreviewFullscreen() {
   if (currentFullscreenElement()) {
+    // 点「退出全屏」这一下会让 .preview-box 从 100vw×100vh 缩回窗口尺寸，
+    // 按钮位置也跟着挪。鼠标 pointerdown 还按在按钮上、pointerup 时布局已经
+    // 变了，浏览器就把 click 派给两者共同祖先（遮罩），被当成「点空白退出预览」，
+    // 表现就是「点退出全屏 → 预览也一起关了」。退出前先压一个短窗口，
+    // 让这一下 click 不再叠加关预览（预览层留给用户自己按 × / Esc 关）。
+    // 视频预览点画面本来就不关预览，不必压窗口，否则退出全屏后立刻点暂停会被吞一次
+    if (!isVideoPreview()) suppressPreviewClickUntil = Date.now() + 400
     await exitAnyFullscreen()
     return
   }
@@ -2312,45 +2475,27 @@ function onPreviewMaskClick() {
   closePreview()
 }
 
-/** 点视频画面的 click 必须在捕获阶段就拦下来：
- *  原生控件会在这次 click 里自己切一次播放（Chrome 是 DOM 默认动作，等事件派发
- *  结束才执行），和我们自己那次一正一反正好抵消，表现就是「点了闪一下、又播回去」。
- *  preventDefault 挡默认动作、stopPropagation 挡 shadow 里的监听，两条一起做才拦得干净。
- *  底部控制条那一条必须放行，否则原生播放/音量/全屏按钮全部失效。 */
-function onSurfaceClickCapture(e) {
-  if (Date.now() < suppressPreviewClickUntil) return
-  if (!isVideoPreview()) return
-  const v = getActiveVideo()
-  if (!v || e.target !== v) return
-  // <video> 本体全屏时整块画面归原生控制条管
-  if (currentFullscreenElement() === v) return
-  if (inControlsClickArea(e.clientY, v)) return
-  if (e.cancelable) e.preventDefault()
-  e.stopPropagation()
-  handleSurfaceTap(v)
-}
-
 function onPreviewBoxClick(e) {
   // 视频横滑结束后浏览器仍可能合成 click（touchend 的 preventDefault 不是绝对可靠），
   // 这段时间内忽略「点空白退出」，避免刚快进完预览就被关掉
   if (Date.now() < suppressPreviewClickUntil) return
-  if (isVideoPreview()) {
-    // 点画面的 click 已经被 onSurfaceClickCapture 拦掉了，能走到这里的只剩
-    // 底部原生控制条那一条：上面的按钮（播放、音量、全屏）交给浏览器自己处理，
-    // 顺手把提示静音窗口清掉，按下去就能看到状态
-    const t = e.target
-    const v = getActiveVideo()
-    if (t && t.tagName === 'VIDEO' && v && inControlsClickArea(e.clientY, v)) {
-      unmutePlaybackHints()
-    }
-    return
-  }
+  // 视频预览：点画面由 <video> 自己的 click 处理（onVideoSurfaceClick），
+  // 控制条与中央按钮都带 @click.stop，冒泡不到这里，所以直接返回
+  if (isVideoPreview()) return
   const t = e.target
   if (!t) return
-  // 点图片/视频本体（含视频原生控制条）不退出
-  if (t.tagName === 'IMG' || t.tagName === 'VIDEO') return
+  // 点图片本体不退出
+  if (t.tagName === 'IMG') return
   // 箭头、旋转、关闭等按钮各走自己的逻辑，不额外退出
   if (typeof t.closest === 'function' && t.closest('button')) return
+  // 图片全屏时点画面外的黑边：只退全屏、预览留着，再点一次才关。
+  // 以前这里直接 closePreview，全屏下点一下黑边整个预览就没了，
+  // 看着像「退出全屏怎么把预览一起关了」。与 Esc 的两段式保持一致；
+  // 全屏时 × 仍在画面右上角，真想关预览点它就行
+  if (currentFullscreenElement() === previewBoxRef.value) {
+    exitAnyFullscreen()
+    return
+  }
   closePreview()
 }
 
@@ -2405,7 +2550,7 @@ async function doLogin() {
   if (loginLockRemaining.value > 0) return
   loginErr.value = ''
   try {
-    const res = await fetch(`${baseUrl}/api/login`, {
+    const res = await fetch('/api/login', {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify(loginForm.value)
@@ -2466,6 +2611,10 @@ function resetUiState() {
   dirOptions.value = []
   guardList.value = []
   guardMsg.value = ''
+  // 删除确认框与搜索词也是上一位用户的状态：确认框残留会在下一位管理员
+  // 打开用户管理时直接盖上来，搜索词残留会让新用户一进来看到空列表
+  umDelConfirm.value = { show: false, user: null }
+  searchQuery.value = ''
   logList.value = []
   cacheStats.value = { total: 0, cached: 0, uncached: 0, failed: 0,
                        failed_files: [], failed_files_truncated: false, last_finish_time: null }
@@ -2477,7 +2626,7 @@ function resetUiState() {
 }
 
 async function doLogout() {
-  await fetch(`${baseUrl}/api/logout`, {method:"POST"})
+  await fetch('/api/logout', {method:"POST"})
   // 停掉轮询链并复位进度，否则快速切换账号时会把上一位管理员的任务
   // 结束提示弹给下一位用户，或让新会话永久卡在「缓存处理中」
   stopStatusPoll()
@@ -2493,7 +2642,7 @@ async function doLogout() {
 
 async function checkLoginStatus() {
   try {
-    const res = await fetch(`${baseUrl}/api/whoami`)
+    const res = await fetch('/api/whoami')
     if (res.ok) {
       const ret = await res.json()
       isLogin.value = true
@@ -2525,7 +2674,7 @@ async function checkLoginStatus() {
 // ========= 用户头像下拉 =========
 async function loadCacheStats() {
   try {
-    const res = await fetch(`${baseUrl}/api/cache-stats`)
+    const res = await fetch('/api/cache-stats')
     if (!res.ok) { checkAuthResp(res); return }
     const j = await res.json()
     if (j.code === 0) {
@@ -2568,7 +2717,7 @@ function openFailedFilesModal(){
 }
 async function loadLogs(){
   try {
-    const res = await fetch(`${baseUrl}/api/logs?limit=200`)
+    const res = await fetch('/api/logs?limit=200')
     if (!res.ok) { checkAuthResp(res); return }
     const j = await res.json()
     if (j.code === 0) {
@@ -2581,7 +2730,7 @@ async function loadLogs(){
 async function clearLogs(){
   if (!confirm("确认清除全部执行日志？此操作不可恢复。")) return
   try {
-    const res = await fetch(`${baseUrl}/api/logs`, { method: 'DELETE' })
+    const res = await fetch('/api/logs', { method: 'DELETE' })
     if (!res.ok) { checkAuthResp(res); return }
     const ret = await res.json()
     if (ret.code === 0) {
@@ -2639,7 +2788,7 @@ function formatGuardLeft(sec) {
 async function loadLoginGuard(quiet = false) {
   if (!quiet) guardMsg.value = ''
   try {
-    const res = await fetch(`${baseUrl}/api/admin/login-guard`)
+    const res = await fetch('/api/admin/login-guard')
     if (!res.ok) { checkAuthResp(res); return false }
     const j = await res.json()
     if (j.code === 0) {
@@ -2658,7 +2807,7 @@ async function unlockGuard(item) {
         username: item.username || null, ip: item.ip }
     : { all: true }
   try {
-    const res = await fetch(`${baseUrl}/api/admin/login-unlock`, {
+    const res = await fetch('/api/admin/login-unlock', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -2884,15 +3033,19 @@ function onFullscreenChange(){
       try { focusEl.blur() } catch (err) { /* 忽略 */ }
     }
   }
-  // 原生控制条上的全屏按钮，进的就是 <video> 本体全屏。这里必须接受它：
-  // 曾经试过「趁文档还在全屏态把全屏元素换成 .preview-box」，但那等于在
-  // fullscreenchange 回调里重新发一次 requestFullscreen，没有用户手势，
-  // Chrome 直接 NotAllowedError，代码随后退回内联 —— 表现就是「点全屏、
+  // 幻灯片里的视频用原生控制条，点它的全屏按钮进的是 <video> 本体全屏。
+  // 这里必须接受它：曾经试过「趁文档还在全屏态把全屏元素换成 .preview-box」，
+  // 但那等于在 fullscreenchange 回调里重新发一次 requestFullscreen，没有用户
+  // 手势，Chrome 直接 NotAllowedError，代码随后退回内联 —— 表现就是「点全屏、
   // 闪一下又回到内联」，按钮像坏了。所以这里不做任何换层，只记录状态。
-  // 全屏时预览层里的提示、× 不渲染（top layer 只画 <video>），但手势监听
-  // 挂在 .preview-box 上，事件仍沿 DOM 冒泡，快进/音量照旧可用。
-  // 全屏切换后画面尺寸变了，右上角的关闭按钮要重新贴边（内联时可见）
-  if (previewShow.value) updateCloseBtnPos()
+  // <video> 本体全屏时 top layer 只画它自己，预览层的提示、× 都渲染不出来；
+  // .preview-box 全屏没有这个限制（它们就在全屏子树里）。
+  // 全屏切换后画面尺寸变了，右上角的关闭按钮要重新贴边（内联时可见），
+  // 控制条也要按新的实际宽度决定收多少
+  if (previewShow.value) {
+    updateCloseBtnPos()
+    updateVideoControlsMetrics()
+  }
   if (el === document.documentElement) {
     // 整个页面进了全屏，说明是我们（或用户）要的幻灯片全屏
     slideFullscreenOwned = true
@@ -2950,6 +3103,7 @@ onUnmounted(() => {
   clearTimeout(resizeTimer)
   clearTimeout(imageLoadTimer)
   clearTimeout(closeBtnPosTimer)
+  stopVideoControlsTimer()
   stopLoginLock()
 })
 </script>
@@ -3602,6 +3756,173 @@ input[type="checkbox"] {
 .preview-image-area img:focus-visible,
 .preview-image-area video:focus,
 .preview-image-area video:focus-visible { outline: none }
+
+/* ---------- 视频预览：自绘控制层 ----------
+   视频不再用浏览器原生 controls（原生控件层在 shadow DOM 里，显现时机与中央按钮
+   尺寸都不归网页管）。这里所有控件都是普通 DOM，显隐、尺寸、点击行为完全可控 */
+/* 舞台贴合视频实际显示尺寸：控制条才能贴在画面底边，而不是飘到容器底部。
+   高度取满、宽度由视频自身比例决定：这样 video 的 max-height 有确定的百分比基准，
+   横屏竖屏都能同时受宽高约束（只给 max-height 而高度 auto 时，百分比解析不出，会溢出） */
+.video-stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+.video-stage video {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  background: #000;
+}
+/* 暂停时画面中央的圆钮：比浏览器内建那个小一号 */
+.video-center-btn {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 56px;
+  height: 56px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(12, 15, 20, .6);
+  color: #fff;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background .15s ease, transform .15s ease;
+}
+.video-center-btn svg { width: 22px; height: 22px; fill: currentColor }
+.video-center-btn:hover { background: rgba(91, 130, 247, .82); transform: translate(-50%, -50%) scale(1.04) }
+/* 底部控制条 */
+.video-controls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  color: #fff;
+  font-size: 12px;
+  background: linear-gradient(to top, rgba(0, 0, 0, .8), rgba(0, 0, 0, .3) 60%, transparent);
+  transition: opacity .2s ease, transform .2s ease;
+}
+/* 淡出后彻底不接事件，否则鼠标点到透明区域会误触 */
+.video-controls.is-hidden {
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+}
+.vc-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+}
+.vc-btn svg { width: 17px; height: 17px; fill: currentColor }
+.vc-btn:hover { background: rgba(255, 255, 255, .16) }
+.vc-time {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: clip;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, .86);
+}
+/* 手感区比视觉条高，细条也点得中 */
+.vc-track {
+  position: relative;
+  flex: 1;
+  min-width: 30px;
+  height: 16px;
+  cursor: pointer;
+  touch-action: none;
+}
+.vc-track::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 4px;
+  margin-top: -2px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, .26);
+}
+.vc-buffer,
+.vc-played {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 4px;
+  margin-top: -2px;
+  border-radius: 2px;
+}
+.vc-buffer { background: rgba(255, 255, 255, .34) }
+.vc-played { background: var(--accent) }
+.vc-thumb {
+  position: absolute;
+  top: 50%;
+  width: 11px;
+  height: 11px;
+  margin: -5.5px 0 0 -5.5px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .5);
+  pointer-events: none;
+}
+.vc-volume {
+  flex-shrink: 1;
+  width: 68px;
+  min-width: 40px;
+  height: 4px;
+  margin: 0 2px;
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, .3);
+  cursor: pointer;
+}
+.vc-volume::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 11px;
+  height: 11px;
+  border: 0;
+  border-radius: 50%;
+  background: #fff;
+}
+.vc-volume::-moz-range-thumb {
+  width: 11px;
+  height: 11px;
+  border: 0;
+  border-radius: 50%;
+  background: #fff;
+}
+.tv-mode .vc-btn { width: 34px; height: 34px }
+.tv-mode .video-controls { font-size: 15px }
+/* 控制条本身很窄时（竖屏视频在宽屏上）按实际宽度收放：
+   先让出音量条，再让出时间，把宽度留给进度条。
+   类名由 JS 按视频渲染宽度打，视口媒体查询判断不出竖屏视频有多窄 */
+.video-controls.is-narrow .vc-volume { display: none }
+.video-controls.is-tiny .vc-time { display: none }
 /* 视频预览：底部只留文件名那一行，把画面高度还给视频 */
 .preview-footer.footer-compact { padding: 6px 16px 10px; gap: 0 }
 .preview-footer {
@@ -3957,6 +4278,11 @@ input[type="checkbox"] {
   .arrow-left { left: 6px }
   .arrow-right { right: 6px }
   .preview-name { font-size: 12px }
+  /* 手机上音量交给系统按键，控制条只留播放、进度、静音、全屏 */
+  .vc-volume { display: none }
+  .video-controls { gap: 8px; padding: 7px 10px }
+  .video-center-btn { width: 52px; height: 52px }
+  .video-center-btn svg { width: 20px; height: 20px }
 }
 @media (max-width: 480px) {
   .header h1.app-title { font-size: 16px }
