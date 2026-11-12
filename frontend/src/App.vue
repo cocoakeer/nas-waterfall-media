@@ -49,6 +49,10 @@
                 <div v-if="cacheRunning" class="drop-item" @click="stopCacheTask">取消缓存任务</div>
               </div>
               <div class="drop-section">
+                <div v-if="isAppClient" class="drop-item drop-with-icon" @click="openServerSettings">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><circle cx="6" cy="6.5" r="1"/><circle cx="6" cy="17.5" r="1"/></svg>
+                  <span>服务器地址</span>
+                </div>
                 <div class="drop-item drop-with-icon" @click="openChangePwdModal">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
                   <span>修改密码</span>
@@ -223,6 +227,8 @@
               @click="onVideoSurfaceClick"
               @play="onVideoPlayback(false, $event)"
               @pause="onVideoPlayback(true, $event)"
+              @webkitbeginfullscreen="onIosVideoFullscreen(true)"
+              @webkitendfullscreen="onIosVideoFullscreen(false)"
             ></video>
             <!-- 暂停时画面中央的圆钮：尺寸自己定，比浏览器内建那个小一号 -->
             <button v-if="previewPaused" class="video-center-btn" type="button"
@@ -277,12 +283,34 @@
         <div class="preview-footer" :class="{'footer-compact': previewItem.type !== 'image' && !isTvMode}">
           <div class="preview-name">{{ previewItem.name }} ({{ previewCurrentIndex + 1 }} / {{ previewMediaList.length }})</div>
           <div v-if="previewItem.type === 'image'" class="img-action-bar">
-            <button @click="openOriginal">查看原图</button>
-            <button @click.stop="togglePreviewFullscreen">{{ previewFullscreen ? '退出全屏' : '全屏' }}</button>
-            <button @click="rotateLeft">↺ 左旋90°</button>
-            <button @click="rotateRight">↻ 右旋90°</button>
-            <button @click="resetRotate">重置旋转</button>
-            <button @click="startSlideFromCurrent">从此处开始幻灯片</button>
+            <button class="icon-btn" type="button" data-tip="查看原图" aria-label="查看原图" @click="openOriginal">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              <span class="icon-btn-text">查看原图</span>
+            </button>
+            <button class="icon-btn" type="button"
+                    :data-tip="previewFullscreen ? '退出全屏' : '全屏'"
+                    :aria-label="previewFullscreen ? '退出全屏' : '全屏'"
+                    @click.stop="togglePreviewFullscreen">
+              <svg v-if="previewFullscreen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg>
+              <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+              <span class="icon-btn-text">{{ previewFullscreen ? '退出全屏' : '全屏' }}</span>
+            </button>
+            <button class="icon-btn" type="button" data-tip="向左旋转 90°" aria-label="向左旋转 90 度" @click="rotateLeft">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+              <span class="icon-btn-text">左旋 90°</span>
+            </button>
+            <button class="icon-btn" type="button" data-tip="向右旋转 90°" aria-label="向右旋转 90 度" @click="rotateRight">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              <span class="icon-btn-text">右旋 90°</span>
+            </button>
+            <button class="icon-btn" type="button" data-tip="重置旋转" aria-label="重置旋转" @click="resetRotate">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+              <span class="icon-btn-text">重置旋转</span>
+            </button>
+            <button class="icon-btn" type="button" data-tip="从此处开始幻灯片" aria-label="从此处开始幻灯片" @click="startSlideFromCurrent">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+              <span class="icon-btn-text">开始幻灯片</span>
+            </button>
           </div>
           <!-- 电视只有遥控器，没有可点的按钮：把键位直接写在画面上，
                否则「左右快进、上下切换、OK 暂停」全靠猜 -->
@@ -503,7 +531,10 @@
         <video v-else ref="slideVideoRef" controls autoplay muted playsinline :src="getSrcUrl(currentSlide.path)"
                @play="onVideoPlayback(false, $event)" @pause="onVideoPlayback(true, $event)"></video>
         <div class="slide-name">{{ currentSlide.name }}</div>
-        <button class="slide-exit-btn" @click="exitSlide">退出全屏</button>
+        <button class="slide-exit-btn icon-btn" type="button" data-tip="退出幻灯片" aria-label="退出幻灯片" @click="exitSlide">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <span class="icon-btn-text">退出幻灯片</span>
+        </button>
         <button class="slide-prev-btn" @click="slidePrev">‹</button>
         <button class="slide-next-btn" @click="slideNext">›</button>
       </div>
@@ -521,6 +552,12 @@ import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 // TV 客户端的 WebView 在 UA 里加了 WaterfallAlbumTV 标记；
 // 浏览器与手机 App 检测不到，所有 TV 逻辑都不会生效
 const isTvMode = typeof navigator !== 'undefined' && /WaterfallAlbumTV/.test(navigator.userAgent)
+// 手机客户端在 UA 里加 WaterfallAlbum/<版本>。1.1 起客户端才在
+// shouldOverrideUrlLoading 里拦截 waterfall:// 自定义 scheme，旧版发出去没人接，
+// 所以只有 1.1 及以上才显示「服务器地址」菜单项、才同步登录状态
+const appUaTag = (typeof navigator !== 'undefined'
+  && navigator.userAgent.match(/WaterfallAlbum\/([0-9.]+)/)) || null
+const isAppClient = !!appUaTag && parseFloat(appUaTag[1]) >= 1.1
 // 初始化加载标记：修复刷新闪现登录页
 const initLoading = ref(true)
 const isLogin = ref(false)
@@ -1913,6 +1950,10 @@ function handleKeydown(e) {
         // 此时 fullscreenElement 已是 null。刚退过全屏的那一次 Esc 不再叠加关预览，
         // 否则一次 Esc 会同时退全屏 + 关预览，看着像按一下就全没了
         if (Date.now() - fullscreenExitAt < 600) { fullscreenExitAt = 0; break }
+        // iPhone 系统播放器全屏不是 DOM 全屏：previewFullscreen 为 true 但查不到
+        // 全屏元素。这一下 Esc 归系统播放器处理，网页不能再顺手关预览，
+        // 否则系统还在播、背后的预览已经没了
+        if (previewFullscreen.value) break
         closePreview()
         break
       }
@@ -2119,6 +2160,22 @@ function openTvSetup() {
   // TV 客户端在 shouldOverrideUrlLoading 里拦截这个自定义 scheme
   window.location.href = 'waterfall-tv://setup'
 }
+
+// 手机客户端同样在本机拦截自定义 scheme：地址只存在手机上，
+// 网页端拿不到也改不了，只能把「用户点了」这件事转给原生去弹原来的对话框
+function openServerSettings() {
+  showUserDrop.value = false
+  window.location.href = 'waterfall://settings'
+}
+
+// 登录后入口已收进用户名菜单，右下角那颗悬浮按钮就该收起来；
+// 未登录（登录页还没有菜单）和登出后再放回去，保证随时能换服务器
+function syncAppLoginState() {
+  if (!isAppClient) return
+  window.location.href = 'waterfall://ui?login=' + (isLogin.value ? '1' : '0')
+}
+// 统一挂钩登录态：登录 / 登出 / 会话过期（401 直接写 isLogin）都会走到这里
+watch(isLogin, () => syncAppLoginState())
 
 async function loadSlideSettings() {
   try {
@@ -2367,12 +2424,50 @@ async function togglePreviewFullscreen() {
   const box = previewBoxRef.value
   if (!box) return
   const req = box.requestFullscreen || box.webkitRequestFullscreen || box.msRequestFullscreen
-  if (!req) { showHud('当前浏览器不支持全屏'); return }
+  if (!req) {
+    // iPhone 上 WebKit 根本不提供 Element 全屏（只给 iPad 和桌面），
+    // 唯一能把画面铺满屏幕的办法，是把 <video> 交给 iOS 系统播放器。
+    // 代价固定：进去以后是系统控制条，自绘控制层、快进/音量手势、黄色提示
+    // 全都不再显示——这是平台机制，代码换不回来。
+    // 这里必须同步调用：iOS 要求全屏由用户手势直接触发，中间 await 一次就会被拒
+    const v = isVideoPreview() ? previewMediaRef.value : null
+    if (v && typeof v.webkitEnterFullscreen === 'function') {
+      try {
+        v.webkitEnterFullscreen()
+      } catch (e) {
+        showHud('进入全屏失败')
+      }
+      return
+    }
+    showHud('当前浏览器不支持全屏')
+    return
+  }
   try {
     await req.call(box)
   } catch (e) {
     // 浏览器要求全屏由用户手势触发，脚本代点会走到这里
     showHud('浏览器拒绝了全屏')
+  }
+}
+
+// iPhone 的系统播放器全屏不派发 fullscreenchange，只有这两个私有事件。
+// 进出都把播放提示静音：系统播放器接管、交还 <video> 时浏览器会补发一对
+// pause→play，那不是用户点的，弹「已暂停」纯属误导。
+// 退出后把按钮文案复位，否则控制条会一直停在「退出全屏」
+function onIosVideoFullscreen(on) {
+  muteVideoPlaybackHint()
+  previewFullscreen.value = on
+  if (on) return
+  // 系统播放器里拖过进度，退出后这边的 <video> 未必会立刻补一次 timeupdate，
+  // 手动同步一下，免得控制条停在进全屏之前的位置
+  onVideoTimeUpdate()
+  // 上面那 160ms 的状态静音窗口会把系统播放器交还时补发的 pause/play 一起挡掉，
+  // previewPaused 就停在进全屏之前的旧值上——退回页面后中央播放按钮、
+  // 控制条显隐会和真实状态对不上。直接读 DOM 拉齐一次
+  const v = previewMediaRef.value
+  if (v && v.tagName === 'VIDEO') {
+    previewPaused.value = v.paused
+    if (previewShow.value && !slideShow.value) showVideoControls(v.paused)
   }
 }
 
@@ -3934,19 +4029,71 @@ input[type="checkbox"] {
   gap: 12px;
 }
 .preview-name { font-size: 13px; color: var(--text-2); text-align: center; word-break: break-all }
-.img-action-bar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center }
-.img-action-bar button {
-  padding: 7px 13px;
+.img-action-bar { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center }
+
+/* 预览图片底部与幻灯片右上角：只留图标，说明放进悬停气泡。
+   触屏没有 hover，靠图标形状与 aria-label 认；TV 用遥控器放不出气泡，
+   改回「图标 + 文字」并整体放大（见下面的 .tv-mode 规则） */
+.icon-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
   background: rgba(255, 255, 255, .10);
   border: 1px solid rgba(255, 255, 255, .16);
   border-radius: 8px;
   color: #fff;
-  font-size: 12px;
   cursor: pointer;
   backdrop-filter: blur(8px);
   transition: background .15s ease;
+  -webkit-tap-highlight-color: transparent;
 }
-.img-action-bar button:hover { background: rgba(255, 255, 255, .2) }
+.icon-btn:hover { background: rgba(255, 255, 255, .2) }
+.icon-btn svg { width: 17px; height: 17px; flex-shrink: 0 }
+.icon-btn-text { display: none }
+
+/* 悬停气泡只给有精确指针的设备：触屏上 :hover 会粘住，点完按钮一直挂个说明。
+   data-tip 是文案来源，键盘聚焦也给，能替代被藏掉的文字 */
+@media (hover: hover) and (pointer: fine) {
+  .icon-btn[data-tip]::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 8px);
+    transform: translate(-50%, 4px);
+    padding: 5px 9px;
+    border-radius: 6px;
+    background: rgba(14, 16, 20, .92);
+    border: 1px solid rgba(255, 255, 255, .12);
+    color: #fff;
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .15s ease, transform .15s ease;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .55);
+    z-index: 6;
+  }
+  .icon-btn[data-tip]:hover::after,
+  .icon-btn[data-tip]:focus-visible::after { opacity: 1; transform: translate(-50%, 0) }
+
+  /* 幻灯片那颗在屏幕右上角，气泡再往上就出视口了，翻到下方。
+     按钮距右边只有 16px，居中摆的话气泡右半边会被视口裁掉一截，
+     所以改成右对齐：气泡右边缘贴着按钮右边缘 */
+  .slide-exit-btn[data-tip]::after {
+    bottom: auto;
+    top: calc(100% + 8px);
+    left: auto;
+    right: 0;
+    transform: translateY(-4px);
+  }
+  .slide-exit-btn[data-tip]:hover::after,
+  .slide-exit-btn[data-tip]:focus-visible::after { transform: none }
+}
 
 /* 设置 / 表单弹窗 */
 .setting-box {
@@ -4211,18 +4358,12 @@ input[type="checkbox"] {
   font-size: 13px;
   text-shadow: 0 2px 8px rgba(0, 0, 0, .8);
 }
+/* 定位与悬停色单独留着，外观尺寸交给 .icon-btn */
 .slide-exit-btn {
   position: absolute;
   top: max(16px, env(safe-area-inset-top));
   right: max(16px, env(safe-area-inset-right));
-  padding: 8px 14px;
-  background: rgba(20, 24, 32, .7);
-  border: 1px solid rgba(255, 255, 255, .2);
-  color: #fff;
-  border-radius: 8px;
-  font-size: 12px;
-  cursor: pointer;
-  backdrop-filter: blur(8px);
+  z-index: 3;
 }
 .slide-exit-btn:hover { background: rgba(91, 130, 247, .8) }
 .slide-prev-btn,
@@ -4287,7 +4428,7 @@ input[type="checkbox"] {
 @media (max-width: 480px) {
   .header h1.app-title { font-size: 16px }
   .sort-select { flex: 1 }
-  .img-action-bar button { padding: 8px 10px; font-size: 12px }
+  .img-action-bar .icon-btn { width: 32px; height: 32px }
   .slide-prev-btn { left: 8px; width: 44px; height: 44px }
   .slide-next-btn { right: 8px; width: 44px; height: 44px }
   .preview-mask { padding: 0 }
@@ -4319,7 +4460,7 @@ input[type="checkbox"] {
   .slide-prev-btn, .slide-next-btn { width: 38px; height: 38px; font-size: 22px }
   .slide-prev-btn { left: max(8px, env(safe-area-inset-left)) }
   .slide-next-btn { right: max(8px, env(safe-area-inset-right)) }
-  .slide-exit-btn { padding: 6px 10px; font-size: 11px }
+  .slide-exit-btn { width: 32px; height: 32px }
   .slide-name { bottom: max(6px, env(safe-area-inset-bottom)); font-size: 11px }
 }
 /* ---------- TV：遥控器 / 10-foot 界面 ----------
@@ -4364,12 +4505,22 @@ input[type="checkbox"] {
   color: #AAB1BD;
   text-align: center;
 }
-.tv-mode .img-action-bar button { font-size: 17px; padding: 12px 20px }
+/* 遥控器放不出悬停气泡，把文字放回来，图标也放大到十英尺外看得清 */
+.tv-mode .icon-btn {
+  width: auto;
+  height: auto;
+  padding: 12px 20px;
+  font-size: 17px;
+  border-radius: 10px;
+}
+.tv-mode .icon-btn svg { width: 22px; height: 22px }
+.tv-mode .icon-btn-text { display: inline; margin-left: 8px }
+/* 少数安卓电视把遥控器报成鼠标，气泡会随焦点乱冒，TV 一律关掉 */
+.tv-mode .icon-btn[data-tip]::after { content: none }
 .tv-mode .close-btn { width: 52px; height: 52px; font-size: 28px }
 .tv-mode .arrow-btn { width: 64px; height: 64px; font-size: 32px }
 .tv-mode .slide-prev-btn,
 .tv-mode .slide-next-btn { width: 64px; height: 64px; font-size: 34px }
-.tv-mode .slide-exit-btn { padding: 12px 22px; font-size: 17px }
 .tv-mode .slide-name { font-size: 18px }
 /* 十英尺界面：整体等比放大，仍是同一套样式 */
 .tv-mode .seek-hud { padding: 14px 28px; border-radius: 12px; font-size: 28px }

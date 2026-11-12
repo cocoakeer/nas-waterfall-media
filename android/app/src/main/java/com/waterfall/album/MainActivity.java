@@ -70,6 +70,14 @@ public class MainActivity extends Activity {
     private static final String PREF_NAME = "waterfall_album";
     private static final String KEY_URL = "server_url";
     /**
+     * WebView 的 UA 标记。前端按 WaterfallAlbum/1.1 判断客户端能否接住
+     * waterfall:// 自定义 scheme；1.0 的 APK 没有 shouldOverrideUrlLoading，
+     * 新页面不会对它显示「服务器地址」菜单项、也不会发登录态。
+     */
+    private static final String UA_TAG = " WaterfallAlbum/1.1";
+    /** 网页驱动原生的通道：waterfall://settings 弹地址框，waterfall://ui?login= 同步登录态 */
+    private static final String SCHEME = "waterfall";
+    /**
      * 前端 index.html 里的标记，用来确认连上的确实是瀑布相册。
      * 第二条兼容旧版服务端（还没更新镜像时没有 meta，但 title 和 #app 在）：
      * 否则「先装新 APK、后更新镜像」会被误判成连错了地址。
@@ -107,6 +115,8 @@ public class MainActivity extends Activity {
      * 用旧页面的结果把状态页关掉（或误报错误），把网页错误页重新露出来。
      */
     private int loadSeq = 0;
+    /** 网页报告的登录状态：登录后右下角那颗悬浮「设置」按钮收起，入口在用户名菜单里 */
+    private boolean loggedIn = false;
 
     /** HTML5 <video> 原生全屏：WebView 把视频 View 交给宿主后的挂载点 */
     private FrameLayout rootLayout;
@@ -208,9 +218,28 @@ public class MainActivity extends Activity {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
             CookieManager.getInstance().setAcceptThirdPartyCookies(w, false);
         }
-        s.setUserAgentString(s.getUserAgentString() + " WaterfallAlbum/1.0");
+        s.setUserAgentString(s.getUserAgentString() + UA_TAG);
 
         w.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri u = request == null ? null : request.getUrl();
+                if (u == null || !SCHEME.equals(u.getScheme())) return false;
+                String host = u.getHost();
+                if ("settings".equals(host)) {
+                    // 用户名菜单里的「服务器地址」：地址只存在本机，网页改不了，
+                    // 只能把这次点击转回原来的原生对话框
+                    showServerDialog(false);
+                    return true;
+                }
+                if ("ui".equals(host)) {
+                    // 登录成功/登出时网页报一声，用来收起或放回右下角悬浮按钮
+                    setLoggedIn("1".equals(u.getQueryParameter("login")));
+                    return true;
+                }
+                return false;
+            }
+
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request,
                                         WebResourceError error) {
@@ -720,7 +749,16 @@ public class MainActivity extends Activity {
         verifying = false;
         loadFailed = false;
         statusPanel.setVisibility(View.GONE);
-        settingsBtn.setVisibility(View.VISIBLE);
+        // 页面重载后 loggedIn 已复位，网页稍后会再报一次真实登录态
+        settingsBtn.setVisibility(loggedIn ? View.GONE : View.VISIBLE);
+    }
+
+    /** 登录后入口在网页用户名菜单里；未登录仍留右下角，登录页还没有菜单可用 */
+    private void setLoggedIn(boolean on) {
+        loggedIn = on;
+        // 状态页盖着的时候按钮本来就是 GONE，交给 showContent 统一摆位
+        if (statusPanel == null || statusPanel.getVisibility() == View.VISIBLE) return;
+        settingsBtn.setVisibility(on ? View.GONE : View.VISIBLE);
     }
 
     /**
@@ -758,6 +796,9 @@ public class MainActivity extends Activity {
         currentUrl = url;
         prefs.edit().putString(KEY_URL, url).apply();
         loadSeq++;
+        // 新页面还没登录（唤起的通常是登录框），悬浮按钮先按未登录摆出来，
+        // 等网页的 whoami 结果报回来再决定是否收起
+        loggedIn = false;
         showLoading(url);
         web.loadUrl(url + "/");
     }
