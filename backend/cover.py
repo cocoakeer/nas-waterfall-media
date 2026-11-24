@@ -125,12 +125,31 @@ def _freshness_mtime(src: Path) -> float:
         return dir_mtime
 
 
+# 源文件带着「未来时间戳」时（换机器拷贝保留了源端时钟、批量工具改过 mtime、
+# 文件服务器与容器时钟不同步），mtime 就没法用来比新旧了：缓存 mtime 永远追不上
+# 基准，每次缓存任务都会把同一批文件重生成一遍，「未缓存」永远清不掉，可文件其实
+# 一个都没动过。偏差超过这个值就认为时间戳不可信
+_FUTURE_SKEW_SEC = 300
+# 缓存与源文件可能在不同文件系统上，时间戳精度不一样（exFAT/FAT 只有 2 秒），
+# 刚写完的缓存不能被判成「比源文件旧」，否则同一批文件会无限重建
+_FRESH_TOLERANCE_SEC = 2
+
+
 def is_cache_fresh(src_full: Path, cache_full: Path) -> bool:
     """缓存存在且 mtime 不旧于新鲜度基准（见 _freshness_mtime）即可跳过生成。"""
     try:
-        if not cache_full.exists():
+        st = cache_full.stat()
+        # 0 字节是写失败的残留（进程被杀、磁盘满）：它的 mtime 是新的，只按时间
+        # 判断会让坏图永远判定新鲜，再也不重建
+        if st.st_size <= 0:
             return False
-        return cache_full.stat().st_mtime >= _freshness_mtime(src_full)
+        base = _freshness_mtime(src_full)
+        if base > time.time() + _FUTURE_SKEW_SEC:
+            # 基准在未来，比不出新旧：只认「缓存存在且非空」，直接当新鲜。
+            # 不能拿「当前时间」当基准——那样基准会跟着时间一起往前跑，
+            # 每次任务依旧把同一批文件重建一遍
+            return True
+        return st.st_mtime + _FRESH_TOLERANCE_SEC >= base
     except OSError:
         return False
 
